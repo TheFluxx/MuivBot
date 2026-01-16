@@ -23,5 +23,11 @@ async def cmd_start(message: types.Message):
     else:
         await message.reply("Вы уже зарегистрированы.", reply_markup=kb_client)
 
+
+async def settings(message: types.Message):
+    await message.reply(f"💼 Настройки", reply_markup=kb_client)
+
+
 def register_handlers_client(dp: Dispatcher):
     dp.register_message_handler(cmd_start, commands=['start'])
+    dp.register_message_handler(settings, '💼 Настройки')
