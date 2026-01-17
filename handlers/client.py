@@ -37,10 +37,10 @@ async def settings(message: types.Message):
 # Словари для хранения расписания
 schedule_data = {}
 group_info_data = {}
-
+week_days_info = {}  # Структура для хранения информации о днях недели: {курс: {неделя: {день: дата}}}
 def parse_excel_file():
     """Парсит Excel файл .xls формата с расписанием"""
-    global schedule_data, group_info_data
+    global schedule_data, group_info_data, week_days_info
     
     try:
         # Путь к файлу
@@ -86,6 +86,7 @@ def parse_excel_file():
                 # Инициализируем структуру для этого курса
                 schedule_data[sheet_name] = {}
                 group_info_data[sheet_name] = {}
+                week_days_info[sheet_name] = {}
                 
                 # Ищем строки с кодами групп (они содержат "ИД")
                 group_codes = {}
@@ -142,12 +143,19 @@ def parse_excel_file():
                         # Инициализируем неделю для всех групп
                         for group_code in group_codes.keys():
                             schedule_data[sheet_name][group_code][current_week] = []
+                        
+                        # Инициализируем структуру для дней недели
+                        if current_week not in week_days_info[sheet_name]:
+                            week_days_info[sheet_name][current_week] = {}
                     
                     # Парсим строки с днями недели
-                    elif first_cell.lower() in ['понедельник', 'вторник', 'среда', 'четверг', 'пятница', 'суббота']:
+                    elif first_cell.lower() in ['понедельник', 'вторник', 'среда', 'четверг', 'пятница', 'суббота', 'воскресенье']:
                         day_of_week = first_cell.strip()
                         date_cell = row[1]
                         time_cell = row[2]
+                        
+                        # ВАЖНО: всегда инициализируем date_str перед использованием
+                        date_str = "Не указана"  # Значение по умолчанию
                         
                         # Преобразуем дату из Excel формата
                         if isinstance(date_cell, float):
@@ -155,13 +163,19 @@ def parse_excel_file():
                             try:
                                 date_tuple = xlrd.xldate_as_tuple(date_cell, wb.datemode)
                                 date_str = f"{date_tuple[0]}-{date_tuple[1]:02d}-{date_tuple[2]:02d}"
-                            except:
+                            except Exception as date_error:
+                                print(f"      Ошибка преобразования даты: {date_error}")
                                 date_str = str(date_cell)
                         elif date_cell:
                             date_str = str(date_cell)
-                        else:
-                            date_str = "Не указана"
                         
+                        # Сохраняем информацию о дне недели
+                        if current_week and day_of_week:
+                            # Сохраняем информацию о дне
+                            week_days_info[sheet_name][current_week][day_of_week] = date_str
+                        
+                        # Преобразуем время
+                        time_str = ""
                         if time_cell:
                             # Время может быть в разных форматах
                             if isinstance(time_cell, float):
@@ -172,12 +186,13 @@ def parse_excel_file():
                                     # Если указан интервал, добавляем окончание
                                     if time_tuple[4] == 0:
                                         time_str += ":00"
-                                except:
+                                except Exception as time_error:
+                                    print(f"      Ошибка преобразования времени: {time_error}")
                                     time_str = str(time_cell)
                             else:
                                 time_str = str(time_cell)
                         else:
-                            continue
+                            continue  # Пропускаем если нет времени
                         
                         # Для каждой группы
                         for group_code, group_data in group_codes.items():
@@ -186,7 +201,7 @@ def parse_excel_file():
                             if col_idx < len(row) and row[col_idx]:
                                 lesson_info = str(row[col_idx]).strip()
                                 
-                                if lesson_info and lesson_info.lower() not in ['', 'none', 'null']:
+                                if lesson_info and lesson_info.lower() not in ['', 'none', 'null', 'нет', 'праздничный день']:
                                     schedule_entry = {
                                         'day': day_of_week,
                                         'date': date_str,
@@ -212,6 +227,10 @@ def parse_excel_file():
                 )
                 print(f"   Загружено занятий: {total_lessons}")
                 
+                # Выводим информацию о днях недели
+                for week, days in week_days_info[sheet_name].items():
+                    print(f"   Неделя {week}: {len(days)} дней")
+                
             except Exception as e:
                 print(f"   ❌ Ошибка при обработке листа {sheet_name}: {e}")
                 import traceback
@@ -228,11 +247,12 @@ def parse_excel_file():
 # Инициализируем расписание при запуске
 def init_schedule():
     """Инициализация расписания из Excel файла"""
-    global schedule_data, group_info_data
+    global schedule_data, group_info_data, week_days_info
     
     # Очищаем предыдущие данные
     schedule_data.clear()
     group_info_data.clear()
+    week_days_info.clear()
     
     # Пробуем парсить файл
     parse_excel_file()
@@ -244,7 +264,7 @@ def init_schedule():
 
 def create_test_data():
     """Создает тестовые данные если файл не найден или парсинг не удался"""
-    global schedule_data, group_info_data
+    global schedule_data, group_info_data, week_days_info
     
     schedule_data = {
         "1 курс": {
@@ -269,26 +289,44 @@ def create_test_data():
             "ИД 23.1/Б3-25": ["1 курс", "ИД 23.1/Б3-25", "Прикладная информатика_Искусственный интеллект и анализ данных"],
         }
     }
+    
+    week_days_info = {
+        "1 курс": {
+            "19 НЕДЕЛЯ": {
+                "понедельник": "2026-01-05",
+                "вторник": "2026-01-06",
+                "среда": "2026-01-07",
+                "четверг": "2026-01-08",
+                "пятница": "2026-01-09",
+                "суббота": "2026-01-10"
+            },
+            "20 НЕДЕЛЯ": {
+                "понедельник": "2026-01-12",
+                "вторник": "2026-01-13",
+                "среда": "2026-01-14",
+                "четверг": "2026-01-15",
+                "пятница": "2026-01-16",
+                "суббота": "2026-01-17"
+            }
+        }
+    }
 
 # Функция для получения расписания на конкретный день
 async def get_day_schedule(course, group_code, week, day_index):
     """Получает расписание для конкретного дня недели"""
     
     if course not in schedule_data:
-        return f"❌ Курс '{course}' не найден в расписании.", None, None
+        return f"❌ Курс '{course}' не найден в расписании.", None, None, None
     
     if group_code not in schedule_data[course]:
-        return f"❌ Группа '{group_code}' не найдена в расписании курса '{course}'.", None, None
+        return f"❌ Группа '{group_code}' не найдена в расписании курса '{course}'.", None, None, None
     
     group_schedule = schedule_data[course][group_code]
-    
-    if not group_schedule:
-        return f"📭 Для группы '{group_code}' нет данных о расписании.", None, None
     
     # Определяем неделю
     available_weeks = list(group_schedule.keys())
     if not available_weeks:
-        return f"📭 Для группы '{group_code}' нет расписания на какие-либо недели.", None, None
+        return f"📭 Для группы '{group_code}' нет расписания на какие-либо недели.", None, None, None
     
     if week and week in available_weeks:
         target_week = week
@@ -296,40 +334,54 @@ async def get_day_schedule(course, group_code, week, day_index):
         # Берем первую доступную неделю
         target_week = available_weeks[0]
     
-    week_schedule = group_schedule[target_week]
+    week_schedule = group_schedule.get(target_week, [])
     
-    if not week_schedule:
-        return f"📭 Для группы '{group_code}' нет занятий на неделе '{target_week}'.", None, None
+    # Получаем все дни недели
+    days_in_week = []
     
-    # Группируем по дням
-    days_schedule = {}
-    days_order = []  # Сохраняем порядок дней
+    # Сначала проверяем сохраненные дни недели
+    if course in week_days_info and target_week in week_days_info[course]:
+        # Используем сохраненные дни недели
+        day_order_map = {
+            'понедельник': 0,
+            'вторник': 1,
+            'среда': 2,
+            'четверг': 3,
+            'пятница': 4,
+            'суббота': 5,
+            'воскресенье': 6
+        }
+        
+        # Сортируем дни в правильном порядке
+        days_in_week = sorted(
+            week_days_info[course][target_week].items(),
+            key=lambda x: day_order_map.get(x[0], 99)
+        )
     
-    for entry in week_schedule:
-        day_key = entry['day']
-        if day_key not in days_schedule:
-            days_schedule[day_key] = []
-            days_order.append(day_key)
-        days_schedule[day_key].append(entry)
+    # Если нет сохраненных дней, создаем стандартный список дней недели
+    if not days_in_week:
+        print(f"⚠️ Для курса {course}, недели {target_week} нет информации о днях")
+        
+        # Стандартные дни недели
+        days_order = ['понедельник', 'вторник', 'среда', 'четверг', 'пятница', 'суббота']
+        days_in_week = []
+        
+        # Пытаемся получить даты из занятий группы
+        for day in days_order:
+            # Ищем дату для этого дня в занятиях
+            date_for_day = "Дата не указана"
+            for entry in week_schedule:
+                if entry['day'] == day:
+                    date_for_day = entry['date']
+                    break
+            
+            days_in_week.append((day, date_for_day))
     
-    # Сортируем дни по порядку недели
-    day_order_map = {
-        'понедельник': 0,
-        'вторник': 1,
-        'среда': 2,
-        'четверг': 3,
-        'пятница': 4,
-        'суббота': 5,
-        'воскресенье': 6
-    }
-    
-    sorted_days = sorted(days_schedule.items(), key=lambda x: day_order_map.get(x[0], 99))
-    
-    if not sorted_days:
-        return f"📭 Для группы '{group_code}' нет занятий на неделе '{target_week}'.", None, None
+    if not days_in_week:
+        return f"📭 Для группы '{group_code}' нет дней в неделе '{target_week}'.", None, None, None
     
     # Определяем текущий день
-    if day_index is None or day_index >= len(sorted_days):
+    if day_index is None or day_index >= len(days_in_week):
         current_day_index = 0
     else:
         current_day_index = day_index
@@ -337,14 +389,11 @@ async def get_day_schedule(course, group_code, week, day_index):
     if current_day_index < 0:
         current_day_index = 0
     
-    if current_day_index >= len(sorted_days):
-        current_day_index = len(sorted_days) - 1
+    if current_day_index >= len(days_in_week):
+        current_day_index = len(days_in_week) - 1
     
     # Получаем текущий день
-    current_day, day_entries = sorted_days[current_day_index]
-    
-    # Получаем дату для текущего дня (берем первую запись)
-    current_date = day_entries[0]['date'] if day_entries else "Не указана"
+    current_day, current_date = days_in_week[current_day_index]
     
     # Форматируем расписание для дня
     schedule_text = f"📅 <b>Расписание для группы {group_code}</b>\n"
@@ -352,13 +401,20 @@ async def get_day_schedule(course, group_code, week, day_index):
     schedule_text += f"📆 <b>Неделя:</b> {target_week}\n"
     schedule_text += f"📌 <b>День:</b> {current_day} ({current_date})\n\n"
     
-    # Сортируем занятия по времени
-    sorted_entries = sorted(day_entries, key=lambda x: x['time'])
+    # Получаем занятия для этого дня
+    day_lessons = []
+    for entry in week_schedule:
+        if entry['day'] == current_day:
+            day_lessons.append(entry)
     
-    if not sorted_entries:
-        schedule_text += "📭 Занятий нет\n"
+    # Сортируем занятия по времени
+    day_lessons_sorted = sorted(day_lessons, key=lambda x: x['time'])
+    
+    if not day_lessons_sorted:
+        schedule_text += "✅ <b>Свободный день!</b>\n"
+        schedule_text += "🎉 Нет лекций и семинаров\n"
     else:
-        for entry in sorted_entries:
+        for entry in day_lessons_sorted:
             time_display = entry['time']
             lesson_display = entry['lesson']
             
@@ -369,9 +425,9 @@ async def get_day_schedule(course, group_code, week, day_index):
             schedule_text += f"• ⏰ <b>{time_display}</b> - {lesson_display}\n"
     
     # Информация о навигации
-    schedule_text += f"\n📋 <b>День {current_day_index + 1} из {len(sorted_days)}</b>"
+    schedule_text += f"\n📋 <b>День {current_day_index + 1} из {len(days_in_week)}</b>"
     
-    return schedule_text, target_week, current_day_index
+    return schedule_text, target_week, current_day_index, days_in_week
 
 # Функция для получения информации о группе
 def get_group_info(course, group_code):
@@ -478,8 +534,8 @@ async def process_group_choice(callback_query: types.CallbackQuery, state: FSMCo
     await callback_query.answer()
 
 # Колбек для показа расписания по дням
-async def show_schedule_day(callback_query: types.CallbackQuery, state: FSMContext):
-    data = callback_query.data.split("_", 5)
+async def show_schedule_day(callback_query: types.CallbackQuery):
+    data = callback_query.data.split("_", 6)
     course = data[2]
     group_code = data[3]
     
@@ -491,20 +547,34 @@ async def show_schedule_day(callback_query: types.CallbackQuery, state: FSMConte
         day_index = int(data[4])
     
     if len(data) > 5:
+        # Формат: show_schedule_{course}_{group_code}_{day_index}_{week}
         week = data[5]
     
     # Получаем расписание на день
-    schedule_text, target_week, current_day_index = await get_day_schedule(course, group_code, week, day_index)
+    schedule_text, target_week, current_day_index, days_in_week = await get_day_schedule(
+        course, group_code, week, day_index
+    )
+    
+    if not schedule_text or not current_day_index is not None:
+        await callback_query.answer("Ошибка при получении расписания")
+        return
     
     keyboard = types.InlineKeyboardMarkup(row_width=3)
     
     # Кнопки навигации по дням
-    if current_day_index is not None:
+    if days_in_week and len(days_in_week) > 1:
         # Кнопка предыдущего дня
-        if current_day_index > 0:
+        prev_day_index = current_day_index - 1
+        if prev_day_index >= 0:
             keyboard.add(types.InlineKeyboardButton(
                 text="◀️ Предыдущий день",
-                callback_data=f"show_day_{course}_{group_code}_{current_day_index - 1}_{target_week}"
+                callback_data=f"show_day_{course}_{group_code}_{prev_day_index}_{target_week}"
+            ))
+        else:
+            # Если это первый день, показываем последний
+            keyboard.add(types.InlineKeyboardButton(
+                text="◀️ Последний день",
+                callback_data=f"show_day_{course}_{group_code}_{len(days_in_week)-1}_{target_week}"
             ))
         
         # Кнопка выбора дня
@@ -514,10 +584,18 @@ async def show_schedule_day(callback_query: types.CallbackQuery, state: FSMConte
         ))
         
         # Кнопка следующего дня
-        keyboard.add(types.InlineKeyboardButton(
-            text="Следующий день ▶️",
-            callback_data=f"show_day_{course}_{group_code}_{current_day_index + 1}_{target_week}"
-        ))
+        next_day_index = current_day_index + 1
+        if next_day_index < len(days_in_week):
+            keyboard.add(types.InlineKeyboardButton(
+                text="Следующий день ▶️",
+                callback_data=f"show_day_{course}_{group_code}_{next_day_index}_{target_week}"
+            ))
+        else:
+            # Если это последний день, показываем первый
+            keyboard.add(types.InlineKeyboardButton(
+                text="Первый день ▶️",
+                callback_data=f"show_day_{course}_{group_code}_0_{target_week}"
+            ))
     
     # Кнопки навигации по неделям
     available_weeks = []
@@ -561,46 +639,35 @@ async def choose_day(callback_query: types.CallbackQuery):
     week = data[4] if len(data) > 4 else None
     
     # Получаем доступные дни для этой недели
-    if course not in schedule_data or group_code not in schedule_data[course]:
-        await callback_query.answer("Нет данных о группе")
+    schedule_text, target_week, current_day_index, days_in_week = await get_day_schedule(
+        course, group_code, week, 0
+    )
+    
+    if not days_in_week:
+        await callback_query.answer("Нет данных о днях недели")
         return
-    
-    available_weeks = list(schedule_data[course][group_code].keys())
-    if not available_weeks:
-        await callback_query.answer("Нет данных о расписании")
-        return
-    
-    if not week:
-        week = available_weeks[0]
-    
-    week_schedule = schedule_data[course][group_code][week]
-    
-    # Группируем по дням
-    days_schedule = {}
-    for entry in week_schedule:
-        day_key = entry['day']
-        if day_key not in days_schedule:
-            days_schedule[day_key] = entry['date']
-    
-    # Сортируем дни по порядку недели
-    day_order_map = {
-        'понедельник': 0,
-        'вторник': 1,
-        'среда': 2,
-        'четверг': 3,
-        'пятница': 4,
-        'суббота': 5,
-        'воскресенье': 6
-    }
-    
-    sorted_days = sorted(days_schedule.items(), key=lambda x: day_order_map.get(x[0], 99))
     
     keyboard = types.InlineKeyboardMarkup(row_width=2)
     
-    for i, (day, date) in enumerate(sorted_days):
+    for i, (day, date) in enumerate(days_in_week):
+        # Проверяем, есть ли занятия в этот день
+        has_lessons = False
+        if course in schedule_data and group_code in schedule_data[course]:
+            week_schedule = schedule_data[course][group_code].get(target_week, [])
+            for entry in week_schedule:
+                if entry['day'] == day:
+                    has_lessons = True
+                    break
+        
+        day_text = f"{day} ({date})"
+        if has_lessons:
+            day_text = "✅ " + day_text
+        else:
+            day_text = "📭 " + day_text
+        
         keyboard.add(types.InlineKeyboardButton(
-            text=f"{day} ({date})",
-            callback_data=f"show_day_{course}_{group_code}_{i}_{week}"
+            text=day_text,
+            callback_data=f"show_day_{course}_{group_code}_{i}_{target_week}"
         ))
     
     keyboard.row()
@@ -610,7 +677,9 @@ async def choose_day(callback_query: types.CallbackQuery):
     ))
     
     await callback_query.message.edit_text(
-        f"📅 Выберите день недели ({week}):",
+        f"📅 Выберите день недели ({target_week}):\n"
+        f"✅ - есть занятия\n"
+        f"📭 - свободный день",
         reply_markup=keyboard
     )
     await callback_query.answer()
@@ -623,7 +692,7 @@ async def show_week(callback_query: types.CallbackQuery):
     week = data[4]
     
     # Показываем первый день выбранной недели
-    await show_schedule_day(callback_query, None)
+    await show_schedule_day(callback_query)
 
 # Колбек для обновления расписания
 async def refresh_schedule(callback_query: types.CallbackQuery):
@@ -641,43 +710,7 @@ async def refresh_schedule(callback_query: types.CallbackQuery):
     init_schedule()
     
     # Возвращаемся к показу расписания
-    schedule_text, target_week, current_day_index = await get_day_schedule(course, group_code, None, 0)
-    
-    keyboard = types.InlineKeyboardMarkup(row_width=3)
-    
-    if current_day_index is not None:
-        keyboard.add(
-            types.InlineKeyboardButton(
-                text="◀️ Предыдущий день",
-                callback_data=f"show_day_{course}_{group_code}_{current_day_index - 1}_{target_week}"
-            ),
-            types.InlineKeyboardButton(
-                text="📅 Выбрать день",
-                callback_data=f"choose_day_{course}_{group_code}_{target_week}"
-            ),
-            types.InlineKeyboardButton(
-                text="Следующий день ▶️",
-                callback_data=f"show_day_{course}_{group_code}_{current_day_index + 1}_{target_week}"
-            )
-        )
-    
-    keyboard.row()
-    keyboard.add(
-        types.InlineKeyboardButton(
-            text="🔄 Обновить",
-            callback_data=f"refresh_{course}_{group_code}"
-        ),
-        types.InlineKeyboardButton(
-            text="⬅️ Назад к группе",
-            callback_data=f"group_{course}_{group_code}"
-        )
-    )
-    
-    await callback_query.message.edit_text(
-        schedule_text + "\n\n✅ Расписание обновлено!",
-        reply_markup=keyboard,
-        parse_mode="HTML"
-    )
+    await show_schedule_day(callback_query)
     await callback_query.answer("Расписание обновлено!")
 
 # Колбек для возврата к выбору курса
