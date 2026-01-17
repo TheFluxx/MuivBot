@@ -1,15 +1,18 @@
+import asyncio
+import os
+from datetime import datetime
 from aiogram import types, Dispatcher
 from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters import Text
+import xlrd
 from db_api import db_commands
 from create_bot import bot
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 
 # Создаем клавиатуру
 def get_main_keyboard():
-    kb = ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.add(KeyboardButton("📅 Мое расписание"))
-    kb.add(KeyboardButton("💼 Настройки"))
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.add(types.KeyboardButton("📅 Мое расписание"))
+    kb.add(types.KeyboardButton("💼 Настройки"))
     return kb
 
 async def cmd_start(message: types.Message):
@@ -31,94 +34,346 @@ async def cmd_start(message: types.Message):
 async def settings(message: types.Message):
     await message.reply(f"💼 Настройки", reply_markup=get_main_keyboard())
 
-# Словарь для хранения расписания из Excel
-schedule_data = {
-    "1 курс": {},
-    "1 курс СПО": {},
-    "2 курс": {},
-    "2 курс СПО": {},
-    "3 курс": {},
-    "3 курс СПО": {},
-    "4 курс": {},
-}
+# Словари для хранения расписания
+schedule_data = {}
+group_info_data = {}
 
-# Заполним структуру данными из Excel
-def init_schedule():
-    # 1 курс
-    schedule_data["1 курс"] = {
-        "ИД 23.1/Б3-25": ["Прикладная информатика_Искусственный интеллект и анализ данных"],
-        "ИД 23.1/Б4-25": ["Прикладная информатика_Кибербезопасность цифрового предприятия"],
-        "ИД 23.1/Б1-25": ["Прикладная информатика_Корпоративные информационные системы"],
-        "ИД 30.1/Б4-25": ["Бизнес-информатика_Игровая компьютерная индустрия"],
-        "ИД 30.1/Б5-25": ["Бизнес-информатика_Бизнес-аналитик 1С"],
-        "ИД 30.1/Б6-25": ["Бизнес информатика_Цифровой дизайн и веб-разработка"]
-    }
+def parse_excel_file():
+    """Парсит Excel файл .xls формата с расписанием"""
+    global schedule_data, group_info_data
     
-    # 1 курс СПО
-    schedule_data["1 курс СПО"] = {
-        "ИДс 23.1/Б3-25": ["Прикладная информатика, Корпоративные информационные системы"],
-        "ИДс 23.1/Б4-25": ["Прикладная информатика, Кибербезопасность цифрового предприятия"],
-        "ИДс 30.1/Б4-25": ["Бизнес-информатика, Игровая компьютерная индустрия"],
-        "ИДс 30.1/Б6-25": ["Бизнес информатика_Цифровой дизайн и веб-разработка"]
-    }
-    
-    # 2 курс
-    schedule_data["2 курс"] = {
-        "ИД 23.1/Б3-24": ["Прикладная информатика Искусственный интеллект и анализ данных"],
-        "ИД 23.1/Б4-24": ["Прикладная информатика Кибербезопасность цифрового предприятия"],
-        "ИД 23.1/Б1-24": ["Прикладная информатика Корпоративные информационные системы"],
-        "ИД 30.1/Б4-24": ["Бизнес-информатика Игровая компьютерная индустрия"],
-        "ИД 30.1/Б3-24": ["Бизнес информатика_Цифровая экономика"]
-    }
-    
-    # 2 курс СПО
-    schedule_data["2 курс СПО"] = {
-        "ИДс 23.1/Б3-24": ["Прикладная информатика, Искусственный интеллект и анализ данных"]
-    }
-    
-    # 3 курс
-    schedule_data["3 курс"] = {
-        "ИД 30.1/Б3-23": ["Бизнес информатика_Цифровая экономика"],
-        "ИД 23.1/Б3-23": ["Прикладная информатика_Искусственный интеллект и анализ данных"]
-    }
-    
-    # 3 курс СПО
-    schedule_data["3 курс СПО"] = {
-        "ИДс 23.1/Б3-23": ["Искусственный интеллект и анализ данных"]
-    }
-    
-    # 4 курс
-    schedule_data["4 курс"] = {
-        "ИД 30.1/Б3-22": ["Бизнес информатика_Цифровая экономика"],
-        "ИД 23.1/Б3-22": ["Прикладная информатика_Искусственный интеллект и анализ данных"]
-    }
+    try:
+        # Путь к файлу
+        excel_file = "Raspisanie-FIT-ochnaya-f.o.-25_26-osenniy-sem.-YAnvar.xls"
+        
+        # Проверяем наличие файла
+        if not os.path.exists(excel_file):
+            print(f"❌ Файл {excel_file} не найден!")
+            print(f"Текущая директория: {os.getcwd()}")
+            
+            # Ищем файл в разных местах
+            possible_paths = [
+                excel_file,
+                os.path.join("data", excel_file),
+                os.path.join("..", excel_file),
+                os.path.join(".", excel_file),
+            ]
+            
+            for path in possible_paths:
+                if os.path.exists(path):
+                    excel_file = path
+                    print(f"✅ Файл найден по пути: {path}")
+                    break
+            else:
+                print("❌ Файл не найден ни по одному из путей!")
+                return
+        
+        print(f"📖 Чтение файла .xls: {excel_file}")
+        
+        # Открываем книгу .xls
+        wb = xlrd.open_workbook(excel_file)
+        
+        # Список всех листов (курсов)
+        sheets = wb.sheet_names()
+        print(f"📑 Найдено листов: {len(sheets)}")
+        
+        for sheet_idx, sheet_name in enumerate(sheets, 1):
+            print(f"📋 Обработка листа {sheet_idx}/{len(sheets)}: {sheet_name}")
+            
+            try:
+                ws = wb.sheet_by_name(sheet_name)
+                
+                # Инициализируем структуру для этого курса
+                schedule_data[sheet_name] = {}
+                group_info_data[sheet_name] = {}
+                
+                # Ищем строки с кодами групп (они содержат "ИД")
+                group_codes = {}
+                
+                # Проходим по всем строкам
+                for row_idx in range(ws.nrows):
+                    row = ws.row_values(row_idx)
+                    
+                    if not any(row):
+                        continue
+                    
+                    # Ищем строку с кодами групп
+                    for col_idx, cell_value in enumerate(row):
+                        if cell_value and isinstance(cell_value, str) and "ИД" in cell_value:
+                            group_code = cell_value.strip()
+                            if group_code not in group_codes:
+                                group_codes[group_code] = {
+                                    'col_idx': col_idx,
+                                    'group_info': group_code
+                                }
+                                # Инициализируем структуру для группы
+                                schedule_data[sheet_name][group_code] = {}
+                                
+                                # Ищем направление обучения (обычно следующая строка после кодов групп)
+                                if row_idx + 1 < ws.nrows:
+                                    next_row = ws.row_values(row_idx + 1)
+                                    if col_idx < len(next_row) and next_row[col_idx]:
+                                        direction = str(next_row[col_idx]).strip()
+                                        group_info_data[sheet_name][group_code] = [sheet_name, group_code, direction]
+                                    else:
+                                        group_info_data[sheet_name][group_code] = [sheet_name, group_code, "Не указано"]
+                
+                print(f"   Найдено групп: {len(group_codes)}")
+                
+                if not group_codes:
+                    print(f"   ⚠️ Группы не найдены на листе {sheet_name}")
+                    continue
+                
+                # Теперь парсим расписание
+                current_week = None
+                
+                for row_idx in range(ws.nrows):
+                    row = ws.row_values(row_idx)
+                    
+                    if not any(row):
+                        continue
+                    
+                    # Проверяем на неделю (например, "19 НЕДЕЛЯ")
+                    first_cell = str(row[0]) if row[0] else ""
+                    if "НЕДЕЛЯ" in first_cell.upper():
+                        current_week = first_cell.strip()
+                        print(f"   Найдена неделя: {current_week}")
+                        
+                        # Инициализируем неделю для всех групп
+                        for group_code in group_codes.keys():
+                            schedule_data[sheet_name][group_code][current_week] = []
+                    
+                    # Парсим строки с днями недели
+                    elif first_cell.lower() in ['понедельник', 'вторник', 'среда', 'четверг', 'пятница', 'суббота']:
+                        day_of_week = first_cell.strip()
+                        date_cell = row[1]
+                        time_cell = row[2]
+                        
+                        # Преобразуем дату из Excel формата
+                        if isinstance(date_cell, float):
+                            # Дата в Excel хранится как число дней от 1900-01-01
+                            try:
+                                date_tuple = xlrd.xldate_as_tuple(date_cell, wb.datemode)
+                                date_str = f"{date_tuple[0]}-{date_tuple[1]:02d}-{date_tuple[2]:02d}"
+                            except:
+                                date_str = str(date_cell)
+                        elif date_cell:
+                            date_str = str(date_cell)
+                        else:
+                            date_str = "Не указана"
+                        
+                        if time_cell:
+                            # Время может быть в разных форматах
+                            if isinstance(time_cell, float):
+                                # Время как десятичная дробь
+                                try:
+                                    time_tuple = xlrd.xldate_as_tuple(time_cell, wb.datemode)
+                                    time_str = f"{time_tuple[3]:02d}:{time_tuple[4]:02d}"
+                                except:
+                                    time_str = str(time_cell)
+                            else:
+                                time_str = str(time_cell)
+                        else:
+                            continue
+                        
+                        # Для каждой группы
+                        for group_code, group_data in group_codes.items():
+                            col_idx = group_data['col_idx']
+                            
+                            if col_idx < len(row) and row[col_idx]:
+                                lesson_info = str(row[col_idx]).strip()
+                                
+                                if lesson_info and lesson_info.lower() not in ['', 'none', 'null']:
+                                    schedule_entry = {
+                                        'day': day_of_week,
+                                        'date': date_str,
+                                        'time': time_str,
+                                        'lesson': lesson_info,
+                                        'week': current_week if current_week else "Неизвестная неделя"
+                                    }
+                                    
+                                    if current_week:
+                                        schedule_data[sheet_name][group_code][current_week].append(schedule_entry)
+                                    else:
+                                        # Если неделя не определена
+                                        temp_week = "Неделя_1"
+                                        if temp_week not in schedule_data[sheet_name][group_code]:
+                                            schedule_data[sheet_name][group_code][temp_week] = []
+                                        schedule_data[sheet_name][group_code][temp_week].append(schedule_entry)
+                
+                # Проверяем, есть ли данные для этого листа
+                total_lessons = sum(
+                    len(week_schedule) 
+                    for group in schedule_data[sheet_name].values() 
+                    for week_schedule in group.values()
+                )
+                print(f"   Загружено занятий: {total_lessons}")
+                
+            except Exception as e:
+                print(f"   ❌ Ошибка при обработке листа {sheet_name}: {e}")
+                import traceback
+                traceback.print_exc()
+                continue
+        
+        print("✅ Парсинг .xls файла завершен успешно!")
+        
+    except Exception as e:
+        print(f"❌ Ошибка при парсинге .xls файла: {e}")
+        import traceback
+        traceback.print_exc()
 
 # Инициализируем расписание при запуске
-init_schedule()
+def init_schedule():
+    """Инициализация расписания из Excel файла"""
+    global schedule_data, group_info_data
+    
+    # Очищаем предыдущие данные
+    schedule_data.clear()
+    group_info_data.clear()
+    
+    # Пробуем парсить файл
+    parse_excel_file()
+    
+    # Если данные не загружены, используем тестовые данные
+    if not schedule_data:
+        print("⚠️ Использую тестовые данные...")
+        create_test_data()
+
+def create_test_data():
+    """Создает тестовые данные если файл не найден или парсинг не удался"""
+    global schedule_data, group_info_data
+    
+    schedule_data = {
+        "1 курс": {
+            "ИД 23.1/Б3-25": {
+                "19 НЕДЕЛЯ": [
+                    {"day": "понедельник", "date": "2026-01-05", "time": "8:20-9:50", "lesson": "Праздничный день", "week": "19 НЕДЕЛЯ"},
+                    {"day": "пятница", "date": "2026-01-09", "time": "8:20-9:50", "lesson": "Основы российской государственности (СПЗ)", "week": "19 НЕДЕЛЯ"},
+                    {"day": "пятница", "date": "2026-01-09", "time": "10:00-11:30", "lesson": "Основы российской государственности (СПЗ)", "week": "19 НЕДЕЛЯ"},
+                    {"day": "пятница", "date": "2026-01-09", "time": "15:25-16:55", "lesson": "Основы информационных систем и технологий (Лекция)", "week": "19 НЕДЕЛЯ"},
+                ],
+                "20 НЕДЕЛЯ": [
+                    {"day": "понедельник", "date": "2026-01-12", "time": "8:20-9:50", "lesson": "Математика (СПЗ)", "week": "20 НЕДЕЛЯ"},
+                    {"day": "понедельник", "date": "2026-01-12", "time": "10:00-11:30", "lesson": "Информатика (Лекция)", "week": "20 НЕДЕЛЯ"},
+                ]
+            },
+            "ИД 23.1/Б4-25": {
+                "19 НЕДЕЛЯ": [
+                    {"day": "понедельник", "date": "2026-01-05", "time": "8:20-9:50", "lesson": "Праздничный день", "week": "19 НЕДЕЛЯ"},
+                    {"day": "пятница", "date": "2026-01-09", "time": "15:25-16:55", "lesson": "Основы информационных систем и технологий (Лекция)", "week": "19 НЕДЕЛЯ"},
+                ]
+            }
+        },
+        "1 курс СПО": {
+            "ИДс 23.1/Б3-25": {
+                "19 НЕДЕЛЯ": [
+                    {"day": "суббота", "date": "2026-01-10", "time": "8:20-9:50", "lesson": "Моделирование, анализ и совершенствование бизнес-процессов (СПЗ)", "week": "19 НЕДЕЛЯ"},
+                ]
+            }
+        }
+    }
+    
+    group_info_data = {
+        "1 курс": {
+            "ИД 23.1/Б3-25": ["1 курс", "ИД 23.1/Б3-25", "Прикладная информатика_Искусственный интеллект и анализ данных"],
+            "ИД 23.1/Б4-25": ["1 курс", "ИД 23.1/Б4-25", "Прикладная информатика_Кибербезопасность цифрового предприятия"],
+        },
+        "1 курс СПО": {
+            "ИДс 23.1/Б3-25": ["1 курс СПО", "ИДс 23.1/Б3-25", "Прикладная информатика, Корпоративные информационные системы"],
+        }
+    }
 
 # Функция для получения расписания группы
 async def get_group_schedule(course, group_code, week=None):
-    return f"""
-📅 Расписание для группы {group_code}
-🎓 Курс: {course}
+    """Получает расписание для конкретной группы"""
+    
+    if course not in schedule_data:
+        return f"❌ Курс '{course}' не найден в расписании."
+    
+    if group_code not in schedule_data[course]:
+        return f"❌ Группа '{group_code}' не найдена в расписании курса '{course}'."
+    
+    group_schedule = schedule_data[course][group_code]
+    
+    if not group_schedule:
+        return f"📭 Для группы '{group_code}' нет данных о расписании."
+    
+    # Определяем неделю
+    available_weeks = list(group_schedule.keys())
+    if not available_weeks:
+        return f"📭 Для группы '{group_code}' нет расписания на какие-либо недели."
+    
+    if week and week in available_weeks:
+        target_week = week
+    else:
+        # Берем первую доступную неделю
+        target_week = available_weeks[0]
+    
+    week_schedule = group_schedule[target_week]
+    
+    if not week_schedule:
+        return f"📭 Для группы '{group_code}' нет занятий на неделе '{target_week}'."
+    
+    # Форматируем расписание
+    schedule_text = f"📅 <b>Расписание для группы {group_code}</b>\n"
+    schedule_text += f"🎓 <b>Курс:</b> {course}\n"
+    schedule_text += f"📆 <b>Неделя:</b> {target_week}\n\n"
+    
+    # Группируем по дням
+    days_schedule = {}
+    for entry in week_schedule:
+        day_key = f"{entry['day']} ({entry['date']})"
+        if day_key not in days_schedule:
+            days_schedule[day_key] = []
+        days_schedule[day_key].append(entry)
+    
+    # Сортируем дни по дате
+    sorted_days = sorted(days_schedule.items(), key=lambda x: x[0])
+    
+    for day, entries in sorted_days:
+        schedule_text += f"<b>📌 {day}:</b>\n"
+        
+        # Сортируем занятия по времени
+        sorted_entries = sorted(entries, key=lambda x: x['time'])
+        
+        for entry in sorted_entries:
+            # Форматируем время и занятие
+            time_display = entry['time']
+            lesson_display = entry['lesson']
+            
+            # Обрезаем слишком длинные названия
+            if len(lesson_display) > 80:
+                lesson_display = lesson_display[:77] + "..."
+            
+            schedule_text += f"• ⏰ <b>{time_display}</b> - {lesson_display}\n"
+        
+        schedule_text += "\n"
+    
+    # Добавляем информацию о доступных неделях
+    if len(available_weeks) > 1:
+        weeks_list = "\n".join([f"• {w}" for w in available_weeks])
+        schedule_text += f"📋 <b>Доступные недели:</b>\n{weeks_list}\n"
+    
+    return schedule_text
 
-📌 Пример занятий:
-Понедельник 2026-01-05:
-• 8:20-9:50 - Праздничный день
-
-Пятница 2026-01-09:
-• 8:20-9:50 - Основы российской государственности (СПЗ)
-• 10:00-11:30 - Основы российской государственности (СПЗ)
-• 15:25-16:55 - Основы информационных систем и технологий (Лекция)
-
-📝 Для получения полного расписания обратитесь к файлу Excel.
-"""
+# Функция для получения информации о группе
+def get_group_info(course, group_code):
+    """Получает информацию о группе"""
+    if course in group_info_data and group_code in group_info_data[course]:
+        return group_info_data[course][group_code]
+    return [course, group_code, "Информация не найдена"]
 
 # Хендлер для выбора курса
 async def choose_course(message: types.Message):
     keyboard = types.InlineKeyboardMarkup(row_width=2)
     
+    # Используем реальные курсы из распарсенных данных
     courses = list(schedule_data.keys())
+    
+    if not courses:
+        await message.answer("⚠️ Расписание еще не загружено. Попробуйте позже.")
+        return
+    
     for course in courses:
         keyboard.add(types.InlineKeyboardButton(
             text=f"🎓 {course}",
@@ -135,9 +390,14 @@ async def process_course_choice(callback_query: types.CallbackQuery):
     
     # Получаем группы для выбранного курса
     if course in schedule_data:
-        groups = schedule_data[course]
-        for group_code, group_info in groups.items():
-            group_name = f"{group_code} - {group_info[0]}"
+        groups = schedule_data[course].keys()
+        for group_code in groups:
+            # Получаем информацию о группе для отображения
+            group_info = get_group_info(course, group_code)
+            group_name = f"{group_code}"
+            if len(group_info) > 2 and group_info[2]:
+                group_name += f" - {group_info[2]}"
+            
             keyboard.add(types.InlineKeyboardButton(
                 text=group_name[:50],  # Обрезаем слишком длинные названия
                 callback_data=f"group_{course}_{group_code}"
@@ -167,7 +427,10 @@ async def process_group_choice(callback_query: types.CallbackQuery, state: FSMCo
     )
     
     # Получаем информацию о группе
-    group_info = schedule_data[course][group_code][0] if schedule_data[course][group_code] else ""
+    group_info = get_group_info(course, group_code)
+    group_display = f"{group_code}"
+    if len(group_info) > 2 and group_info[2]:
+        group_display += f"\n📚 Направление: {group_info[2]}"
     
     keyboard = types.InlineKeyboardMarkup(row_width=2)
     keyboard.add(
@@ -182,18 +445,22 @@ async def process_group_choice(callback_query: types.CallbackQuery, state: FSMCo
     )
     keyboard.add(
         types.InlineKeyboardButton(
+            text="🔄 Обновить расписание",
+            callback_data=f"refresh_{course}_{group_code}"
+        ),
+        types.InlineKeyboardButton(
             text="🏠 В главное меню",
             callback_data="main_menu"
         )
     )
     
     await callback_query.message.edit_text(
-        f"✅ Вы выбрали:\n"
-        f"🎓 Курс: {course}\n"
-        f"👥 Группа: {group_code}\n"
-        f"📚 Направление: {group_info}\n\n"
+        f"✅ <b>Вы выбрали:</b>\n"
+        f"🎓 <b>Курс:</b> {course}\n"
+        f"👥 <b>Группа:</b> {group_display}\n\n"
         f"Теперь вы можете посмотреть расписание.",
-        reply_markup=keyboard
+        reply_markup=keyboard,
+        parse_mode="HTML"
     )
     await callback_query.answer()
 
@@ -206,17 +473,21 @@ async def show_schedule(callback_query: types.CallbackQuery, state: FSMContext):
     # Получаем расписание
     schedule_text = await get_group_schedule(course, group_code)
     
+    # Получаем доступные недели для навигации
+    available_weeks = []
+    if course in schedule_data and group_code in schedule_data[course]:
+        available_weeks = list(schedule_data[course][group_code].keys())
+    
     keyboard = types.InlineKeyboardMarkup(row_width=2)
-    keyboard.add(
-        types.InlineKeyboardButton(
-            text="◀️ Предыдущая неделя",
-            callback_data=f"prev_week_{course}_{group_code}"
-        ),
-        types.InlineKeyboardButton(
-            text="Следующая неделя ▶️",
-            callback_data=f"next_week_{course}_{group_code}"
-        )
-    )
+    
+    # Добавляем кнопки навигации по неделям если их больше одной
+    if len(available_weeks) > 1:
+        for week in available_weeks[:4]:  # Ограничим 4 неделями для удобства
+            keyboard.add(types.InlineKeyboardButton(
+                text=f"📆 {week}",
+                callback_data=f"week_{course}_{group_code}_{week}"
+            ))
+    
     keyboard.add(
         types.InlineKeyboardButton(
             text="🔄 Обновить",
@@ -235,12 +506,89 @@ async def show_schedule(callback_query: types.CallbackQuery, state: FSMContext):
     )
     await callback_query.answer()
 
-# Колбеки для навигации по неделям
-async def prev_week(callback_query: types.CallbackQuery):
-    await callback_query.answer("Функция перехода к предыдущей неделе в разработке")
+# Колбек для выбора конкретной недели
+async def select_week(callback_query: types.CallbackQuery):
+    data = callback_query.data.split("_", 4)
+    course = data[1]
+    group_code = data[2]
+    week = data[3]
+    
+    # Получаем расписание для конкретной недели
+    schedule_text = await get_group_schedule(course, group_code, week)
+    
+    # Получаем доступные недели для навигации
+    available_weeks = []
+    if course in schedule_data and group_code in schedule_data[course]:
+        available_weeks = list(schedule_data[course][group_code].keys())
+    
+    keyboard = types.InlineKeyboardMarkup(row_width=2)
+    
+    # Кнопки для других недель
+    for other_week in available_weeks[:4]:
+        if other_week != week:
+            keyboard.add(types.InlineKeyboardButton(
+                text=f"📆 {other_week}",
+                callback_data=f"week_{course}_{group_code}_{other_week}"
+            ))
+    
+    keyboard.add(
+        types.InlineKeyboardButton(
+            text="🔄 Обновить",
+            callback_data=f"week_{course}_{group_code}_{week}"
+        ),
+        types.InlineKeyboardButton(
+            text="📋 Все недели",
+            callback_data=f"show_schedule_{course}_{group_code}"
+        ),
+        types.InlineKeyboardButton(
+            text="⬅️ Назад к группе",
+            callback_data=f"group_{course}_{group_code}"
+        )
+    )
+    
+    await callback_query.message.edit_text(
+        schedule_text,
+        reply_markup=keyboard,
+        parse_mode="HTML"
+    )
+    await callback_query.answer()
 
-async def next_week(callback_query: types.CallbackQuery):
-    await callback_query.answer("Функция перехода к следующей неделе в разработке")
+# Колбек для обновления расписания
+async def refresh_schedule(callback_query: types.CallbackQuery):
+    data = callback_query.data.split("_", 3)
+    course = data[1]
+    group_code = data[2]
+    
+    # Показываем сообщение о загрузке
+    await callback_query.message.edit_text(
+        "🔄 Обновляю расписание...",
+        parse_mode="HTML"
+    )
+    
+    # Перепарсиваем файл
+    init_schedule()
+    
+    # Возвращаемся к показу расписания
+    schedule_text = await get_group_schedule(course, group_code)
+    
+    keyboard = types.InlineKeyboardMarkup(row_width=2)
+    keyboard.add(
+        types.InlineKeyboardButton(
+            text="🔄 Обновить",
+            callback_data=f"refresh_{course}_{group_code}"
+        ),
+        types.InlineKeyboardButton(
+            text="⬅️ Назад к группе",
+            callback_data=f"group_{course}_{group_code}"
+        )
+    )
+    
+    await callback_query.message.edit_text(
+        schedule_text + "\n\n✅ Расписание обновлено!",
+        reply_markup=keyboard,
+        parse_mode="HTML"
+    )
+    await callback_query.answer("Расписание обновлено!")
 
 # Колбек для возврата к выбору курса
 async def back_to_courses(callback_query: types.CallbackQuery):
@@ -275,15 +623,18 @@ async def my_schedule(message: types.Message, state: FSMContext):
             )
         )
         
-        group_info = schedule_data[course][group_code][0] if schedule_data[course][group_code] else ""
+        group_info = get_group_info(course, group_code)
+        group_display = f"{group_code}"
+        if len(group_info) > 2 and group_info[2]:
+            group_display += f"\n📚 Направление: {group_info[2]}"
         
         await message.answer(
-            f"📋 Ваше текущее расписание:\n"
-            f"🎓 Курс: {course}\n"
-            f"👥 Группа: {group_code}\n"
-            f"📚 Направление: {group_info}\n\n"
+            f"📋 <b>Ваше текущее расписание:</b>\n"
+            f"🎓 <b>Курс:</b> {course}\n"
+            f"👥 <b>Группа:</b> {group_display}\n\n"
             f"Что вы хотите сделать?",
-            reply_markup=keyboard
+            reply_markup=keyboard,
+            parse_mode="HTML"
         )
     else:
         await message.answer(
@@ -306,8 +657,8 @@ def register_handlers_client(dp: Dispatcher):
     dp.register_callback_query_handler(process_course_choice, Text(startswith="course_"))
     dp.register_callback_query_handler(process_group_choice, Text(startswith="group_"))
     dp.register_callback_query_handler(show_schedule, Text(startswith="show_schedule_"))
-    dp.register_callback_query_handler(prev_week, Text(startswith="prev_week_"))
-    dp.register_callback_query_handler(next_week, Text(startswith="next_week_"))
+    dp.register_callback_query_handler(select_week, Text(startswith="week_"))
+    dp.register_callback_query_handler(refresh_schedule, Text(startswith="refresh_"))
     dp.register_callback_query_handler(back_to_courses, Text(startswith="back_to_courses"))
     dp.register_callback_query_handler(main_menu, Text(startswith="main_menu"))
     dp.register_callback_query_handler(change_group, Text(startswith="change_group"))
