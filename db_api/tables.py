@@ -1,14 +1,126 @@
 from datetime import datetime
 
-from sqlalchemy import Column, Integer, String, Float, BigInteger, DateTime, ARRAY
+from sqlalchemy import (
+    BigInteger,
+    Column,
+    Date,
+    DateTime,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+)
+from sqlalchemy.orm import relationship
 
 from db_api.database import Base
 
 
 class Users(Base):
+    """Пользователи бота."""
+
     __tablename__ = 'users'
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     telegram_id = Column(BigInteger, nullable=False)
     username = Column(String)
     referrer_id = Column(BigInteger)
+
+
+class SchedulePeriod(Base):
+    """Период расписания (например, месяц/семестр из имени файла)."""
+
+    __tablename__ = 'schedule_periods'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    period_code = Column(String(32), nullable=False, unique=True, index=True)
+    label = Column(String(255), nullable=False)
+    source_file = Column(String(255), nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+    courses = relationship('ScheduleCourse', back_populates='period', cascade='all, delete-orphan')
+
+
+class ScheduleCourse(Base):
+    """Курс/лист Excel в рамках периода."""
+
+    __tablename__ = 'schedule_courses'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    course_key = Column(String(255), nullable=False, unique=True, index=True)
+    course_name = Column(String(255), nullable=False)
+    display_name = Column(String(255), nullable=False)
+    period_id = Column(Integer, ForeignKey('schedule_periods.id', ondelete='CASCADE'), nullable=True, index=True)
+
+    period = relationship('SchedulePeriod', back_populates='courses')
+    groups = relationship('ScheduleGroup', back_populates='course', cascade='all, delete-orphan')
+
+
+class ScheduleGroup(Base):
+    """Академическая группа внутри курса."""
+
+    __tablename__ = 'schedule_groups'
+    __table_args__ = (
+        UniqueConstraint('course_id', 'group_code', name='uq_schedule_group_course_code'),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    course_id = Column(Integer, ForeignKey('schedule_courses.id', ondelete='CASCADE'), nullable=False, index=True)
+    group_code = Column(String(64), nullable=False, index=True)
+    direction = Column(Text, nullable=True)
+
+    course = relationship('ScheduleCourse', back_populates='groups')
+    weeks = relationship('ScheduleWeek', back_populates='group', cascade='all, delete-orphan')
+
+
+class ScheduleWeek(Base):
+    """Неделя расписания для конкретной группы."""
+
+    __tablename__ = 'schedule_weeks'
+    __table_args__ = (
+        UniqueConstraint('group_id', 'week_label', name='uq_schedule_week_group_label'),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    group_id = Column(Integer, ForeignKey('schedule_groups.id', ondelete='CASCADE'), nullable=False, index=True)
+    week_label = Column(String(128), nullable=False)
+    week_sort = Column(Integer, nullable=False, default=0)
+
+    group = relationship('ScheduleGroup', back_populates='weeks')
+    days = relationship('ScheduleWeekDay', back_populates='week', cascade='all, delete-orphan')
+    lessons = relationship('ScheduleLesson', back_populates='week', cascade='all, delete-orphan')
+
+
+class ScheduleWeekDay(Base):
+    """День недели внутри недели (включая дату)."""
+
+    __tablename__ = 'schedule_week_days'
+    __table_args__ = (
+        UniqueConstraint('week_id', 'day_name', name='uq_schedule_week_day_name'),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    week_id = Column(Integer, ForeignKey('schedule_weeks.id', ondelete='CASCADE'), nullable=False, index=True)
+    day_name = Column(String(32), nullable=False)
+    day_order = Column(Integer, nullable=False, default=99)
+    date_value = Column(Date, nullable=True)
+    date_text = Column(String(64), nullable=True)
+
+    week = relationship('ScheduleWeek', back_populates='days')
+
+
+class ScheduleLesson(Base):
+    """Учебная пара/занятие в рамках недели."""
+
+    __tablename__ = 'schedule_lessons'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    week_id = Column(Integer, ForeignKey('schedule_weeks.id', ondelete='CASCADE'), nullable=False, index=True)
+    day_name = Column(String(32), nullable=False)
+    date_value = Column(Date, nullable=True)
+    date_text = Column(String(64), nullable=True)
+    time_text = Column(String(64), nullable=True)
+    lesson_text = Column(Text, nullable=False)
+    lesson_order = Column(Integer, nullable=False, default=0)
+
+    week = relationship('ScheduleWeek', back_populates='lessons')

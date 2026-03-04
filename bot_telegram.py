@@ -1,37 +1,48 @@
-from handlers import client
-from db_api.database import create_base
-from aiogram.utils import executor
-from create_bot import dp
 import logging
 
+from aiogram.utils import executor
 
-def setup_handlers(dp):
-    client.register_handlers_client(dp)
+from create_bot import dp
+from db_api.database import create_base
+from handlers import client
 
 
-async def on_startup(dp):
+def setup_handlers(dispatcher):
+    """Регистрирует обработчики бота."""
+    client.register_handlers_client(dispatcher)
+
+
+async def on_startup(dispatcher):
+    """Инициализация БД и расписания при запуске."""
     await create_base()
-    setup_handlers(dp)
-    
-    # Загружаем расписание при запуске бота
-    from handlers.client import init_schedule
-    print("Загрузка расписания из Excel файла...")
+    setup_handlers(dispatcher)
+
+    from handlers.client import init_schedule, persist_schedule_to_db, schedule_data
+
+    print('Загрузка расписания из Excel...')
     init_schedule()
-    
-    # Проверяем результат
-    from handlers.client import schedule_data
+
     total_courses = len(schedule_data)
     total_groups = sum(len(groups) for groups in schedule_data.values())
-    
-    print(f"Загружено расписание: {total_courses} курсов, {total_groups} групп")
-    
+    print(f'Загружено расписание: {total_courses} курсов, {total_groups} групп')
+
+    try:
+        db_stats = await persist_schedule_to_db()
+        print(
+            'Сохранено в БД: '
+            f"периодов={db_stats['periods']}, курсов={db_stats['courses']}, "
+            f"групп={db_stats['groups']}, недель={db_stats['weeks']}, "
+            f"дней={db_stats['days']}, занятий={db_stats['lessons']}"
+        )
+    except Exception as db_error:
+        print(f'⚠️ Ошибка сохранения расписания в БД: {db_error}')
+
     if total_groups == 0:
-        print("⚠️ Внимание: расписание не загружено или файл не найден!")
-        print("Проверьте наличие файла: Raspisanie-FIT-ochnaya-f.o.-25_26-osenniy-sem.-YAnvar.xls")
+        print('⚠️ Внимание: расписание не загружено или файлы не найдены!')
     else:
-        print("✅ Расписание успешно загружено!")
-    
-    print("Бот запущен!")
+        print('✅ Расписание успешно загружено!')
+
+    print('Бот запущен!')
 
 
 if __name__ == '__main__':

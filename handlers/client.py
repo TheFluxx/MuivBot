@@ -1,4 +1,4 @@
-﻿import asyncio
+import asyncio
 import os
 import re
 import html
@@ -454,6 +454,27 @@ def init_schedule():
     if not schedule_data:
         print("⚠️ Использую тестовые данные...")
         create_test_data()
+
+async def persist_schedule_to_db():
+    """Сохраняет текущее расписание из памяти в базу данных."""
+    if not schedule_data:
+        return {
+            'periods': 0,
+            'courses': 0,
+            'groups': 0,
+            'weeks': 0,
+            'days': 0,
+            'lessons': 0,
+        }
+
+    return await db_commands.replace_schedule_snapshot(
+        schedule_data=schedule_data,
+        group_info_data=group_info_data,
+        week_days_info=week_days_info,
+        course_display_names=course_display_names,
+        course_period_ids=course_period_ids,
+        period_id_to_label=period_id_to_label,
+    )
 
 def create_test_data():
     """Создает тестовые данные, если файлы расписания недоступны."""
@@ -1743,6 +1764,15 @@ async def refresh_schedule(callback_query: types.CallbackQuery, state: FSMContex
     await _safe_edit_text(callback_query.message, '🔄 Обновляю расписание...', parse_mode='HTML')
 
     init_schedule()
+    try:
+        db_stats = await persist_schedule_to_db()
+        print(
+            "Расписание сохранено в БД: "
+            "периодов={periods}, курсов={courses}, групп={groups}, недель={weeks}, дней={days}, занятий={lessons}".format(**db_stats)
+        )
+    except Exception as db_error:
+        print(f"ERROR: cannot save schedule to DB: {db_error}")
+
 
     if course and group_code and course in schedule_data and group_code in schedule_data.get(course, {}):
         await state.update_data(selected_course=course, selected_group=group_code, selected_course_name=_course_name(course))
@@ -1845,4 +1875,5 @@ def register_handlers_client(dp: Dispatcher):
     dp.register_callback_query_handler(back_to_courses, Text(startswith="back_to_courses"))
     dp.register_callback_query_handler(main_menu, Text(startswith="main_menu"))
     dp.register_callback_query_handler(change_group, Text(startswith="change_group"))
+
 
