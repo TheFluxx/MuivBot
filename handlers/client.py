@@ -1,11 +1,13 @@
-import asyncio
+﻿import asyncio
 import os
 import re
+import html
 from pathlib import Path
 from datetime import datetime, timedelta
 from aiogram import types, Dispatcher
 from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters import Text
+from aiogram.utils.exceptions import MessageNotModified
 import xlrd
 from db_api import db_commands
 from create_bot import bot
@@ -514,6 +516,13 @@ WEEKDAY_ORDER = [
 ]
 WEEKDAY_INDEX = {day_name: idx for idx, day_name in enumerate(WEEKDAY_ORDER)}
 
+def _short_day_name(day_name):
+    """Возвращает короткое имя дня недели."""
+    normalized = _normalize_cell_text(day_name)
+    if not normalized:
+        return "--"
+    return normalized[:2].title()
+
 
 def _parse_schedule_date(date_text):
     """Преобразует строку даты расписания в datetime."""
@@ -587,84 +596,58 @@ def _collect_days_for_week(course, target_week, week_schedule):
 
 async def get_day_schedule(course, group_code, week, day_index):
     """Формирует расписание на конкретный день."""
-    
+
     if course not in schedule_data:
-        return f"❌ Курс '{course}' не найден в расписании.", None, None, None
-    
+        return f"Курс '{course}' не найден в расписании.", None, None, None
+
     if group_code not in schedule_data[course]:
-        return f"❌ Группа '{group_code}' не найдена в расписании курса '{course}'.", None, None, None
-    
+        return f"Группа '{group_code}' не найдена в расписании курса '{course}'.", None, None, None
+
     group_schedule = schedule_data[course][group_code]
-    
-    # Определяем неделю
     available_weeks = sorted(group_schedule.keys(), key=_week_sort_key)
     if not available_weeks:
-        return f"📭 Для группы '{group_code}' нет расписания на какие-либо недели.", None, None, None
-    
-    if week and week in available_weeks:
-        target_week = week
-    else:
-        # Берем первую доступную неделю
-        target_week = available_weeks[-1]
-    
-    week_schedule = group_schedule.get(target_week, [])
+        return f"Для группы '{group_code}' нет расписания на какие-либо недели.", None, None, None
 
+    target_week = week if week and week in available_weeks else available_weeks[-1]
+    week_schedule = group_schedule.get(target_week, [])
     days_in_week = _collect_days_for_week(course, target_week, week_schedule)
 
     if not days_in_week:
-        return f"📭 Для группы '{group_code}' нет дней в неделе '{target_week}'.", None, None, None
-    
-    # Определяем текущий день
+        return f"Для группы '{group_code}' нет дней в неделе '{target_week}'.", None, None, None
+
     if day_index is None or day_index >= len(days_in_week):
         current_day_index = 0
     else:
-        current_day_index = day_index
-    
-    if current_day_index < 0:
-        current_day_index = 0
-    
-    if current_day_index >= len(days_in_week):
-        current_day_index = len(days_in_week) - 1
-    
-    # Получаем текущий день
+        current_day_index = max(0, min(day_index, len(days_in_week) - 1))
+
     current_day, current_date = days_in_week[current_day_index]
-    
-    # Форматируем расписание для дня
-    schedule_text = f"📅 <b>Расписание для группы {group_code}</b>\n"
-    schedule_text += f"🎓 <b>Курс:</b> {_course_display(course)}\n"
-    schedule_text += f"📆 <b>Неделя:</b> {target_week}\n"
-    schedule_text += f"📌 <b>День:</b> {current_day} ({current_date})\n\n"
-    
-    # Получаем занятия для этого дня
+
+    schedule_text = f"<b>📅 Расписание для группы {group_code}</b>\n"
+    schedule_text += f"<b>🎓 Курс:</b> {_course_display(course)}\n"
+    schedule_text += f"<b>🗓️ Неделя:</b> {target_week}\n"
+    schedule_text += f"<b>📅 День:</b> {current_day} ({current_date})\n\n"
+
     day_lessons = []
     for entry in week_schedule:
-        entry_day = _normalize_cell_text(entry.get('day')).lower()
-        if entry_day == current_day:
+        if _normalize_cell_text(entry.get("day")).lower() == current_day:
             day_lessons.append(entry)
-    
-    # Сортируем занятия по времени
-    day_lessons_sorted = sorted(day_lessons, key=lambda x: x['time'])
-    
+
+    day_lessons_sorted = sorted(day_lessons, key=lambda x: x["time"])
+
     if not day_lessons_sorted:
-        schedule_text += "✅ <b>Свободный день!</b>\n"
-        schedule_text += "🎉 Нет лекций и семинаров\n"
+        schedule_text += "<b>😌 Свободный день!</b>\n"
+        schedule_text += "Нет лекций и семинаров\n"
     else:
         for entry in day_lessons_sorted:
-            time_display = entry['time']
-            lesson_display = entry['lesson']
-            
-            # Обрезаем слишком длинные названия
+            time_display = entry["time"]
+            lesson_display = entry["lesson"]
             if len(lesson_display) > 80:
                 lesson_display = lesson_display[:77] + "..."
-            
-            schedule_text += f"• ⏰ <b>{time_display}</b> - {lesson_display}\n"
-    
-    # Информация о навигации
-    schedule_text += f"\n📋 <b>День {current_day_index + 1} из {len(days_in_week)}</b>"
-    
+            schedule_text += f"- <b>{time_display}</b> - {lesson_display}\n"
+
+    schedule_text += f"\n<b>День {current_day_index + 1} из {len(days_in_week)}</b>"
     return schedule_text, target_week, current_day_index, days_in_week
 
-# Функция для получения информации о группе
 def get_group_info(course, group_code):
     """Возвращает информацию о группе."""
     if course in group_info_data and group_code in group_info_data[course]:
@@ -682,13 +665,13 @@ async def choose_course(message: types.Message):
         await message.answer("⚠️ Расписание еще не загружено. Попробуйте позже.")
         return
 
-    for course_name in course_names:
-        keyboard.add(types.InlineKeyboardButton(
-            text=course_name[:64],
-            callback_data=f"course_{course_name}"
-        ))
+    buttons = [
+        types.InlineKeyboardButton(text=name[:64], callback_data=f"course_{name}") 
+        for name in course_names
+    ]
+    keyboard.add(*buttons)
 
-    await message.answer("Выберите курс:", reply_markup=keyboard)
+    await message.answer("🎓 Выберите курс:", reply_markup=keyboard)
 
 
 async def process_course_choice(callback_query: types.CallbackQuery):
@@ -718,257 +701,1059 @@ async def process_course_choice(callback_query: types.CallbackQuery):
     ))
 
     await callback_query.message.edit_text(
-        f"Выбран курс: {course_name}\nВыберите вашу группу:",
+        f"✅ Выбран курс: {course_name}\n👥 Выберите вашу группу:",
         reply_markup=keyboard
     )
     await callback_query.answer()
 
 
-async def process_group_choice(callback_query: types.CallbackQuery, state: FSMContext):
-    """Обрабатывает выбор группы и показывает доступные месяцы/периоды."""
-    data = callback_query.data.split("_", 2)
-    course_name = data[1]
-    group_code = data[2]
+async def _safe_edit_text(message: types.Message, text: str, reply_markup=None, parse_mode: str | None = None):
+    """Безопасно редактирует сообщение."""
+    try:
+        await message.edit_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
+    except MessageNotModified:
+        pass
 
-    await state.update_data(
-        selected_course_name=course_name,
-        selected_group=group_code
+
+def _build_period_to_course(course_name, group_code):
+    """Строит связку периода и курса для группы."""
+    period_items = []
+    seen_periods = set()
+
+    course_keys = sorted(
+        _course_keys_by_name(course_name),
+        key=lambda item: (
+            _course_start_date(item, group_code) is None,
+            _course_start_date(item, group_code) or datetime.max.date(),
+            _period_label_for_course(item),
+        ),
     )
 
-    group_info = _group_info_for_course_name(course_name, group_code)
-    group_display = f"{group_code}"
-    if len(group_info) > 2 and group_info[2]:
-        group_display += f"\n📚 Направление: {group_info[2]}"
-
-    period_to_course = {}
-    course_keys = sorted(_course_keys_by_name(course_name), key=lambda item: _period_label_for_course(item))
     for course_key in course_keys:
         if group_code not in schedule_data.get(course_key, {}):
             continue
 
         period_label = _period_label_for_course(course_key)
-        period_to_course.setdefault(period_label, course_key)
+        if period_label in seen_periods:
+            continue
 
+        seen_periods.add(period_label)
+        period_items.append((period_label, course_key))
+
+    return period_items
+
+def _get_available_weeks(course, group_code):
+    """Возвращает отсортированные недели группы."""
+    if course not in schedule_data:
+        return []
+    if group_code not in schedule_data[course]:
+        return []
+    return sorted(schedule_data[course][group_code].keys(), key=_week_sort_key)
+
+
+def _week_dates(week_days):
+    """Возвращает отсортированные даты недели."""
+    return sorted(item['date_obj'] for item in week_days if item['date_obj'] is not None)
+
+
+def _course_start_date(course, group_code):
+    """Возвращает дату начала периода для группы."""
+    weeks = _get_available_weeks(course, group_code)
+    start_dates = []
+
+    for week_label in weeks:
+        week_days = _build_week_day_items(course, group_code, week_label)
+        dates = _week_dates(week_days)
+        if dates:
+            start_dates.append(dates[0])
+
+    if start_dates:
+        return min(start_dates)
+    return None
+
+
+def _week_number_text(week_label):
+    """Извлекает номер недели из заголовка XLS (служебно)."""
+    week_text = _normalize_cell_text(week_label)
+    for token in week_text.replace('-', ' ').split():
+        if token.isdigit():
+            return token
+    return week_text
+
+
+def _build_week_day_items(course, group_code, week_label):
+    """Формирует список дней недели с датами."""
+    week_schedule = schedule_data.get(course, {}).get(group_code, {}).get(week_label, [])
+    days_in_week = _collect_days_for_week(course, week_label, week_schedule)
+    today = datetime.now().date()
+
+    items = []
+    for day_name, date_text in days_in_week:
+        parsed_date = _parse_schedule_date(date_text)
+        day_date = parsed_date.date() if parsed_date else None
+        has_lessons = any(
+            _normalize_cell_text(entry.get('day')).lower() == day_name
+            for entry in week_schedule
+        )
+        date_short = parsed_date.strftime('%d.%m.%y') if parsed_date else _normalize_cell_text(date_text)
+
+        items.append(
+            {
+                'day_name': day_name,
+                'day_title': day_name.capitalize(),
+                'date_obj': day_date,
+                'date_short': date_short,
+                'has_lessons': has_lessons,
+                'is_today': day_date == today,
+            }
+        )
+
+    return items
+
+
+def _month_week_number(week_days):
+    """Возвращает номер недели в месяце по первой дате недели."""
+    dates = _week_dates(week_days)
+    if not dates:
+        return None
+
+    reference_date = dates[0]
+    return ((reference_date.day - 1) // 7) + 1
+
+
+def _month_week_number_text(week_days):
+    """Текстовое представление номера недели месяца."""
+    month_week_number = _month_week_number(week_days)
+    if month_week_number is None:
+        return '-'
+    return str(month_week_number)
+
+
+def _build_group_week_timeline(course_name, group_code):
+    """Строит непрерывную шкалу недель группы по всем периодам."""
+    timeline = []
+    course_keys = sorted(
+        _course_keys_by_name(course_name),
+        key=lambda item: (
+            _course_start_date(item, group_code) is None,
+            _course_start_date(item, group_code) or datetime.max.date(),
+            _period_label_for_course(item),
+        ),
+    )
+
+    for course_key in course_keys:
+        weeks = _get_available_weeks(course_key, group_code)
+        for week_index, week_label in enumerate(weeks):
+            week_days = _build_week_day_items(course_key, group_code, week_label)
+            dates = _week_dates(week_days)
+            start_date = dates[0] if dates else None
+
+            timeline.append(
+                {
+                    'course': course_key,
+                    'week_label': week_label,
+                    'week_index': week_index,
+                    'start_date': start_date,
+                }
+            )
+
+    timeline.sort(
+        key=lambda item: (
+            item['start_date'] is None,
+            item['start_date'] or datetime.max.date(),
+            item['course'],
+            item['week_index'],
+        )
+    )
+
+    return timeline
+
+def _pick_today_week_for_group(course_name, group_code):
+    """Выбирает неделю, в которую попадает сегодняшняя дата."""
+    today = datetime.now().date()
+    timeline = _build_group_week_timeline(course_name, group_code)
+
+    if not timeline:
+        return None
+
+    nearest_item = None
+    nearest_key = None
+
+    for item in timeline:
+        week_days = _build_week_day_items(item['course'], group_code, item['week_label'])
+        dates = _week_dates(week_days)
+        if not dates:
+            continue
+
+        week_start = dates[0]
+        week_end = dates[-1]
+
+        if week_start <= today <= (week_end + timedelta(days=1)):
+            return item['course'], item['week_index']
+
+        if today < week_start:
+            distance = (week_start - today).days
+        else:
+            distance = (today - week_end).days
+
+        candidate_key = (distance, week_start)
+        if nearest_key is None or candidate_key < nearest_key:
+            nearest_key = candidate_key
+            nearest_item = item
+
+    if nearest_item is not None:
+        return nearest_item['course'], nearest_item['week_index']
+
+    first_item = timeline[0]
+    return first_item['course'], first_item['week_index']
+
+def _period_has_current_month(course, group_code, weeks):
+    """Проверяет, есть ли в периоде недели текущего месяца."""
+    today = datetime.now().date()
+    for week_label in weeks:
+        for day_item in _build_week_day_items(course, group_code, week_label):
+            day_date = day_item['date_obj']
+            if day_date and day_date.year == today.year and day_date.month == today.month:
+                return True
+    return False
+
+def _pick_initial_week_index(course, group_code, weeks):
+    """Выбирает стартовую неделю."""
+    if not weeks:
+        return 0
+
+    today = datetime.now().date()
+    if not _period_has_current_month(course, group_code, weeks):
+        return 0
+
+    for index, week_label in enumerate(weeks):
+        week_days = _build_week_day_items(course, group_code, week_label)
+        dates = [item['date_obj'] for item in week_days if item['date_obj'] is not None]
+        if not dates:
+            continue
+
+        week_start = min(dates)
+        week_end = max(dates)
+        if week_start <= today <= (week_end + timedelta(days=1)):
+            return index
+
+    for index, week_label in enumerate(weeks):
+        week_days = _build_week_day_items(course, group_code, week_label)
+        if any(
+            item['date_obj']
+            and item['date_obj'].year == today.year
+            and item['date_obj'].month == today.month
+            for item in week_days
+        ):
+            return index
+
+    return 0
+
+
+def _week_date_range_text(week_days):
+    """Форматирует диапазон дат недели."""
+    dates = sorted(item['date_obj'] for item in week_days if item['date_obj'] is not None)
+    if not dates:
+        return 'даты не указаны'
+    return f"{dates[0].strftime('%d.%m')} - {dates[-1].strftime('%d.%m')}"
+
+
+def _get_day_lessons(week_schedule, day_name):
+    """Возвращает занятия выбранного дня."""
+    lessons = [
+        entry
+        for entry in week_schedule
+        if _normalize_cell_text(entry.get('day')).lower() == day_name
+    ]
+    return sorted(lessons, key=lambda item: _normalize_cell_text(item.get('time')))
+
+
+def _build_week_overview_text(course, group_code, week_label, week_days):
+    """Формирует текст страницы недели."""
+    month_week_number = _month_week_number_text(week_days)
+    week_range = _week_date_range_text(week_days)
+
+    lines = [
+        f"<b>{html.escape(_period_label_for_course(course))}</b>\n",
+        f"🎓 Курс: <b>{html.escape(_course_name(course))}</b>\n",
+        f"👥 Группа: <b>{html.escape(group_code)}</b>\n",
+        f"🗓️ Неделя месяца: <b>{month_week_number}</b> ({week_range})\n\n",
+    ]
+
+    lines.append('👇 Нажмите, чтобы открыть расписание.')
+    return ''.join(lines)
+
+def _build_week_keyboard(week_label, week_days):
+    """Строит клавиатуру страницы недели."""
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+
+    for day_index, day_item in enumerate(week_days):
+        day_button_text = f"{day_item['date_short']} ({day_item['day_title']})"
+        if day_item['is_today']:
+            day_button_text += ' | Сегодня 💠'
+
+        keyboard.add(
+            types.InlineKeyboardButton(
+                text=day_button_text[:64],
+                callback_data=f"cal_day_{day_index}",
+            )
+        )
+
+    month_week_number = _month_week_number_text(week_days)
+    keyboard.row(
+        types.InlineKeyboardButton(text='⬅️ Назад', callback_data='cal_shift_-1'),
+        types.InlineKeyboardButton(text=f"📆 Неделя {month_week_number}"[:64], callback_data='cal_noop'),
+        types.InlineKeyboardButton(text='Вперед ➡️', callback_data='cal_shift_1'),
+    )
+
+    keyboard.row(
+        types.InlineKeyboardButton(text='🗂️ Выбор недели', callback_data='cal_pick_week'),
+        types.InlineKeyboardButton(text='🗓️ Выбор месяца', callback_data='cal_pick_month'),
+    )
+
+    return keyboard
+
+def _build_day_keyboard(week_days, selected_day_index):
+    """Строит клавиатуру страницы дня."""
+    keyboard = types.InlineKeyboardMarkup(row_width=6)
+
+    prev_day_index = selected_day_index - 1
+    next_day_index = selected_day_index + 1
+
+    keyboard.row(
+        types.InlineKeyboardButton(text='⬅️ Предыдущий день', callback_data=f"cal_day_{prev_day_index}"),
+        types.InlineKeyboardButton(text='Следующий день ➡️', callback_data=f"cal_day_{next_day_index}"),
+    )
+
+    day_buttons = []
+    for day_index, day_item in enumerate(week_days):
+        short_name = _short_day_name(day_item['day_name'])
+        button_text = f"{short_name} {day_item['date_short'][:5]}"
+
+        if day_index == selected_day_index:
+            button_text = f"* {button_text}"
+        elif day_item['is_today']:
+            button_text = f"{button_text} *"
+
+        day_buttons.append(
+            types.InlineKeyboardButton(
+                text=button_text[:64],
+                callback_data=f"cal_day_{day_index}",
+            )
+        )
+
+
+
+    keyboard.row(types.InlineKeyboardButton(text='↩️ Назад к неделе', callback_data='cal_back_week'))
+
+    return keyboard
+
+def _build_week_picker_keyboard(course, group_code, weeks, current_week_index):
+    """Строит клавиатуру выбора недели."""
+    keyboard = types.InlineKeyboardMarkup(row_width=2)
+
+    if not weeks:
+        return keyboard
+
+    current_week_index = current_week_index % len(weeks)
+
+    for week_index, week_label in enumerate(weeks):
+        week_days = _build_week_day_items(course, group_code, week_label)
+        range_text = _week_date_range_text(week_days)
+        month_week_number = _month_week_number_text(week_days)
+        selected_prefix = '* ' if week_index == current_week_index else ''
+        button_text = f"{selected_prefix}📆 Неделя {month_week_number} ({range_text})"
+
+        keyboard.add(
+            types.InlineKeyboardButton(
+                text=button_text[:64],
+                callback_data=f"cal_weekpick_{week_index}",
+            )
+        )
+
+    current_week_days = _build_week_day_items(course, group_code, weeks[current_week_index])
+    current_dates = _week_dates(current_week_days)
+    month_names = [
+        'Январь', 'Февраль', 'Март', 'Апрель',
+        'Май', 'Июнь', 'Июль', 'Август',
+        'Сентябрь', 'Октябрь', 'Ноябрь', 'Декабрь',
+    ]
+
+    if current_dates:
+        month_date = current_dates[0]
+        month_text = f"🗓️ {month_names[month_date.month - 1]} {month_date.year}"
+    else:
+        month_text = '🗓️ Месяц'
+
+    keyboard.row(
+        types.InlineKeyboardButton(text='⬅️ Назад', callback_data='cal_month_shift_-1'),
+        types.InlineKeyboardButton(text=month_text[:64], callback_data='cal_noop'),
+        types.InlineKeyboardButton(text='Вперед ➡️', callback_data='cal_month_shift_1'),
+    )
+
+    keyboard.row(
+        types.InlineKeyboardButton(text='🎯 Перейти к нынешней неделе', callback_data='cal_current_week'),
+    )
+
+
+    return keyboard
+
+async def _render_period_picker(callback_query: types.CallbackQuery, state: FSMContext, course_name: str, group_code: str):
+    """Показывает выбор месяца или периода."""
+    await state.update_data(
+        selected_course_name=course_name,
+        selected_group=group_code,
+    )
+
+    period_to_course = _build_period_to_course(course_name, group_code)
     if not period_to_course:
-        await callback_query.answer("Для выбранной группы нет расписания", show_alert=True)
+        return False
+
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    group_info = _group_info_for_course_name(course_name, group_code)
+    group_display = f"{group_code}"
+    if len(group_info) > 2 and group_info[2]:
+        group_display += f"\n📚 Направление: {group_info[2]}"
+
+    for period_label, course_key in period_to_course:
+        keyboard.add(
+            types.InlineKeyboardButton(
+                text=f"{period_label}"[:64],
+                callback_data=f"show_schedule_{course_key}_{group_code}",
+            )
+        )
+
+    keyboard.add(
+        types.InlineKeyboardButton(
+            text='👥 Выбрать другую группу',
+            callback_data=f"course_{course_name}",
+        )
+    )
+    keyboard.add(
+        types.InlineKeyboardButton(
+            text='🏠 В главное меню',
+            callback_data='main_menu',
+        )
+    )
+
+    await _safe_edit_text(
+        callback_query.message,
+        f"<b>✅ Вы выбрали:</b>\n"
+        f"🎓 Курс: {html.escape(course_name)}\n"
+        f"👥 Группа: {html.escape(group_display)}\n\n"
+        f"🗓️ Теперь выберите месяц/период:",
+        reply_markup=keyboard,
+        parse_mode='HTML',
+    )
+    return True
+
+async def _render_week_view(callback_query: types.CallbackQuery, state: FSMContext, week_index: int | None = None):
+    """Показывает страницу недели."""
+    user_data = await state.get_data()
+    course = user_data.get('selected_course')
+    group_code = user_data.get('selected_group')
+
+    if not course or not group_code:
+        await callback_query.answer('⚠️ Сначала выберите курс, группу и месяц', show_alert=True)
         return
 
-    keyboard = types.InlineKeyboardMarkup(row_width=2)
-    for period_label, course_key in sorted(period_to_course.items(), key=lambda item: item[0]):
-        keyboard.add(types.InlineKeyboardButton(
-            text=f"📅 {period_label}"[:64],
-            callback_data=f"show_schedule_{course_key}_{group_code}"
-        ))
+    weeks = _get_available_weeks(course, group_code)
+    if not weeks:
+        await callback_query.answer('📭 Для выбранной группы нет расписания', show_alert=True)
+        return
 
-    keyboard.add(types.InlineKeyboardButton(
-        text="⬅️ Выбрать другую группу",
-        callback_data=f"course_{course_name}"
-    ))
-    keyboard.add(types.InlineKeyboardButton(
-        text="🏠 В главное меню",
-        callback_data="main_menu"
-    ))
+    if week_index is None:
+        week_index = user_data.get('selected_week_index', 0)
 
-    await callback_query.message.edit_text(
-        f"✅ <b>Вы выбрали:</b>\n"
-        f"🎓 <b>Курс:</b> {course_name}\n"
-        f"👥 <b>Группа:</b> {group_display}\n\n"
-        f"Теперь выберите месяц/период:",
-        reply_markup=keyboard,
-        parse_mode="HTML"
-    )
+    week_index = week_index % len(weeks)
+    week_label = weeks[week_index]
+    week_days = _build_week_day_items(course, group_code, week_label)
+
+    await state.update_data(selected_week_index=week_index)
+
+    text = _build_week_overview_text(course, group_code, week_label, week_days)
+    keyboard = _build_week_keyboard(week_label, week_days)
+
+    await _safe_edit_text(callback_query.message, text, reply_markup=keyboard, parse_mode='HTML')
     await callback_query.answer()
 
 
+async def _render_day_view(callback_query: types.CallbackQuery, state: FSMContext, day_index: int | None = None):
+    """Показывает страницу дня."""
+    user_data = await state.get_data()
+    course = user_data.get('selected_course')
+    group_code = user_data.get('selected_group')
+
+    if not course or not group_code:
+        await callback_query.answer('⚠️ Сначала выберите курс, группу и месяц', show_alert=True)
+        return
+
+    weeks = _get_available_weeks(course, group_code)
+    if not weeks:
+        await callback_query.answer('📭 Для выбранной группы нет расписания', show_alert=True)
+        return
+
+    week_index = user_data.get('selected_week_index', 0) % len(weeks)
+    week_label = weeks[week_index]
+    week_days = _build_week_day_items(course, group_code, week_label)
+
+    if not week_days:
+        await callback_query.answer('⚠️ Неделя не содержит дней', show_alert=True)
+        return
+
+    if day_index is None:
+        day_index = user_data.get('selected_day_index')
+
+    if day_index is None:
+        today_index = next((idx for idx, item in enumerate(week_days) if item['is_today']), None)
+        day_index = today_index if today_index is not None else 0
+
+    day_index = day_index % len(week_days)
+    day_item = week_days[day_index]
+
+    week_schedule = schedule_data.get(course, {}).get(group_code, {}).get(week_label, [])
+    lessons = _get_day_lessons(week_schedule, day_item['day_name'])
+
+    await state.update_data(selected_week_index=week_index, selected_day_index=day_index)
+
+    header_day = f"{day_item['date_short']} ({day_item['day_title']})"
+    if day_item['is_today']:
+        header_day += ' | Сегодня'
+
+    month_week_number = _month_week_number_text(week_days)
+    week_range = _week_date_range_text(week_days)
+
+    lines = [
+        f"🎓 Курс: <b>{html.escape(_course_name(course))}</b>",
+        f"👥 Группа: <b>{html.escape(group_code)}</b>",
+        f"📅 День: <b>{html.escape(header_day)}</b>",
+        f"🗓️ Неделя месяца: <b>{month_week_number}</b> ({week_range})",
+        '',
+    ]
+
+    if not lessons:
+        lines.append('😌 Свободный день: занятий нет')
+    else:
+        for lesson in lessons:
+            time_text = html.escape(_normalize_cell_text(lesson.get('time')) or 'Время не указано')
+            lesson_text = html.escape(_normalize_cell_text(lesson.get('lesson')) or 'Без названия')
+            if len(lesson_text) > 180:
+                lesson_text = f"{lesson_text[:177]}..."
+            lines.append(f"• ⏰ <b>{time_text}</b> {lesson_text}")
+
+    keyboard = _build_day_keyboard(week_days, day_index)
+
+    await _safe_edit_text(
+        callback_query.message,
+        '\n'.join(lines),
+        reply_markup=keyboard,
+        parse_mode='HTML',
+    )
+    await callback_query.answer()
+
+async def _render_week_picker(callback_query: types.CallbackQuery, state: FSMContext):
+    """Показывает список недель."""
+    user_data = await state.get_data()
+    course = user_data.get('selected_course')
+    group_code = user_data.get('selected_group')
+
+    if not course or not group_code:
+        await callback_query.answer('⚠️ Сначала выберите курс, группу и месяц', show_alert=True)
+        return
+
+    weeks = _get_available_weeks(course, group_code)
+    if not weeks:
+        await callback_query.answer('📭 Для выбранной группы нет расписания', show_alert=True)
+        return
+
+    current_week_index = user_data.get('selected_week_index', 0) % len(weeks)
+    keyboard = _build_week_picker_keyboard(course, group_code, weeks, current_week_index)
+
+    lines = [
+        '<b>🗂️ Выбор недели</b>',
+        f"🎓 Курс: <b>{html.escape(_course_name(course))}</b>",
+        f"👥 Группа: <b>{html.escape(group_code)}</b>",
+        '',
+    ]
+
+
+    await _safe_edit_text(
+        callback_query.message,
+        '\n'.join(lines),
+        reply_markup=keyboard,
+        parse_mode='HTML',
+    )
+    await callback_query.answer()
+
+async def process_group_choice(callback_query: types.CallbackQuery, state: FSMContext):
+    """Обрабатывает выбор группы."""
+    payload = callback_query.data[len('group_'):]
+    if '_' not in payload:
+        await callback_query.answer('⚠️ Некорректные данные группы', show_alert=True)
+        return
+
+    course_name, group_code = payload.rsplit('_', 1)
+    period_to_course = _build_period_to_course(course_name, group_code)
+    if not period_to_course:
+        await callback_query.answer('📭 Для выбранной группы нет расписания', show_alert=True)
+        return
+
+    selected_course = None
+    selected_week_index = 0
+
+    for _, course_key in period_to_course:
+        weeks = _get_available_weeks(course_key, group_code)
+        if not weeks:
+            continue
+        if _period_has_current_month(course_key, group_code, weeks):
+            selected_course = course_key
+            selected_week_index = _pick_initial_week_index(course_key, group_code, weeks)
+            break
+
+    if selected_course is None:
+        selected_course = period_to_course[0][1]
+        weeks = _get_available_weeks(selected_course, group_code)
+        if weeks:
+            selected_week_index = _pick_initial_week_index(selected_course, group_code, weeks)
+
+    await state.update_data(
+        selected_course_name=course_name,
+        selected_course=selected_course,
+        selected_group=group_code,
+        selected_week_index=selected_week_index,
+        selected_day_index=None,
+    )
+    await _render_week_view(callback_query, state, selected_week_index)
+
 async def show_schedule_day(callback_query: types.CallbackQuery, state: FSMContext):
-    """Показывает расписание по дням и неделям."""
+    """Точка входа в расписание."""
     callback_data = callback_query.data
 
     course = None
     group_code = None
-    day_index = None
-    week = None
+    target_week_label = None
+    target_day_index = None
+    open_day_view = False
+    use_auto_week = False
 
-    if callback_data.startswith("show_schedule_"):
-        parts = callback_data.split("_", 3)
-        if len(parts) >= 4:
-            course = parts[2]
-            group_code = parts[3]
-            await state.update_data(selected_course=course, selected_group=group_code)
-    elif callback_data.startswith("show_day_"):
-        parts = callback_data.split("_", 5)
-        if len(parts) >= 5:
-            course = parts[2]
-            group_code = parts[3]
-            if parts[4].isdigit():
-                day_index = int(parts[4])
-        if len(parts) >= 6:
-            week = parts[5]
-    elif callback_data.startswith("show_week_"):
-        parts = callback_data.split("_", 4)
-        if len(parts) >= 5:
-            course = parts[2]
-            group_code = parts[3]
-            week = parts[4]
-            day_index = 0
+    if callback_data.startswith('show_schedule_'):
+        payload = callback_data[len('show_schedule_'):]
+        if '_' in payload:
+            course, group_code = payload.rsplit('_', 1)
+            use_auto_week = True
+    elif callback_data.startswith('show_day_'):
+        payload = callback_data[len('show_day_'):]
+        parts = payload.rsplit('_', 2)
+        if len(parts) == 3 and parts[1].isdigit():
+            course_group, day_token, week_token = parts
+            if '_' in course_group:
+                course, group_code = course_group.rsplit('_', 1)
+                target_day_index = int(day_token)
+                target_week_label = week_token
+                open_day_view = True
+        elif len(parts) == 2 and parts[1].isdigit():
+            course_group, day_token = parts
+            if '_' in course_group:
+                course, group_code = course_group.rsplit('_', 1)
+                target_day_index = int(day_token)
+                open_day_view = True
+    elif callback_data.startswith('show_week_'):
+        payload = callback_data[len('show_week_'):]
+        if '_' in payload:
+            course_group, target_week_label = payload.rsplit('_', 1)
+            if '_' in course_group:
+                course, group_code = course_group.rsplit('_', 1)
 
     if not course or not group_code:
-        await callback_query.answer("Invalid schedule callback data")
+        await callback_query.answer('⚠️ Сначала выберите курс, группу и месяц', show_alert=True)
         return
 
-    schedule_text, target_week, current_day_index, days_in_week = await get_day_schedule(
-        course, group_code, week, day_index
+    weeks = _get_available_weeks(course, group_code)
+    if not weeks:
+        await callback_query.answer('📭 Для выбранной группы нет расписания', show_alert=True)
+        return
+
+    if target_week_label and target_week_label in weeks:
+        week_index = weeks.index(target_week_label)
+    elif use_auto_week:
+        week_index = _pick_initial_week_index(course, group_code, weeks)
+    else:
+        user_data = await state.get_data()
+        week_index = user_data.get('selected_week_index', 0) % len(weeks)
+
+    await state.update_data(
+        selected_course=course,
+        selected_course_name=_course_name(course),
+        selected_group=group_code,
+        selected_week_index=week_index,
     )
 
-    if schedule_text is None or current_day_index is None:
-        await callback_query.answer("Ошибка при получении расписания")
+    if open_day_view:
+        await _render_day_view(callback_query, state, target_day_index)
+    else:
+        await _render_week_view(callback_query, state, week_index)
+
+
+async def calendar_shift_week(callback_query: types.CallbackQuery, state: FSMContext):
+    """Переключает неделю вперед или назад, включая переход между месяцами."""
+    try:
+        delta = int(callback_query.data.split('_', 2)[2])
+    except (ValueError, IndexError):
+        await callback_query.answer('⚠️ Некорректный шаг недели', show_alert=True)
         return
 
-    keyboard = types.InlineKeyboardMarkup(row_width=3)
+    user_data = await state.get_data()
+    course = user_data.get('selected_course')
+    group_code = user_data.get('selected_group')
+    course_name = user_data.get('selected_course_name')
 
-    if days_in_week and len(days_in_week) > 1:
-        prev_day_index = current_day_index - 1
-        if prev_day_index >= 0:
-            keyboard.add(types.InlineKeyboardButton(
-                text="◀️ Предыдущий день",
-                callback_data=f"show_day_{course}_{group_code}_{prev_day_index}_{target_week}"
-            ))
-        else:
-            keyboard.add(types.InlineKeyboardButton(
-                text="◀️ Последний день",
-                callback_data=f"show_day_{course}_{group_code}_{len(days_in_week)-1}_{target_week}"
-            ))
+    if not course or not group_code:
+        await callback_query.answer('⚠️ Сначала выберите курс, группу и месяц', show_alert=True)
+        return
 
-        keyboard.add(types.InlineKeyboardButton(
-            text="📅 Выбрать день",
-            callback_data=f"choose_day_{course}_{group_code}_{target_week}"
-        ))
+    if not course_name:
+        course_name = _course_name(course)
 
-        next_day_index = current_day_index + 1
-        if next_day_index < len(days_in_week):
-            keyboard.add(types.InlineKeyboardButton(
-                text="Следующий день ▶️",
-                callback_data=f"show_day_{course}_{group_code}_{next_day_index}_{target_week}"
-            ))
-        else:
-            keyboard.add(types.InlineKeyboardButton(
-                text="Первый день ▶️",
-                callback_data=f"show_day_{course}_{group_code}_0_{target_week}"
-            ))
+    weeks = _get_available_weeks(course, group_code)
+    if not weeks:
+        await callback_query.answer('📭 Для выбранной группы нет расписания', show_alert=True)
+        return
 
-    available_weeks = []
-    if course in schedule_data and group_code in schedule_data[course]:
-        available_weeks = sorted(schedule_data[course][group_code].keys(), key=_week_sort_key)
+    current_week_index = user_data.get('selected_week_index', 0) % len(weeks)
+    current_week_label = weeks[current_week_index]
 
-    if len(available_weeks) > 1:
-        keyboard.row()
-        for week_item in available_weeks:
-            if week_item != target_week:
-                keyboard.add(types.InlineKeyboardButton(
-                    text=f"📆 {week_item}",
-                    callback_data=f"show_week_{course}_{group_code}_{week_item}"
-                ))
+    timeline = _build_group_week_timeline(course_name, group_code)
+    if not timeline:
+        await callback_query.answer('📭 Для выбранной группы нет расписания', show_alert=True)
+        return
 
-    keyboard.row()
-    keyboard.add(
-        types.InlineKeyboardButton(
-            text="🔄 Обновить",
-            callback_data=f"refresh_{course}_{group_code}"
+    current_timeline_index = next(
+        (
+            idx
+            for idx, item in enumerate(timeline)
+            if item['course'] == course and item['week_label'] == current_week_label
         ),
-        types.InlineKeyboardButton(
-            text="⬅️ Назад к месяцам",
-            callback_data=f"group_{_course_name(course)}_{group_code}"
-        )
+        None,
     )
 
-    await callback_query.message.edit_text(
-        schedule_text,
-        reply_markup=keyboard,
-        parse_mode="HTML"
-    )
-    await callback_query.answer()
+    if current_timeline_index is None:
+        current_timeline_index = 0
 
+    target_timeline_index = current_timeline_index + delta
 
-async def choose_day(callback_query: types.CallbackQuery):
-    """Показывает выбор дня недели."""
-    data = callback_query.data.split("_", 4)
-    course = data[2]
-    group_code = data[3]
-    week = data[4] if len(data) > 4 else None
-    
-    # Получаем доступные дни для этой недели
-    schedule_text, target_week, current_day_index, days_in_week = await get_day_schedule(
-        course, group_code, week, 0
-    )
-    
-    if not days_in_week:
-        await callback_query.answer("Нет данных о днях недели")
+    if target_timeline_index < 0:
+        await callback_query.answer('📭 Предыдущих недель больше нет.', show_alert=True)
         return
-    
-    keyboard = types.InlineKeyboardMarkup(row_width=2)
-    
-    for i, (day, date) in enumerate(days_in_week):
-        # Проверяем, есть ли занятия в этот день
-        has_lessons = False
-        if course in schedule_data and group_code in schedule_data[course]:
-            week_schedule = schedule_data[course][group_code].get(target_week, [])
-            for entry in week_schedule:
-                entry_day = _normalize_cell_text(entry.get('day')).lower()
-                if entry_day == day:
-                    has_lessons = True
-                    break
-        
-        day_text = f"{day} ({date})"
-        if has_lessons:
-            day_text = "✅ " + day_text
-        else:
-            day_text = "📭 " + day_text
-        
-        keyboard.add(types.InlineKeyboardButton(
-            text=day_text,
-            callback_data=f"show_day_{course}_{group_code}_{i}_{target_week}"
-        ))
-    
-    keyboard.row()
-    keyboard.add(types.InlineKeyboardButton(
-        text="⬅️ Назад к расписанию",
-        callback_data=f"show_schedule_{course}_{group_code}"
-    ))
-    
-    await callback_query.message.edit_text(
-        f"📅 Выберите день недели ({target_week}):\n"
-        f"✅ - есть занятия\n"
-        f"📭 - свободный день",
-        reply_markup=keyboard
+
+    if target_timeline_index >= len(timeline):
+        await callback_query.answer(
+            '📭 Следующих недель нет. Как они появятся, мы вам обязательно сообщим.',
+            show_alert=True,
+        )
+        return
+
+    target = timeline[target_timeline_index]
+
+    await state.update_data(
+        selected_course_name=course_name,
+        selected_course=target['course'],
+        selected_group=group_code,
+        selected_week_index=target['week_index'],
+        selected_day_index=None,
     )
+
+    await _render_week_view(callback_query, state, target['week_index'])
+
+async def calendar_open_day(callback_query: types.CallbackQuery, state: FSMContext):
+    """Открывает расписание дня со сквозной навигацией между неделями и месяцами."""
+    try:
+        day_index = int(callback_query.data.split('_', 2)[2])
+    except (ValueError, IndexError):
+        await callback_query.answer('⚠️ Некорректный день', show_alert=True)
+        return
+
+    user_data = await state.get_data()
+    course = user_data.get('selected_course')
+    group_code = user_data.get('selected_group')
+
+    if not course or not group_code:
+        await callback_query.answer('⚠️ Сначала выберите курс, группу и месяц', show_alert=True)
+        return
+
+    weeks = _get_available_weeks(course, group_code)
+    if not weeks:
+        await callback_query.answer('📭 Для выбранной группы нет расписания', show_alert=True)
+        return
+
+    current_week_index = user_data.get('selected_week_index', 0) % len(weeks)
+    current_week_label = weeks[current_week_index]
+    current_week_days = _build_week_day_items(course, group_code, current_week_label)
+
+    if not current_week_days:
+        await callback_query.answer('⚠️ Неделя не содержит дней', show_alert=True)
+        return
+
+    if 0 <= day_index < len(current_week_days):
+        await _render_day_view(callback_query, state, day_index)
+        return
+
+    direction = -1 if day_index < 0 else 1
+    course_name = user_data.get('selected_course_name') or _course_name(course)
+    timeline = _build_group_week_timeline(course_name, group_code)
+
+    if not timeline:
+        await callback_query.answer('📭 Для выбранной группы нет расписания', show_alert=True)
+        return
+
+    current_timeline_index = next(
+        (
+            idx
+            for idx, item in enumerate(timeline)
+            if item['course'] == course and item['week_label'] == current_week_label
+        ),
+        None,
+    )
+
+    if current_timeline_index is None:
+        current_timeline_index = 0
+
+    target_timeline_index = current_timeline_index + direction
+
+    while 0 <= target_timeline_index < len(timeline):
+        target = timeline[target_timeline_index]
+        target_week_days = _build_week_day_items(target['course'], group_code, target['week_label'])
+
+        if target_week_days:
+            target_day_index = len(target_week_days) - 1 if direction < 0 else 0
+
+            await state.update_data(
+                selected_course_name=course_name,
+                selected_course=target['course'],
+                selected_group=group_code,
+                selected_week_index=target['week_index'],
+                selected_day_index=target_day_index,
+            )
+
+            await _render_day_view(callback_query, state, target_day_index)
+            return
+
+        target_timeline_index += direction
+
+    if direction < 0:
+        await callback_query.answer('📭 Предыдущих дней больше нет.', show_alert=True)
+        return
+
+    await callback_query.answer(
+        '📭 Следующих дней нет. Как они появятся, мы вам обязательно сообщим.',
+        show_alert=True,
+    )
+
+
+
+async def calendar_shift_month_in_week_picker(callback_query: types.CallbackQuery, state: FSMContext):
+    """Листает месяцы на экране выбора недели."""
+    try:
+        delta = int(callback_query.data.split('_', 3)[3])
+    except (ValueError, IndexError):
+        await callback_query.answer('⚠️ Некорректное направление', show_alert=True)
+        return
+
+    user_data = await state.get_data()
+    selected_course = user_data.get('selected_course')
+    group_code = user_data.get('selected_group')
+    course_name = user_data.get('selected_course_name')
+
+    if not selected_course or not group_code:
+        await callback_query.answer('⚠️ Сначала выберите курс, группу и месяц', show_alert=True)
+        return
+
+    if not course_name:
+        course_name = _course_name(selected_course)
+
+    period_to_course = _build_period_to_course(course_name, group_code)
+    if not period_to_course:
+        await callback_query.answer('📭 Для выбранной группы нет расписания', show_alert=True)
+        return
+
+    course_keys = [course_key for _, course_key in period_to_course]
+    if selected_course in course_keys:
+        current_index = course_keys.index(selected_course)
+    else:
+        current_index = 0
+
+    target_index = current_index + delta
+    if target_index < 0 or target_index >= len(course_keys):
+        await callback_query.answer('📭 Больше месяцев нет', show_alert=True)
+        return
+
+    target_course = course_keys[target_index]
+    weeks = _get_available_weeks(target_course, group_code)
+    week_index = _pick_initial_week_index(target_course, group_code, weeks) if weeks else 0
+
+    await state.update_data(
+        selected_course_name=course_name,
+        selected_course=target_course,
+        selected_group=group_code,
+        selected_week_index=week_index,
+        selected_day_index=None,
+    )
+
+    await _render_week_picker(callback_query, state)
+
+
+
+async def calendar_open_current_week(callback_query: types.CallbackQuery, state: FSMContext):
+    """Открывает неделю по сегодняшней дате для текущей группы."""
+    user_data = await state.get_data()
+    course = user_data.get('selected_course')
+    group_code = user_data.get('selected_group')
+    course_name = user_data.get('selected_course_name')
+
+    if not course or not group_code:
+        await callback_query.answer('⚠️ Сначала выберите курс, группу и месяц', show_alert=True)
+        return
+
+    if not course_name:
+        course_name = _course_name(course)
+
+    target_week = _pick_today_week_for_group(course_name, group_code)
+    if target_week is None:
+        await callback_query.answer('📭 Для этой группы нет доступных недель', show_alert=True)
+        return
+
+    target_course, week_index = target_week
+
+    await state.update_data(
+        selected_course_name=course_name,
+        selected_course=target_course,
+        selected_group=group_code,
+        selected_week_index=week_index,
+        selected_day_index=None,
+    )
+    await _render_week_view(callback_query, state, week_index)
+
+async def calendar_pick_week(callback_query: types.CallbackQuery, state: FSMContext):
+    """Открывает выбор недели."""
+    await _render_week_picker(callback_query, state)
+
+
+async def calendar_choose_week(callback_query: types.CallbackQuery, state: FSMContext):
+    """Выбирает неделю из списка."""
+    try:
+        week_index = int(callback_query.data.split('_', 2)[2])
+    except (ValueError, IndexError):
+        await callback_query.answer('⚠️ Некорректный индекс недели', show_alert=True)
+        return
+
+    await state.update_data(selected_week_index=week_index)
+    await _render_week_view(callback_query, state, week_index)
+
+
+async def calendar_back_week(callback_query: types.CallbackQuery, state: FSMContext):
+    """Возвращает к неделе."""
+    user_data = await state.get_data()
+    week_index = user_data.get('selected_week_index', 0)
+    await _render_week_view(callback_query, state, week_index)
+
+
+async def calendar_pick_month(callback_query: types.CallbackQuery, state: FSMContext):
+    """Возвращает к выбору месяца."""
+    user_data = await state.get_data()
+    course_name = user_data.get('selected_course_name')
+    selected_course = user_data.get('selected_course')
+    group_code = user_data.get('selected_group')
+
+    if not course_name and selected_course:
+        course_name = _course_name(selected_course)
+
+    if not course_name or not group_code:
+        await callback_query.answer('⚠️ Сначала выберите курс и группу', show_alert=True)
+        return
+
+    rendered = await _render_period_picker(callback_query, state, course_name, group_code)
+    if not rendered:
+        await callback_query.answer('📭 Для выбранной группы нет расписания', show_alert=True)
+        return
+
     await callback_query.answer()
 
-# Колбек для выбора недели
+
+async def calendar_noop(callback_query: types.CallbackQuery):
+    """Служебная кнопка."""
+    await callback_query.answer()
+
+
+async def choose_day(callback_query: types.CallbackQuery, state: FSMContext):
+    """Обрабатывает старый choose_day callback."""
+    payload = callback_query.data[len('choose_day_'):]
+    parts = payload.rsplit('_', 2)
+    if len(parts) < 2:
+        await callback_query.answer('⚠️ Некорректные данные выбора дня', show_alert=True)
+        return
+
+    if len(parts) == 3:
+        course_group, _, target_week_label = parts
+    else:
+        course_group, _ = parts
+        target_week_label = None
+
+    if '_' not in course_group:
+        await callback_query.answer('⚠️ Некорректные данные курса и группы', show_alert=True)
+        return
+
+    course, group_code = course_group.rsplit('_', 1)
+
+    weeks = _get_available_weeks(course, group_code)
+    if not weeks:
+        await callback_query.answer('📭 Для выбранной группы нет расписания', show_alert=True)
+        return
+
+    week_index = 0
+    if target_week_label and target_week_label in weeks:
+        week_index = weeks.index(target_week_label)
+
+    await state.update_data(
+        selected_course=course,
+        selected_course_name=_course_name(course),
+        selected_group=group_code,
+        selected_week_index=week_index,
+    )
+
+    await _render_week_view(callback_query, state, week_index)
+
+
 async def show_week(callback_query: types.CallbackQuery, state: FSMContext):
-    """Переключает отображение на выбранную неделю."""
+    """Обрабатывает старый show_week callback."""
     await show_schedule_day(callback_query, state)
+
 
 async def refresh_schedule(callback_query: types.CallbackQuery, state: FSMContext):
-    """Перезагружает расписание из Excel-файлов."""
-    data = callback_query.data.split("_", 3)
-    course = data[1]
-    group_code = data[2]
-    
-    # Показываем сообщение о загрузке
-    await callback_query.message.edit_text(
-        "🔄 Обновляю расписание...",
-        parse_mode="HTML"
-    )
-    
-    # Перепарсиваем файл
-    init_schedule()
-    
-    # Возвращаемся к показу расписания
-    callback_query.data = f"show_schedule_{course}_{group_code}"
-    await show_schedule_day(callback_query, state)
-    await callback_query.answer("Расписание обновлено!")
+    """Перезагружает расписание."""
+    payload = callback_query.data[len('refresh_'):]
+    course = None
+    group_code = None
 
-# Колбек для возврата к выбору курса
+    if '_' in payload:
+        course, group_code = payload.rsplit('_', 1)
+
+    user_data = await state.get_data()
+    course = course or user_data.get('selected_course')
+    group_code = group_code or user_data.get('selected_group')
+
+    await _safe_edit_text(callback_query.message, '🔄 Обновляю расписание...', parse_mode='HTML')
+
+    init_schedule()
+
+    if course and group_code and course in schedule_data and group_code in schedule_data.get(course, {}):
+        await state.update_data(selected_course=course, selected_group=group_code, selected_course_name=_course_name(course))
+        callback_query.data = f"show_schedule_{course}_{group_code}"
+        await show_schedule_day(callback_query, state)
+        await callback_query.answer('✅ Расписание обновлено')
+        return
+
+    await callback_query.answer('✅ Расписание обновлено, выберите месяц заново', show_alert=True)
+
+
 async def back_to_courses(callback_query: types.CallbackQuery):
     """Возвращает пользователя к выбору курса."""
     await choose_course(callback_query.message)
@@ -987,11 +1772,11 @@ async def main_menu(callback_query: types.CallbackQuery):
 async def my_schedule(message: types.Message, state: FSMContext):
     """Показывает текущее выбранное расписание пользователя."""
     user_data = await state.get_data()
-    
+
     if 'selected_course' in user_data and 'selected_group' in user_data:
         course = user_data['selected_course']
         group_code = user_data['selected_group']
-        
+
         keyboard = types.InlineKeyboardMarkup(row_width=2)
         keyboard.add(
             types.InlineKeyboardButton(
@@ -1003,27 +1788,26 @@ async def my_schedule(message: types.Message, state: FSMContext):
                 callback_data="change_group"
             )
         )
-        
+
         group_info = get_group_info(course, group_code)
         group_display = f"{group_code}"
         if len(group_info) > 2 and group_info[2]:
             group_display += f"\n📚 Направление: {group_info[2]}"
-        
+
         await message.answer(
-            f"📋 <b>Ваше текущее расписание:</b>\n"
-            f"🎓 <b>Курс:</b> {_course_display(course)}\n"
-            f"👥 <b>Группа:</b> {group_display}\n\n"
-            f"Что вы хотите сделать?",
+            f"<b>📋 Ваше текущее расписание:</b>\n"
+            f"<b>🎓 Курс:</b> {_course_display(course)}\n"
+            f"<b>👥 Группа:</b> {group_display}\n\n"
+            "👇 Нажмите кнопку ниже, чтобы открыть расписание.",
             reply_markup=keyboard,
             parse_mode="HTML"
         )
     else:
         await message.answer(
-            "Вы еще не выбрали группу. Давайте выберем её сейчас:"
+            "ℹ️ Вы еще не выбрали группу. Давайте выберем её сейчас:"
         )
         await choose_course(message)
 
-# Колбек для изменения группы
 async def change_group(callback_query: types.CallbackQuery):
     """Запускает повторный выбор группы."""
     await choose_course(callback_query.message)
@@ -1042,9 +1826,23 @@ def register_handlers_client(dp: Dispatcher):
     dp.register_callback_query_handler(process_group_choice, Text(startswith="group_"))
     dp.register_callback_query_handler(show_schedule_day, Text(startswith="show_schedule_"))
     dp.register_callback_query_handler(show_schedule_day, Text(startswith="show_day_"))
-    dp.register_callback_query_handler(choose_day, Text(startswith="choose_day_"))
     dp.register_callback_query_handler(show_week, Text(startswith="show_week_"))
+    dp.register_callback_query_handler(choose_day, Text(startswith="choose_day_"))
+
+    dp.register_callback_query_handler(calendar_shift_week, Text(startswith="cal_shift_"))
+    dp.register_callback_query_handler(calendar_open_day, Text(startswith="cal_day_"))
+
+    dp.register_callback_query_handler(calendar_pick_week, Text(equals="cal_pick_week"))
+    dp.register_callback_query_handler(calendar_open_current_week, Text(equals="cal_current_week"))
+    dp.register_callback_query_handler(calendar_shift_month_in_week_picker, Text(startswith="cal_month_shift_"))
+
+    dp.register_callback_query_handler(calendar_choose_week, Text(startswith="cal_weekpick_"))
+    dp.register_callback_query_handler(calendar_back_week, Text(equals="cal_back_week"))
+    dp.register_callback_query_handler(calendar_pick_month, Text(equals="cal_pick_month"))
+    dp.register_callback_query_handler(calendar_noop, Text(equals="cal_noop"))
+
     dp.register_callback_query_handler(refresh_schedule, Text(startswith="refresh_"))
     dp.register_callback_query_handler(back_to_courses, Text(startswith="back_to_courses"))
     dp.register_callback_query_handler(main_menu, Text(startswith="main_menu"))
     dp.register_callback_query_handler(change_group, Text(startswith="change_group"))
+
