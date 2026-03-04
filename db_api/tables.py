@@ -27,6 +27,22 @@ class Users(Base):
     referrer_id = Column(BigInteger)
 
 
+
+class UserScheduleState(Base):
+    """Сохраненное состояние выбора расписания для пользователя."""
+
+    __tablename__ = 'user_schedule_states'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    telegram_id = Column(BigInteger, nullable=False, unique=True, index=True)
+    selected_course = Column(String(255), nullable=True)
+    selected_course_name = Column(String(255), nullable=True)
+    selected_group = Column(String(64), nullable=True)
+    selected_week_index = Column(Integer, nullable=True)
+    selected_day_index = Column(Integer, nullable=True)
+    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 class SchedulePeriod(Base):
     """Период расписания (например, месяц/семестр из имени файла)."""
 

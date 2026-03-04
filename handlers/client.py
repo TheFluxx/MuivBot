@@ -77,6 +77,86 @@ course_display_names = {}
 course_period_ids = {}
 period_id_to_label = {}
 period_courses = {}
+USER_SELECTION_KEYS = (
+    'selected_course',
+    'selected_course_name',
+    'selected_group',
+    'selected_week_index',
+    'selected_day_index',
+)
+
+
+def _telegram_id_from_message(message: types.Message):
+    """Возвращает telegram_id из сообщения."""
+    if message and message.from_user:
+        return message.from_user.id
+    return None
+
+
+def _telegram_id_from_callback(callback_query: types.CallbackQuery):
+    """Возвращает telegram_id из callback-запроса."""
+    if callback_query and callback_query.from_user:
+        return callback_query.from_user.id
+    return None
+
+
+async def _load_user_selection_from_db(telegram_id):
+    """Загружает сохраненный выбор пользователя из базы данных."""
+    if telegram_id is None:
+        return {}
+
+    try:
+        db_state = await db_commands.get_user_schedule_state(telegram_id)
+    except Exception as db_error:
+        print(f"ERROR: cannot load user schedule state from DB: {db_error}")
+        return {}
+
+    if not db_state:
+        return {}
+
+    return {key: db_state.get(key) for key in USER_SELECTION_KEYS if key in db_state}
+
+
+async def _get_user_data_with_db_fallback(state: FSMContext, telegram_id):
+    """Возвращает пользовательские данные из FSM с подгрузкой из БД при необходимости."""
+    user_data = await state.get_data()
+
+    # Если ключевой выбор уже есть в FSM, используем его.
+    if user_data.get('selected_course') and user_data.get('selected_group'):
+        return user_data
+
+    db_payload = await _load_user_selection_from_db(telegram_id)
+    if not db_payload:
+        return user_data
+
+    missing_payload = {
+        key: value
+        for key, value in db_payload.items()
+        if key not in user_data or user_data.get(key) is None
+    }
+    if missing_payload:
+        await state.update_data(**missing_payload)
+        user_data = await state.get_data()
+
+    return user_data
+
+
+async def _update_user_selection(state: FSMContext, telegram_id, **kwargs):
+    """Обновляет выбор пользователя в FSM и синхронизирует его в БД."""
+    payload = {key: kwargs.get(key) for key in USER_SELECTION_KEYS if key in kwargs}
+    if not payload:
+        return
+
+    await state.update_data(**payload)
+
+    if telegram_id is None:
+        return
+
+    try:
+        await db_commands.upsert_user_schedule_state(telegram_id, **payload)
+    except Exception as db_error:
+        print(f"ERROR: cannot save user schedule state to DB: {db_error}")
+
 
 
 def _discover_excel_files():
@@ -1121,7 +1201,9 @@ def _build_week_picker_keyboard(course, group_code, weeks, current_week_index):
 
 async def _render_period_picker(callback_query: types.CallbackQuery, state: FSMContext, course_name: str, group_code: str):
     """Показывает выбор месяца или периода."""
-    await state.update_data(
+    await _update_user_selection(
+        state,
+        _telegram_id_from_callback(callback_query),
         selected_course_name=course_name,
         selected_group=group_code,
     )
@@ -1170,7 +1252,7 @@ async def _render_period_picker(callback_query: types.CallbackQuery, state: FSMC
 
 async def _render_week_view(callback_query: types.CallbackQuery, state: FSMContext, week_index: int | None = None):
     """Показывает страницу недели."""
-    user_data = await state.get_data()
+    user_data = await _get_user_data_with_db_fallback(state, _telegram_id_from_callback(callback_query))
     course = user_data.get('selected_course')
     group_code = user_data.get('selected_group')
 
@@ -1190,7 +1272,11 @@ async def _render_week_view(callback_query: types.CallbackQuery, state: FSMConte
     week_label = weeks[week_index]
     week_days = _build_week_day_items(course, group_code, week_label)
 
-    await state.update_data(selected_week_index=week_index)
+    await _update_user_selection(
+        state,
+        _telegram_id_from_callback(callback_query),
+        selected_week_index=week_index,
+    )
 
     text = _build_week_overview_text(course, group_code, week_label, week_days)
     keyboard = _build_week_keyboard(week_label, week_days)
@@ -1201,7 +1287,7 @@ async def _render_week_view(callback_query: types.CallbackQuery, state: FSMConte
 
 async def _render_day_view(callback_query: types.CallbackQuery, state: FSMContext, day_index: int | None = None):
     """Показывает страницу дня."""
-    user_data = await state.get_data()
+    user_data = await _get_user_data_with_db_fallback(state, _telegram_id_from_callback(callback_query))
     course = user_data.get('selected_course')
     group_code = user_data.get('selected_group')
 
@@ -1235,7 +1321,12 @@ async def _render_day_view(callback_query: types.CallbackQuery, state: FSMContex
     week_schedule = schedule_data.get(course, {}).get(group_code, {}).get(week_label, [])
     lessons = _get_day_lessons(week_schedule, day_item['day_name'])
 
-    await state.update_data(selected_week_index=week_index, selected_day_index=day_index)
+    await _update_user_selection(
+        state,
+        _telegram_id_from_callback(callback_query),
+        selected_week_index=week_index,
+        selected_day_index=day_index,
+    )
 
     header_day = f"{day_item['date_short']} ({day_item['day_title']})"
     if day_item['is_today']:
@@ -1274,7 +1365,7 @@ async def _render_day_view(callback_query: types.CallbackQuery, state: FSMContex
 
 async def _render_week_picker(callback_query: types.CallbackQuery, state: FSMContext):
     """Показывает список недель."""
-    user_data = await state.get_data()
+    user_data = await _get_user_data_with_db_fallback(state, _telegram_id_from_callback(callback_query))
     course = user_data.get('selected_course')
     group_code = user_data.get('selected_group')
 
@@ -1337,7 +1428,9 @@ async def process_group_choice(callback_query: types.CallbackQuery, state: FSMCo
         if weeks:
             selected_week_index = _pick_initial_week_index(selected_course, group_code, weeks)
 
-    await state.update_data(
+    await _update_user_selection(
+        state,
+        _telegram_id_from_callback(callback_query),
         selected_course_name=course_name,
         selected_course=selected_course,
         selected_group=group_code,
@@ -1399,10 +1492,12 @@ async def show_schedule_day(callback_query: types.CallbackQuery, state: FSMConte
     elif use_auto_week:
         week_index = _pick_initial_week_index(course, group_code, weeks)
     else:
-        user_data = await state.get_data()
+        user_data = await _get_user_data_with_db_fallback(state, _telegram_id_from_callback(callback_query))
         week_index = user_data.get('selected_week_index', 0) % len(weeks)
 
-    await state.update_data(
+    await _update_user_selection(
+        state,
+        _telegram_id_from_callback(callback_query),
         selected_course=course,
         selected_course_name=_course_name(course),
         selected_group=group_code,
@@ -1423,7 +1518,7 @@ async def calendar_shift_week(callback_query: types.CallbackQuery, state: FSMCon
         await callback_query.answer('⚠️ Некорректный шаг недели', show_alert=True)
         return
 
-    user_data = await state.get_data()
+    user_data = await _get_user_data_with_db_fallback(state, _telegram_id_from_callback(callback_query))
     course = user_data.get('selected_course')
     group_code = user_data.get('selected_group')
     course_name = user_data.get('selected_course_name')
@@ -1475,7 +1570,9 @@ async def calendar_shift_week(callback_query: types.CallbackQuery, state: FSMCon
 
     target = timeline[target_timeline_index]
 
-    await state.update_data(
+    await _update_user_selection(
+        state,
+        _telegram_id_from_callback(callback_query),
         selected_course_name=course_name,
         selected_course=target['course'],
         selected_group=group_code,
@@ -1493,7 +1590,7 @@ async def calendar_open_day(callback_query: types.CallbackQuery, state: FSMConte
         await callback_query.answer('⚠️ Некорректный день', show_alert=True)
         return
 
-    user_data = await state.get_data()
+    user_data = await _get_user_data_with_db_fallback(state, _telegram_id_from_callback(callback_query))
     course = user_data.get('selected_course')
     group_code = user_data.get('selected_group')
 
@@ -1547,7 +1644,9 @@ async def calendar_open_day(callback_query: types.CallbackQuery, state: FSMConte
         if target_week_days:
             target_day_index = len(target_week_days) - 1 if direction < 0 else 0
 
-            await state.update_data(
+            await _update_user_selection(
+                state,
+                _telegram_id_from_callback(callback_query),
                 selected_course_name=course_name,
                 selected_course=target['course'],
                 selected_group=group_code,
@@ -1579,7 +1678,7 @@ async def calendar_shift_month_in_week_picker(callback_query: types.CallbackQuer
         await callback_query.answer('⚠️ Некорректное направление', show_alert=True)
         return
 
-    user_data = await state.get_data()
+    user_data = await _get_user_data_with_db_fallback(state, _telegram_id_from_callback(callback_query))
     selected_course = user_data.get('selected_course')
     group_code = user_data.get('selected_group')
     course_name = user_data.get('selected_course_name')
@@ -1611,7 +1710,9 @@ async def calendar_shift_month_in_week_picker(callback_query: types.CallbackQuer
     weeks = _get_available_weeks(target_course, group_code)
     week_index = _pick_initial_week_index(target_course, group_code, weeks) if weeks else 0
 
-    await state.update_data(
+    await _update_user_selection(
+        state,
+        _telegram_id_from_callback(callback_query),
         selected_course_name=course_name,
         selected_course=target_course,
         selected_group=group_code,
@@ -1625,7 +1726,7 @@ async def calendar_shift_month_in_week_picker(callback_query: types.CallbackQuer
 
 async def calendar_open_current_week(callback_query: types.CallbackQuery, state: FSMContext):
     """Открывает неделю по сегодняшней дате для текущей группы."""
-    user_data = await state.get_data()
+    user_data = await _get_user_data_with_db_fallback(state, _telegram_id_from_callback(callback_query))
     course = user_data.get('selected_course')
     group_code = user_data.get('selected_group')
     course_name = user_data.get('selected_course_name')
@@ -1644,7 +1745,9 @@ async def calendar_open_current_week(callback_query: types.CallbackQuery, state:
 
     target_course, week_index = target_week
 
-    await state.update_data(
+    await _update_user_selection(
+        state,
+        _telegram_id_from_callback(callback_query),
         selected_course_name=course_name,
         selected_course=target_course,
         selected_group=group_code,
@@ -1666,20 +1769,24 @@ async def calendar_choose_week(callback_query: types.CallbackQuery, state: FSMCo
         await callback_query.answer('⚠️ Некорректный индекс недели', show_alert=True)
         return
 
-    await state.update_data(selected_week_index=week_index)
+    await _update_user_selection(
+        state,
+        _telegram_id_from_callback(callback_query),
+        selected_week_index=week_index,
+    )
     await _render_week_view(callback_query, state, week_index)
 
 
 async def calendar_back_week(callback_query: types.CallbackQuery, state: FSMContext):
     """Возвращает к неделе."""
-    user_data = await state.get_data()
+    user_data = await _get_user_data_with_db_fallback(state, _telegram_id_from_callback(callback_query))
     week_index = user_data.get('selected_week_index', 0)
     await _render_week_view(callback_query, state, week_index)
 
 
 async def calendar_pick_month(callback_query: types.CallbackQuery, state: FSMContext):
     """Возвращает к выбору месяца."""
-    user_data = await state.get_data()
+    user_data = await _get_user_data_with_db_fallback(state, _telegram_id_from_callback(callback_query))
     course_name = user_data.get('selected_course_name')
     selected_course = user_data.get('selected_course')
     group_code = user_data.get('selected_group')
@@ -1733,7 +1840,9 @@ async def choose_day(callback_query: types.CallbackQuery, state: FSMContext):
     if target_week_label and target_week_label in weeks:
         week_index = weeks.index(target_week_label)
 
-    await state.update_data(
+    await _update_user_selection(
+        state,
+        _telegram_id_from_callback(callback_query),
         selected_course=course,
         selected_course_name=_course_name(course),
         selected_group=group_code,
@@ -1757,7 +1866,7 @@ async def refresh_schedule(callback_query: types.CallbackQuery, state: FSMContex
     if '_' in payload:
         course, group_code = payload.rsplit('_', 1)
 
-    user_data = await state.get_data()
+    user_data = await _get_user_data_with_db_fallback(state, _telegram_id_from_callback(callback_query))
     course = course or user_data.get('selected_course')
     group_code = group_code or user_data.get('selected_group')
 
@@ -1775,7 +1884,13 @@ async def refresh_schedule(callback_query: types.CallbackQuery, state: FSMContex
 
 
     if course and group_code and course in schedule_data and group_code in schedule_data.get(course, {}):
-        await state.update_data(selected_course=course, selected_group=group_code, selected_course_name=_course_name(course))
+        await _update_user_selection(
+            state,
+            _telegram_id_from_callback(callback_query),
+            selected_course=course,
+            selected_group=group_code,
+            selected_course_name=_course_name(course),
+        )
         callback_query.data = f"show_schedule_{course}_{group_code}"
         await show_schedule_day(callback_query, state)
         await callback_query.answer('✅ Расписание обновлено')
@@ -1801,12 +1916,12 @@ async def main_menu(callback_query: types.CallbackQuery):
 # Хендлер для команды "Мое расписание"
 async def my_schedule(message: types.Message, state: FSMContext):
     """Показывает текущее выбранное расписание пользователя."""
-    user_data = await state.get_data()
+    user_data = await _get_user_data_with_db_fallback(state, _telegram_id_from_message(message))
 
-    if 'selected_course' in user_data and 'selected_group' in user_data:
-        course = user_data['selected_course']
-        group_code = user_data['selected_group']
+    course = user_data.get('selected_course')
+    group_code = user_data.get('selected_group')
 
+    if course and group_code:
         keyboard = types.InlineKeyboardMarkup(row_width=2)
         keyboard.add(
             types.InlineKeyboardButton(
@@ -1875,5 +1990,3 @@ def register_handlers_client(dp: Dispatcher):
     dp.register_callback_query_handler(back_to_courses, Text(startswith="back_to_courses"))
     dp.register_callback_query_handler(main_menu, Text(startswith="main_menu"))
     dp.register_callback_query_handler(change_group, Text(startswith="change_group"))
-
-

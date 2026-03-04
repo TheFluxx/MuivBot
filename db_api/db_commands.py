@@ -8,6 +8,7 @@ from sqlalchemy.exc import IntegrityError
 from db_api.database import get_session
 from db_api.tables import (
     Users,
+    UserScheduleState,
     ScheduleCourse,
     ScheduleGroup,
     ScheduleLesson,
@@ -27,6 +28,13 @@ DAY_ORDER_MAP = {
 }
 
 EMPTY_DATE_MARKERS = {'', 'не указана', 'none', 'null'}
+USER_SCHEDULE_FIELDS = (
+    'selected_course',
+    'selected_course_name',
+    'selected_group',
+    'selected_week_index',
+    'selected_day_index',
+)
 
 
 def _course_name_from_key(course_key: str) -> str:
@@ -79,6 +87,56 @@ async def register_user(telegram_id, username, referrer_id):
             await session.commit()
         except IntegrityError:
             await session.rollback()
+
+
+async def get_user_schedule_state(telegram_id: int):
+    """Возвращает сохраненные настройки расписания пользователя."""
+    async with get_session() as session:
+        result = await session.execute(
+            select(UserScheduleState).where(UserScheduleState.telegram_id == telegram_id)
+        )
+        state_row = result.scalar_one_or_none()
+        if state_row is None:
+            return None
+
+        return {
+            'selected_course': state_row.selected_course,
+            'selected_course_name': state_row.selected_course_name,
+            'selected_group': state_row.selected_group,
+            'selected_week_index': state_row.selected_week_index,
+            'selected_day_index': state_row.selected_day_index,
+        }
+
+
+async def upsert_user_schedule_state(telegram_id: int, **kwargs):
+    """Создает или обновляет сохраненные настройки расписания пользователя."""
+    payload = {key: kwargs.get(key) for key in USER_SCHEDULE_FIELDS if key in kwargs}
+    if not payload:
+        return None
+
+    async with get_session() as session:
+        result = await session.execute(
+            select(UserScheduleState).where(UserScheduleState.telegram_id == telegram_id)
+        )
+        state_row = result.scalar_one_or_none()
+
+        if state_row is None:
+            state_row = UserScheduleState(telegram_id=telegram_id, **payload)
+            session.add(state_row)
+        else:
+            for key, value in payload.items():
+                setattr(state_row, key, value)
+            state_row.updated_at = datetime.utcnow()
+
+        await session.commit()
+
+        return {
+            'selected_course': state_row.selected_course,
+            'selected_course_name': state_row.selected_course_name,
+            'selected_group': state_row.selected_group,
+            'selected_week_index': state_row.selected_week_index,
+            'selected_day_index': state_row.selected_day_index,
+        }
 
 
 async def replace_schedule_snapshot(
