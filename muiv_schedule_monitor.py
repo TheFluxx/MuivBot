@@ -24,7 +24,7 @@ def filename_from_url(url: str) -> str:
 
 
 def _download_or_update_file(page, file_url: str, download_dir: str):
-    """Скачивает Excel, обновляя локальный файл, если содержимое изменилось."""
+    """Каждый раз скачивает Excel в память и сравнивает с локальным файлом; при отличиях перезаписывает файл."""
     file_name = filename_from_url(file_url)
     out_path = os.path.join(download_dir, file_name)
 

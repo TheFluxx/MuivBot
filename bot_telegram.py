@@ -44,6 +44,16 @@ def _build_group_day_snapshot():
             group_map = snapshot.setdefault(group_code, {})
 
             for week_label, entries in weeks.items():
+                week_days_map = client.week_days_info.get(course_key, {}).get(week_label, {})
+                for day_name, date_value in week_days_map.items():
+                    date_text = _normalize_text(date_value)
+                    if not date_text or date_text.lower() == 'не указана':
+                        continue
+                    base_signature = ' | '.join(
+                        [course_name, _normalize_text(week_label), _normalize_text(day_name), 'DAY_MARKER']
+                    )
+                    group_map.setdefault(date_text, set()).add(base_signature)
+
                 for entry in entries:
                     day_name = _normalize_text(entry.get('day'))
                     date_text = _normalize_text(entry.get('date'))
