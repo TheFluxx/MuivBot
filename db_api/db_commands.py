@@ -139,6 +139,37 @@ async def upsert_user_schedule_state(telegram_id: int, **kwargs):
         }
 
 
+
+async def get_users_with_selected_groups(group_codes=None):
+    """Возвращает пользователей с выбранной группой (опционально только для нужных групп)."""
+    async with get_session() as session:
+        query = select(
+            UserScheduleState.telegram_id,
+            UserScheduleState.selected_group,
+            UserScheduleState.selected_course,
+            UserScheduleState.selected_course_name,
+        ).where(UserScheduleState.selected_group.is_not(None))
+
+        if group_codes:
+            normalized_groups = sorted({str(code).strip() for code in group_codes if code})
+            if normalized_groups:
+                query = query.where(UserScheduleState.selected_group.in_(normalized_groups))
+
+        result = await session.execute(query)
+        rows = result.all()
+
+        users = []
+        for row in rows:
+            users.append(
+                {
+                    'telegram_id': row.telegram_id,
+                    'selected_group': row.selected_group,
+                    'selected_course': row.selected_course,
+                    'selected_course_name': row.selected_course_name,
+                }
+            )
+        return users
+
 async def replace_schedule_snapshot(
     schedule_data: Dict[str, Dict[str, Dict[str, list]]],
     group_info_data: Dict[str, Dict[str, list]],

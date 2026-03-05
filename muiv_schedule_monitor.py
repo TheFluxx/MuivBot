@@ -1,10 +1,7 @@
 import os
-import time
 import re
-from urllib.parse import urljoin, urlparse, unquote
-
-import requests
-from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+import time
+from urllib.parse import unquote, urljoin, urlparse
 
 PAGE_URL = "https://www.muiv.ru/studentu/fakultet-it/raspisaniya/"
 BASE_URL = "https://www.muiv.ru"
@@ -17,119 +14,141 @@ EXCEL_RE = re.compile(r"\.(xls|xlsx)$", re.IGNORECASE)
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-session = requests.Session()
-session.headers.update({
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-})
-
 
 def filename_from_url(url: str) -> str:
+    """Извлекает имя файла из URL и очищает запрещенные символы."""
     path = urlparse(url).path
     name = unquote(os.path.basename(path))
-    # подчищаем имя
-    name = re.sub(r'[<>:"/\\|?*\n\r\t]', "_", name).strip()
-    return name or "file.xls"
-def download_file(page, file_url):
-    print(f"  [DL] Скачиваю через браузер: {file_url}")
+    name = re.sub(r'[<>:"/\\|?*\n\r\t]', '_', name).strip()
+    return name or 'file.xls'
 
-    fname = filename_from_url(file_url)
-    out_path = os.path.join(DOWNLOAD_DIR, fname)
+
+def _download_or_update_file(page, file_url: str, download_dir: str):
+    """Скачивает Excel, обновляя локальный файл, если содержимое изменилось."""
+    file_name = filename_from_url(file_url)
+    out_path = os.path.join(download_dir, file_name)
+
+    response = page.context.request.get(file_url)
+    if not response.ok:
+        raise RuntimeError(f'HTTP {response.status} for {file_url}')
+
+    data = response.body()
 
     if os.path.exists(out_path):
-        print(f"  [SKIP] Уже есть: {fname}")
-        return
+        with open(out_path, 'rb') as existing_file:
+            old_data = existing_file.read()
+
+        if old_data == data:
+            return 'unchanged', out_path
+
+        with open(out_path, 'wb') as output_file:
+            output_file.write(data)
+        return 'updated', out_path
+
+    with open(out_path, 'wb') as output_file:
+        output_file.write(data)
+    return 'new', out_path
+
+
+def _extract_links_from_rendered_dom(page):
+    """Возвращает список пар (text, href) для ссылок download__src."""
+    try:
+        page.wait_for_selector('a.download__src', timeout=15000)
+    except Exception:
+        pass
+
+    elements = page.query_selector_all('a.download__src')
+    pairs = []
+    for element in elements:
+        href = element.get_attribute('href') or ''
+        text = (element.inner_text() or '').strip().replace('\n', ' ')
+        pairs.append((text, href))
+    return pairs
+
+
+def check_for_schedule_updates(
+    page_url: str = PAGE_URL,
+    base_url: str = BASE_URL,
+    download_dir: str = DOWNLOAD_DIR,
+    text_prefix: str = TEXT_PREFIX,
+):
+    """Один проход мониторинга: ищет ссылки и скачивает новые/обновленные Excel."""
+    os.makedirs(download_dir, exist_ok=True)
+
+    report = {
+        'new_files': [],
+        'updated_files': [],
+        'unchanged_files': [],
+        'matched_links': 0,
+        'errors': [],
+    }
 
     try:
-        response = page.context.request.get(file_url)
+        from playwright.sync_api import sync_playwright
+    except Exception as import_error:
+        report['errors'].append(f'Playwright import error: {import_error}')
+        return report
 
-        if not response.ok:
-            print("  [ERR] HTTP ошибка:", response.status)
-            return
-
-        data = response.body()
-
-        with open(out_path, "wb") as f:
-            f.write(data)
-
-        print(f"  [OK] Файл сохранён: {fname} ({len(data)} bytes)")
-
-    except Exception as e:
-        print("  [ERR] Ошибка скачивания:", e)
-
-
-def extract_links_from_rendered_dom(page) -> list[tuple[str, str]]:
-    """
-    Возвращает список (text, href) для a.download__src
-    """
-    # Ждём, пока появятся нужные элементы (или хоть какие-то ссылки скачивания)
     try:
-        page.wait_for_selector("a.download__src", timeout=15000)
-    except PWTimeout:
-        print("  [WARN] Не дождался a.download__src за 15s. Попробую собрать что есть в DOM...")
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
 
-    elements = page.query_selector_all("a.download__src")
-    print(f"  [INFO] Найдено a.download__src: {len(elements)}")
+            page.goto(page_url, wait_until='networkidle', timeout=60000)
+            pairs = _extract_links_from_rendered_dom(page)
 
-    results = []
-    for el in elements:
-        href = el.get_attribute("href") or ""
-        # текст бывает в span, но проще взять innerText всей ссылки
-        text = (el.inner_text() or "").strip().replace("\n", " ")
-        results.append((text, href))
-    return results
-
-
-def main():
-    print(f"[START] Страница: {PAGE_URL}")
-    print(f"[START] Папка: {os.path.abspath(DOWNLOAD_DIR)}")
-    print("[START] Ctrl+C чтобы остановить.\n")
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
-
-        while True:
-            print("\n===== Проверка сайта =====")
-            try:
-                page.goto(PAGE_URL, wait_until="networkidle", timeout=60000)
-                print("  [OK] Страница открыта (networkidle)")
-
-                pairs = extract_links_from_rendered_dom(page)
-
-                if not pairs:
-                    html_snippet = page.content()[:500].replace("\n", " ")
-                    print("  [DEBUG] DOM snippet:", html_snippet)
-                    time.sleep(POLL_SECONDS)
+            for text, href in pairs:
+                if not href or not text.startswith(text_prefix):
                     continue
 
-                matched = 0
-                for text, href in pairs:
-                    if not href:
-                        continue
+                full_url = urljoin(base_url, href)
+                if not EXCEL_RE.search(urlparse(full_url).path):
+                    continue
 
-                    if "Расписание" in text:
-                        print(f"  [SEEN] {text} -> {href}")
+                report['matched_links'] += 1
 
-                    if text.startswith(TEXT_PREFIX):
-                        matched += 1
-                        full_url = urljoin(BASE_URL, href)
+                try:
+                    status, path = _download_or_update_file(page, full_url, download_dir)
+                    if status == 'new':
+                        report['new_files'].append(path)
+                    elif status == 'updated':
+                        report['updated_files'].append(path)
+                    else:
+                        report['unchanged_files'].append(path)
+                except Exception as download_error:
+                    report['errors'].append(f'{full_url}: {download_error}')
 
-                        if not EXCEL_RE.search(urlparse(full_url).path):
-                            print(f"  [WARN] Подходит по тексту, но не похоже на Excel: {full_url}")
-                            continue
+            browser.close()
 
-                        print(f"  [MATCH] {text}")
-                        print(f"  [LINK]  {full_url}")
-                        download_file(page, full_url)
+    except Exception as monitor_error:
+        report['errors'].append(str(monitor_error))
 
-                print(f"  [INFO] Подходящих по '{TEXT_PREFIX}': {matched}")
-
-            except Exception as e:
-                print(f"  [ERR] Ошибка цикла: {e}")
-
-            time.sleep(POLL_SECONDS)
+    return report
 
 
-if __name__ == "__main__":
-    main()
+def run_forever(poll_seconds: int = POLL_SECONDS):
+    """Запускает мониторинг в бесконечном цикле (для отдельного запуска скрипта)."""
+    print(f'[START] Monitoring page: {PAGE_URL}')
+    print(f'[START] Download dir: {os.path.abspath(DOWNLOAD_DIR)}')
+    print('[START] Press Ctrl+C to stop.')
+
+    while True:
+        report = check_for_schedule_updates()
+        print(
+            '[CHECK] matched={matched} new={new} updated={updated} unchanged={unchanged} errors={errors}'.format(
+                matched=report['matched_links'],
+                new=len(report['new_files']),
+                updated=len(report['updated_files']),
+                unchanged=len(report['unchanged_files']),
+                errors=len(report['errors']),
+            )
+        )
+        if report['errors']:
+            for error_text in report['errors']:
+                print(f'  [ERR] {error_text}')
+
+        time.sleep(poll_seconds)
+
+
+if __name__ == '__main__':
+    run_forever()
