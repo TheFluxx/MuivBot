@@ -37,9 +37,28 @@ async def cmd_start(message: types.Message):
     else:
         await message.reply("Вы уже зарегистрированы.", reply_markup=get_main_keyboard())
 
-async def settings(message: types.Message):
+async def settings(message: types.Message, state: FSMContext):
     """Показывает раздел настроек."""
-    await message.reply(f"💼 Настройки", reply_markup=get_main_keyboard())
+    user_data = await _get_user_data_with_db_fallback(state, _telegram_id_from_message(message))
+
+    course = user_data.get('selected_course')
+    group_code = user_data.get('selected_group')
+
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    keyboard.add(
+        types.InlineKeyboardButton(
+            text="✏️ Изменить группу" if group_code else "🎓 Выбрать группу",
+            callback_data="change_group",
+        )
+    )
+
+    lines = ["💼 Настройки"]
+    if course and group_code:
+        lines.append("")
+        lines.append(f"🎓 Курс: {_course_display(course)}")
+        lines.append(f"👥 Группа: {group_code}")
+
+    await message.answer("\n".join(lines), reply_markup=keyboard)
 
 # Словари для хранения расписания
 schedule_data = {}
@@ -1922,15 +1941,11 @@ async def my_schedule(message: types.Message, state: FSMContext):
     group_code = user_data.get('selected_group')
 
     if course and group_code:
-        keyboard = types.InlineKeyboardMarkup(row_width=2)
+        keyboard = types.InlineKeyboardMarkup(row_width=1)
         keyboard.add(
             types.InlineKeyboardButton(
                 text="📅 Показать расписание",
                 callback_data=f"show_schedule_{course}_{group_code}"
-            ),
-            types.InlineKeyboardButton(
-                text="✏️ Изменить группу",
-                callback_data="change_group"
             )
         )
 
