@@ -988,6 +988,25 @@ def _build_group_week_timeline(course_name, group_code):
 
     return timeline
 
+
+def _find_day_by_date(course_name, group_code, target_date):
+    """Ищет день расписания по конкретной дате среди всех периодов группы."""
+    timeline = _build_group_week_timeline(course_name, group_code)
+
+    for item in timeline:
+        week_days = _build_week_day_items(item['course'], group_code, item['week_label'])
+        for day_index, day_item in enumerate(week_days):
+            if day_item['date_obj'] == target_date:
+                return {
+                    'course': item['course'],
+                    'week_index': item['week_index'],
+                    'week_label': item['week_label'],
+                    'day_index': day_index,
+                    'week_days': week_days,
+                }
+
+    return None
+
 def _pick_today_week_for_group(course_name, group_code):
     """Выбирает неделю, в которую попадает сегодняшняя дата."""
     today = datetime.now().date()
@@ -1102,6 +1121,45 @@ def _build_week_overview_text(course, group_code, week_label, week_days):
 
     lines.append('👇 Нажмите, чтобы открыть расписание.')
     return ''.join(lines)
+
+
+def _build_day_view_text(course, group_code, week_label, week_days, day_index):
+    """Формирует текст страницы дня."""
+    if not week_days:
+        return '⚠️ Неделя не содержит дней', 0
+
+    day_index = day_index % len(week_days)
+    day_item = week_days[day_index]
+
+    week_schedule = schedule_data.get(course, {}).get(group_code, {}).get(week_label, [])
+    lessons = _get_day_lessons(week_schedule, day_item['day_name'])
+
+    header_day = f"{day_item['date_short']} ({day_item['day_title']})"
+    if day_item['is_today']:
+        header_day += ' | Сегодня'
+
+    month_week_number = _month_week_number_text(week_days)
+    week_range = _week_date_range_text(week_days)
+
+    lines = [
+        f"🎓 Курс: <b>{html.escape(_course_name(course))}</b>",
+        f"👥 Группа: <b>{html.escape(group_code)}</b>",
+        f"📅 День: <b>{html.escape(header_day)}</b>",
+        f"🗓️ Неделя месяца: <b>{month_week_number}</b> ({week_range})",
+        '',
+    ]
+
+    if not lessons:
+        lines.append('😌 Свободный день: занятий нет')
+    else:
+        for lesson in lessons:
+            time_text = html.escape(_normalize_cell_text(lesson.get('time')) or 'Время не указано')
+            lesson_text = html.escape(_normalize_cell_text(lesson.get('lesson')) or 'Без названия')
+            if len(lesson_text) > 180:
+                lesson_text = f"{lesson_text[:177]}..."
+            lines.append(f"• ⏰ <b>{time_text}</b> {lesson_text}")
+
+    return '\n'.join(lines), day_index
 
 def _build_week_keyboard(week_label, week_days):
     """Строит клавиатуру страницы недели."""
@@ -1334,11 +1392,7 @@ async def _render_day_view(callback_query: types.CallbackQuery, state: FSMContex
         today_index = next((idx for idx, item in enumerate(week_days) if item['is_today']), None)
         day_index = today_index if today_index is not None else 0
 
-    day_index = day_index % len(week_days)
-    day_item = week_days[day_index]
-
-    week_schedule = schedule_data.get(course, {}).get(group_code, {}).get(week_label, [])
-    lessons = _get_day_lessons(week_schedule, day_item['day_name'])
+    text, day_index = _build_day_view_text(course, group_code, week_label, week_days, day_index)
 
     await _update_user_selection(
         state,
@@ -1347,40 +1401,67 @@ async def _render_day_view(callback_query: types.CallbackQuery, state: FSMContex
         selected_day_index=day_index,
     )
 
-    header_day = f"{day_item['date_short']} ({day_item['day_title']})"
-    if day_item['is_today']:
-        header_day += ' | Сегодня'
-
-    month_week_number = _month_week_number_text(week_days)
-    week_range = _week_date_range_text(week_days)
-
-    lines = [
-        f"🎓 Курс: <b>{html.escape(_course_name(course))}</b>",
-        f"👥 Группа: <b>{html.escape(group_code)}</b>",
-        f"📅 День: <b>{html.escape(header_day)}</b>",
-        f"🗓️ Неделя месяца: <b>{month_week_number}</b> ({week_range})",
-        '',
-    ]
-
-    if not lessons:
-        lines.append('😌 Свободный день: занятий нет')
-    else:
-        for lesson in lessons:
-            time_text = html.escape(_normalize_cell_text(lesson.get('time')) or 'Время не указано')
-            lesson_text = html.escape(_normalize_cell_text(lesson.get('lesson')) or 'Без названия')
-            if len(lesson_text) > 180:
-                lesson_text = f"{lesson_text[:177]}..."
-            lines.append(f"• ⏰ <b>{time_text}</b> {lesson_text}")
-
     keyboard = _build_day_keyboard(week_days, day_index)
 
     await _safe_edit_text(
         callback_query.message,
-        '\n'.join(lines),
+        text,
         reply_markup=keyboard,
         parse_mode='HTML',
     )
     await callback_query.answer()
+
+
+async def _show_relative_day_schedule(message: types.Message, state: FSMContext, day_shift: int):
+    """Показывает расписание на сегодня или завтра по сохраненной группе пользователя."""
+    user_data = await _get_user_data_with_db_fallback(state, _telegram_id_from_message(message))
+    course = user_data.get('selected_course')
+    group_code = user_data.get('selected_group')
+
+    if not course or not group_code:
+        await message.answer("ℹ️ Сначала выберите группу. Давайте выберем её сейчас:")
+        await choose_course(message)
+        return
+
+    course_name = user_data.get('selected_course_name') or _course_name(course)
+    target_date = datetime.now().date() + timedelta(days=day_shift)
+    target_day = _find_day_by_date(course_name, group_code, target_date)
+
+    if target_day is None:
+        await message.answer(
+            f"📭 На {target_date.strftime('%d.%m.%y')} для группы {group_code} нет занятий или дата еще не опубликована."
+        )
+        return
+
+    await _update_user_selection(
+        state,
+        _telegram_id_from_message(message),
+        selected_course_name=course_name,
+        selected_course=target_day['course'],
+        selected_group=group_code,
+        selected_week_index=target_day['week_index'],
+        selected_day_index=target_day['day_index'],
+    )
+
+    text, day_index = _build_day_view_text(
+        target_day['course'],
+        group_code,
+        target_day['week_label'],
+        target_day['week_days'],
+        target_day['day_index'],
+    )
+    keyboard = _build_day_keyboard(target_day['week_days'], day_index)
+    await message.answer(text, reply_markup=keyboard, parse_mode='HTML')
+
+
+async def schedule_today(message: types.Message, state: FSMContext):
+    """Показывает расписание на сегодня."""
+    await _show_relative_day_schedule(message, state, 0)
+
+
+async def schedule_tomorrow(message: types.Message, state: FSMContext):
+    """Показывает расписание на завтра."""
+    await _show_relative_day_schedule(message, state, 1)
 
 async def _render_week_picker(callback_query: types.CallbackQuery, state: FSMContext):
     """Показывает список недель."""
@@ -1978,8 +2059,12 @@ async def change_group(callback_query: types.CallbackQuery):
 def register_handlers_client(dp: Dispatcher):
     """Регистрирует обработчики сообщений и callback-кнопок."""
     dp.register_message_handler(cmd_start, commands=['start'])
+    dp.register_message_handler(schedule_today, commands=['today'])
+    dp.register_message_handler(schedule_tomorrow, commands=['tomorrow'])
     dp.register_message_handler(settings, text='💼 Настройки')
     dp.register_message_handler(my_schedule, text='📅 Мое расписание')
+    dp.register_message_handler(schedule_today, lambda message: message.text and message.text.casefold() == 'на сегодня')
+    dp.register_message_handler(schedule_tomorrow, lambda message: message.text and message.text.casefold() == 'на завтра')
     
     # Регистрация колбеков
     dp.register_callback_query_handler(process_course_choice, Text(startswith="course_"))
