@@ -46,6 +46,7 @@ def setup_handlers(dispatcher):
     """Регистрирует обработчики бота."""
     client.register_handlers_client(dispatcher)
     dispatcher.register_callback_query_handler(monitor_show_change_details, Text(startswith='mon_diff_'))
+    dispatcher.register_callback_query_handler(monitor_back_to_change_summary, Text(startswith='mon_back_'))
     dispatcher.register_callback_query_handler(monitor_open_schedule, Text(startswith='mon_open_'))
 
 
@@ -195,12 +196,17 @@ def _store_open_callback(course_key: str, group_code: str, week_label: str | Non
     return f'mon_open_{token}'
 
 
-def _store_diff_callback(diff_text: str, open_callback_data: str | None) -> str:
+def _store_diff_callback(
+    diff_text: str,
+    summary_text: str,
+    open_callback_data: str | None,
+) -> str:
     """Сохраняет подробности изменения дня и возвращает callback_data."""
     token = _cache_put(
         MONITOR_DIFF_CACHE,
         {
             'text': _normalize_text(diff_text),
+            'summary_text': _normalize_text(summary_text),
             'open_callback_data': open_callback_data,
         },
     )
@@ -217,20 +223,54 @@ async def monitor_show_change_details(callback_query: types.CallbackQuery):
 
     detail_text = payload.get('text') or 'Нет подробностей по этому изменению.'
     open_callback_data = payload.get('open_callback_data')
+    back_callback_data = f"mon_back_{token}"
 
     keyboard = None
     if open_callback_data:
-        keyboard = types.InlineKeyboardMarkup(row_width=1)
-        keyboard.add(
+        keyboard = types.InlineKeyboardMarkup(row_width=2)
+        keyboard.row(
+            types.InlineKeyboardButton(text='⬅️ Назад', callback_data=back_callback_data),
             types.InlineKeyboardButton(text='📅 Показать расписание', callback_data=open_callback_data)
         )
+    else:
+        keyboard = types.InlineKeyboardMarkup(row_width=1)
+        keyboard.add(types.InlineKeyboardButton(text='⬅️ Назад', callback_data=back_callback_data))
 
     try:
-        await callback_query.message.answer(detail_text, reply_markup=keyboard)
+        await callback_query.message.edit_text(detail_text, reply_markup=keyboard)
         await callback_query.answer()
     except Exception as send_error:
         await callback_query.answer('Не удалось показать подробности изменения.', show_alert=True)
         print(f'WARN: cannot send change details: {send_error}')
+
+
+async def monitor_back_to_change_summary(callback_query: types.CallbackQuery):
+    """Возвращает из подробностей к сообщению об изменении дня."""
+    token = callback_query.data[len('mon_back_'):]
+    payload = MONITOR_DIFF_CACHE.get(token)
+    if not payload:
+        await callback_query.answer('Сообщение об изменении уже недоступно.', show_alert=True)
+        return
+
+    summary_text = payload.get('summary_text') or 'Сообщение об изменении недоступно.'
+    open_callback_data = payload.get('open_callback_data')
+    diff_callback_data = f'mon_diff_{token}'
+
+    keyboard = types.InlineKeyboardMarkup(row_width=2)
+    keyboard.row(
+        types.InlineKeyboardButton(text='🔍 Что изменилось', callback_data=diff_callback_data),
+        types.InlineKeyboardButton(
+            text='📅 Показать расписание',
+            callback_data=open_callback_data or 'cal_noop',
+        ),
+    )
+
+    try:
+        await callback_query.message.edit_text(summary_text, reply_markup=keyboard)
+        await callback_query.answer()
+    except Exception as send_error:
+        await callback_query.answer('Не удалось вернуть сообщение об изменении.', show_alert=True)
+        print(f'WARN: cannot restore changed day summary: {send_error}')
 
 
 async def monitor_open_schedule(callback_query: types.CallbackQuery, state: FSMContext):
@@ -518,7 +558,8 @@ async def _notify_users_about_changes(changed_group_days, old_snapshot, new_snap
                 old_day=old_day,
                 new_day=new_day,
             )
-            diff_callback_data = _store_diff_callback(diff_text, open_callback_data)
+            text = _build_changed_day_message(group_code, date_text, display_day)
+            diff_callback_data = _store_diff_callback(diff_text, text, open_callback_data)
 
             keyboard = types.InlineKeyboardMarkup(row_width=2)
             keyboard.row(
@@ -529,7 +570,6 @@ async def _notify_users_about_changes(changed_group_days, old_snapshot, new_snap
                 ),
             )
 
-            text = _build_changed_day_message(group_code, date_text, display_day)
             try:
                 await bot.send_message(telegram_id, text, reply_markup=keyboard)
                 sent_any = True
