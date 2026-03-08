@@ -1,0 +1,9 @@
+aiogram==2.25.1
+environs==11.0.0
+SQLAlchemy==2.0.30
+asyncpg==0.29.0
+playwright==1.58.0
+xlrd==2.0.2
+
+# После установки зависимостей нужно отдельно установить браузер для Playwright:
+# playwright install chromium
