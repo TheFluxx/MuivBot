@@ -1,4 +1,4 @@
-import asyncio
+﻿import asyncio
 import secrets
 import os
 import re
@@ -1206,63 +1206,80 @@ def _group_search_occurrences_by_date(occurrences):
     return groups
 
 
-def _search_result_lines_for_occurrence(search_kind, occurrence):
-    """Формирует строки одного занятия в выдаче поиска."""
-    lines = [
-        (
-            f"• ⏰ <b>{html.escape(_normalize_cell_text(occurrence.get('time_text')) or 'Время не указано')}</b>"
-            f" | 🎓 {html.escape(_normalize_cell_text(occurrence.get('course_name')))}"
-            f" | 👥 {html.escape(_normalize_cell_text(occurrence.get('group_code')))}"
-        ),
-        f"  📚 {html.escape(_normalize_cell_text(occurrence.get('subject')) or occurrence.get('lesson_text'))}",
-    ]
-
-    teacher = _normalize_cell_text(occurrence.get('teacher'))
-    room = _normalize_cell_text(occurrence.get('room'))
-    period_label = _normalize_cell_text(occurrence.get('period_label'))
-
-    if teacher and search_kind != 'teacher':
-        lines.append(f"  👨‍🏫 {html.escape(teacher)}")
-    if room and search_kind != 'room':
-        lines.append(f"  🏫 {html.escape(room)}")
-    if period_label:
-        lines.append(f"  🗂️ {html.escape(period_label)}")
-
-    return lines
+def _truncate_button_text(text, limit=58):
+    """Сокращает подпись inline-кнопки, чтобы она оставалась читабельной с телефона."""
+    normalized = _normalize_cell_text(text)
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[: max(0, limit - 1)].rstrip() + '…'
 
 
-def _build_search_results_text(search_kind, entity_value, occurrences, page_index):
-    """Формирует страницу расписания выбранной сущности."""
-    meta = SEARCH_TYPES[search_kind]
+def _nearest_search_page_index(date_groups):
+    """Возвращает страницу с датами, которая ближе всего к текущему дню."""
+    if not date_groups:
+        return 0
+
+    today = datetime.now().date()
+    best_group_index = 0
+    best_key = None
+
+    for group_index, group in enumerate(date_groups):
+        date_obj = group.get('date_obj')
+        if date_obj is None:
+            continue
+
+        delta_days = (date_obj - today).days
+        sort_key = (abs(delta_days), 0 if delta_days >= 0 else 1, group_index)
+        if best_key is None or sort_key < best_key:
+            best_key = sort_key
+            best_group_index = group_index
+
+    return best_group_index // SEARCH_PAGE_SIZE
+
+
+def _paginate_search_groups(occurrences, page_index):
+    """Разбивает результаты поиска на страницы по датам."""
     date_groups = _group_search_occurrences_by_date(occurrences)
     pages_count = max(1, (len(date_groups) + SEARCH_PAGE_SIZE - 1) // SEARCH_PAGE_SIZE)
-    page_index = max(0, min(page_index, pages_count - 1))
 
+    if page_index is None:
+        page_index = _nearest_search_page_index(date_groups)
+
+    page_index = max(0, min(page_index, pages_count - 1))
     start = page_index * SEARCH_PAGE_SIZE
     end = start + SEARCH_PAGE_SIZE
     page_groups = date_groups[start:end]
+    return date_groups, page_groups, page_index, pages_count
 
-    lines = [
-        f"<b>{meta['title']}</b>",
-        f"{meta['entity_emoji']} <b>{html.escape(entity_value)}</b>",
-        f"📚 Занятий: <b>{len(occurrences)}</b>",
-        f"📅 Дат: <b>{len(date_groups)}</b>",
-        f"📄 Страница: <b>{page_index + 1}/{pages_count}</b>",
-        '',
-    ]
 
-    for group in page_groups:
-        lines.append(
-            f"<b>📅 {_format_search_date_caption(group.get('date_obj'), group.get('date_text'), group.get('day_name'))}</b>"
-        )
-        for occurrence in group.get('items', []):
-            lines.extend(_search_result_lines_for_occurrence(search_kind, occurrence))
-        lines.append('')
+def _search_occurrence_button_texts(search_kind, occurrence):
+    """Формирует компактные подписи для кнопок найденного занятия."""
+    time_text = _normalize_cell_text(occurrence.get('time_text')) or 'Время не указано'
+    group_code = _normalize_cell_text(occurrence.get('group_code')) or 'Группа не указана'
+    subject = _normalize_cell_text(occurrence.get('subject')) or _normalize_cell_text(occurrence.get('lesson_text'))
+    teacher = _normalize_cell_text(occurrence.get('teacher'))
+    room = _normalize_cell_text(occurrence.get('room'))
 
-    if not page_groups:
-        lines.append('📭 По выбранной сущности занятий не найдено.')
+    title_line = _truncate_button_text(f"🕒 {time_text} • 👥 {group_code}", 58)
 
-    return '\n'.join(lines).strip(), pages_count
+    details_parts = []
+    if search_kind != 'subject' and subject:
+        details_parts.append(f"📚 {subject}")
+    if search_kind != 'teacher' and teacher:
+        details_parts.append(f"👨‍🏫 {teacher}")
+    if search_kind != 'room' and room:
+        details_parts.append(f"🏫 {room}")
+
+    if not details_parts:
+        details_parts.append(f"📚 {subject or 'Информация уточняется'}")
+
+    details_line = _truncate_button_text(' • '.join(details_parts), 62)
+    return [title_line, details_line]
+
+
+def _build_search_entity_text():
+    """Возвращает минимальный заголовок экрана результатов поиска."""
+    return '<b>🔎 Результаты поиска</b>'
 
 
 def _build_search_type_keyboard():
@@ -1290,9 +1307,43 @@ def _build_search_matches_keyboard(match_buttons):
     return keyboard
 
 
-def _build_search_entity_keyboard(token, page_index, pages_count):
-    """Строит клавиатуру страницы найденной сущности."""
-    keyboard = types.InlineKeyboardMarkup(row_width=3)
+def _build_search_entity_keyboard(search_kind, entity_value, token, date_groups, page_groups, page_index, pages_count, lessons_count):
+    """Строит клавиатуру с полной выдачей поиска в inline-кнопках."""
+    meta = SEARCH_TYPES[search_kind]
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+
+    keyboard.add(
+        types.InlineKeyboardButton(
+            text=_truncate_button_text(f"{meta['entity_emoji']} {entity_value}", 62),
+            callback_data='search_noop',
+        )
+    )
+    keyboard.add(
+        types.InlineKeyboardButton(
+            text=_truncate_button_text(f"📚 {lessons_count} пар • 📅 {len(date_groups)} дней • 📄 {page_index + 1}/{pages_count}", 62),
+            callback_data='search_noop',
+        )
+    )
+
+    if not page_groups:
+        keyboard.add(
+            types.InlineKeyboardButton(
+                text='📭 По выбранной сущности занятий не найдено',
+                callback_data='search_noop',
+            )
+        )
+    else:
+        for group in page_groups:
+            date_caption = _format_search_date_caption(group.get('date_obj'), group.get('date_text'), group.get('day_name'))
+            keyboard.add(
+                types.InlineKeyboardButton(
+                    text=_truncate_button_text(f"📅 {date_caption}", 62),
+                    callback_data='search_noop',
+                )
+            )
+            for occurrence in group.get('items', []):
+                for button_text in _search_occurrence_button_texts(search_kind, occurrence):
+                    keyboard.add(types.InlineKeyboardButton(text=button_text, callback_data='search_noop'))
 
     if pages_count > 1:
         keyboard.row(
@@ -1337,7 +1388,7 @@ async def _render_search_start(message_or_callback, state: FSMContext, *, edit: 
         await message_or_callback.answer(text, reply_markup=_build_search_type_keyboard(), parse_mode='HTML')
 
 
-async def _render_search_entity(message, token, page_index, *, edit: bool):
+async def _render_search_entity(message, token, page_index: int | None, *, edit: bool):
     """Показывает страницу найденной сущности."""
     payload = await _load_search_payload(token, 'search_entity')
     if not payload:
@@ -1364,8 +1415,18 @@ async def _render_search_entity(message, token, page_index, *, edit: bool):
             await message.answer('По выбранной сущности занятий больше не найдено.')
         return False
 
-    text, pages_count = _build_search_results_text(search_kind, entity_value, occurrences, page_index)
-    keyboard = _build_search_entity_keyboard(token, max(0, min(page_index, pages_count - 1)), pages_count)
+    date_groups, page_groups, page_index, pages_count = _paginate_search_groups(occurrences, page_index)
+    text = _build_search_entity_text()
+    keyboard = _build_search_entity_keyboard(
+        search_kind,
+        entity_value,
+        token,
+        date_groups,
+        page_groups,
+        page_index,
+        pages_count,
+        len(occurrences),
+    )
 
     if edit:
         await _safe_edit_text(message.message, text, reply_markup=keyboard, parse_mode='HTML')
@@ -1460,7 +1521,7 @@ async def search_receive_query(message: types.Message, state: FSMContext):
                 'entity': matches[0]['entity'],
             },
         )
-        await _render_search_entity(message, token, 0, edit=False)
+        await _render_search_entity(message, token, None, edit=False)
         return
 
     buttons = []
@@ -1504,7 +1565,7 @@ async def search_receive_query(message: types.Message, state: FSMContext):
 async def search_open_entity(callback_query: types.CallbackQuery, state: FSMContext):
     """Открывает расписание выбранной найденной сущности."""
     token = callback_query.data[len('search_entity_'):]
-    await _render_search_entity(callback_query, token, 0, edit=True)
+    await _render_search_entity(callback_query, token, None, edit=True, show_empty=False)
 
 
 async def search_change_page(callback_query: types.CallbackQuery, state: FSMContext):
@@ -1527,6 +1588,1086 @@ async def search_change_page(callback_query: types.CallbackQuery, state: FSMCont
 async def search_noop(callback_query: types.CallbackQuery):
     """Служебная кнопка поиска."""
     await callback_query.answer()
+
+
+def _search_month_label_v2(month_key):
+    """Возвращает подпись месяца для нового календаря поиска."""
+    if not month_key:
+        return 'Месяц не указан'
+
+    year, month = month_key
+    month_names = [
+        'Январь', 'Февраль', 'Март', 'Апрель',
+        'Май', 'Июнь', 'Июль', 'Август',
+        'Сентябрь', 'Октябрь', 'Ноябрь', 'Декабрь',
+    ]
+    return f"{month_names[month - 1]} {year}"
+
+
+def _search_week_month_key_v2(week_days):
+    """Определяет месяц недели по первому дню с занятиями, иначе по первой дате."""
+    for day_item in week_days:
+        if day_item.get('has_lessons') and day_item.get('date_obj') is not None:
+            day_date = day_item['date_obj']
+            return day_date.year, day_date.month
+
+    for day_item in week_days:
+        if day_item.get('date_obj') is not None:
+            day_date = day_item['date_obj']
+            return day_date.year, day_date.month
+
+    return None
+
+
+def _build_search_weeks_v2(occurrences):
+    """Строит непрерывную шкалу недель для найденной сущности."""
+    dated_occurrences = [item for item in occurrences if item.get('date_obj') is not None]
+    if not dated_occurrences:
+        return [], []
+
+    date_to_entries = {}
+    for occurrence in dated_occurrences:
+        date_to_entries.setdefault(occurrence['date_obj'], []).append(occurrence)
+
+    for entries in date_to_entries.values():
+        entries.sort(
+            key=lambda item: (
+                _normalize_cell_text(item.get('time_text')),
+                _normalize_cell_text(item.get('group_code')),
+                _normalize_cell_text(item.get('course_name')),
+            )
+        )
+
+    all_dates = sorted(date_to_entries)
+    first_date = all_dates[0]
+    last_date = all_dates[-1]
+
+    timeline_start = first_date - timedelta(days=first_date.weekday())
+    timeline_end = last_date + timedelta(days=(6 - last_date.weekday()))
+    today = datetime.now().date()
+
+    weeks = []
+    current_start = timeline_start
+    while current_start <= timeline_end:
+        week_days = []
+        for offset, day_name in enumerate(WEEKDAY_ORDER):
+            day_date = current_start + timedelta(days=offset)
+            entries = date_to_entries.get(day_date, [])
+            week_days.append(
+                {
+                    'day_name': day_name,
+                    'day_title': day_name.capitalize(),
+                    'date_obj': day_date,
+                    'date_short': day_date.strftime('%d.%m.%y'),
+                    'has_lessons': bool(entries),
+                    'is_today': day_date == today,
+                    'entries': entries,
+                }
+            )
+
+        sunday_date = current_start + timedelta(days=6)
+        sunday_entries = date_to_entries.get(sunday_date, [])
+        if sunday_entries:
+            week_days.append(
+                {
+                    'day_name': 'воскресенье',
+                    'day_title': 'Воскресенье',
+                    'date_obj': sunday_date,
+                    'date_short': sunday_date.strftime('%d.%m.%y'),
+                    'has_lessons': True,
+                    'is_today': sunday_date == today,
+                    'entries': sunday_entries,
+                }
+            )
+
+        weeks.append(
+            {
+                'week_index': len(weeks),
+                'start_date': current_start,
+                'week_days': week_days,
+            }
+        )
+        current_start += timedelta(days=7)
+
+    months = []
+    month_to_index = {}
+    for week in weeks:
+        month_key = _search_week_month_key_v2(week['week_days'])
+        week['month_key'] = month_key
+
+        if month_key not in month_to_index:
+            month_to_index[month_key] = len(months)
+            months.append(
+                {
+                    'month_index': len(months),
+                    'month_key': month_key,
+                    'label': _search_month_label_v2(month_key),
+                    'week_indices': [],
+                }
+            )
+
+        month_index = month_to_index[month_key]
+        week['month_index'] = month_index
+        months[month_index]['week_indices'].append(week['week_index'])
+
+    for month in months:
+        for week_number, week_index in enumerate(month['week_indices'], start=1):
+            weeks[week_index]['month_week_number'] = week_number
+
+    return weeks, months
+
+
+def _pick_search_initial_week_index_v2(weeks):
+    """Выбирает неделю поиска, ближайшую к сегодняшней дате."""
+    if not weeks:
+        return 0
+
+    nearest_day_ref = _pick_search_nearest_day_ref_v2(weeks)
+    return nearest_day_ref[0] if nearest_day_ref else 0
+
+
+def _pick_search_week_index_for_month_v2(weeks, month_item):
+    """Выбирает стартовую неделю для выбранного месяца."""
+    week_indices = month_item.get('week_indices', [])
+    if not week_indices:
+        return 0
+
+    nearest_day_ref = _pick_search_nearest_day_ref_v2(weeks, allowed_week_indices=week_indices)
+    return nearest_day_ref[0] if nearest_day_ref else week_indices[0]
+
+
+def _search_month_index_for_week_v2(weeks, week_index):
+    """Возвращает индекс месяца для текущей недели поиска."""
+    if not weeks:
+        return 0
+
+    week_index = max(0, min(week_index, len(weeks) - 1))
+    return weeks[week_index].get('month_index', 0)
+
+
+def _search_lesson_day_refs_v2(weeks, allowed_week_indices=None):
+    """Возвращает все дни с занятиями в формате (week_index, day_index, date_obj)."""
+    allowed_set = set(allowed_week_indices) if allowed_week_indices is not None else None
+    refs = []
+
+    for week in weeks:
+        week_index = week.get('week_index', 0)
+        if allowed_set is not None and week_index not in allowed_set:
+            continue
+
+        for day_index, day_item in enumerate(week.get('week_days', [])):
+            if not day_item.get('has_lessons'):
+                continue
+
+            date_obj = day_item.get('date_obj')
+            if date_obj is None:
+                continue
+
+            refs.append((week_index, day_index, date_obj))
+
+    refs.sort(key=lambda item: (item[2], item[0], item[1]))
+    return refs
+
+
+def _pick_search_nearest_day_ref_v2(weeks, allowed_week_indices=None):
+    """Возвращает ближайший к сегодняшней дате день с занятиями."""
+    refs = _search_lesson_day_refs_v2(weeks, allowed_week_indices=allowed_week_indices)
+    if not refs:
+        return None
+
+    today = datetime.now().date()
+    return min(
+        refs,
+        key=lambda item: (
+            abs((item[2] - today).days),
+            item[2] < today,
+            item[2],
+            item[0],
+            item[1],
+        ),
+    )
+
+
+def _pick_search_next_day_ref_v2(weeks, allowed_week_indices=None):
+    """Возвращает ближайший следующий день с занятиями, начиная с сегодняшней даты."""
+    refs = _search_lesson_day_refs_v2(weeks, allowed_week_indices=allowed_week_indices)
+    if not refs:
+        return None
+
+    today = datetime.now().date()
+    for ref in refs:
+        if ref[2] >= today:
+            return ref
+    return None
+
+
+def _search_show_empty_flag(value):
+    """Преобразует флаг показа пустых дней к bool."""
+    return str(value) == '1'
+
+
+def _search_week_callback_data(token, week_index, show_empty):
+    """Собирает callback открытия недели поиска."""
+    return f"search_week_{token}_{week_index}_{int(show_empty)}"
+
+
+def _search_shift_callback_data(token, week_index, delta, show_empty):
+    """Собирает callback перелистывания недель поиска."""
+    return f"search_shift_{token}_{week_index}_{delta}_{int(show_empty)}"
+
+
+def _search_day_callback_data(token, week_index, day_index, show_empty):
+    """Собирает callback открытия дня поиска."""
+    return f"search_day_{token}_{week_index}_{day_index}_{int(show_empty)}"
+
+
+def _search_nearest_callback_data(token, show_empty):
+    """Собирает callback открытия ближайшего следующего дня поиска."""
+    return f"search_nearest_{token}_{int(show_empty)}"
+
+
+def _search_parse_week_payload(payload):
+    """Разбирает callback недели поиска с поддержкой старого формата."""
+    parts = payload.rsplit('_', 2)
+    if len(parts) == 3 and parts[2] in {'0', '1'}:
+        token, week_index_text, show_empty_text = parts
+        return token, int(week_index_text), _search_show_empty_flag(show_empty_text)
+
+    token, separator, week_index_text = payload.rpartition('_')
+    if not separator:
+        raise ValueError
+    return token, int(week_index_text), False
+
+
+def _search_parse_shift_payload(payload):
+    """Разбирает callback перелистывания недели поиска с поддержкой старого формата."""
+    parts = payload.rsplit('_', 3)
+    if len(parts) == 4 and parts[3] in {'0', '1'}:
+        token, week_index_text, delta_text, show_empty_text = parts
+        return token, int(week_index_text), int(delta_text), _search_show_empty_flag(show_empty_text)
+
+    parts = payload.rsplit('_', 2)
+    if len(parts) != 3:
+        raise ValueError
+    token, week_index_text, delta_text = parts
+    return token, int(week_index_text), int(delta_text), False
+
+
+def _search_parse_day_payload(payload):
+    """Разбирает callback дня поиска с поддержкой старого формата."""
+    parts = payload.rsplit('_', 3)
+    if len(parts) == 4 and parts[3] in {'0', '1'}:
+        token, week_index_text, day_index_text, show_empty_text = parts
+        return token, int(week_index_text), int(day_index_text), _search_show_empty_flag(show_empty_text)
+
+    parts = payload.rsplit('_', 2)
+    if len(parts) != 3:
+        raise ValueError
+    token, week_index_text, day_index_text = parts
+    return token, int(week_index_text), int(day_index_text), False
+
+
+def _search_parse_nearest_payload(payload):
+    """Разбирает callback ближайшего дня поиска с поддержкой старого формата."""
+    token, separator, show_empty_text = payload.rpartition('_')
+    if separator and show_empty_text in {'0', '1'}:
+        return token, _search_show_empty_flag(show_empty_text)
+    return payload, False
+
+
+def _find_search_week_with_lessons_v2(weeks, week_index, delta):
+    """Находит соседнюю неделю, где есть хотя бы один день с занятиями."""
+    if not weeks or delta == 0:
+        return None
+
+    step = 1 if delta > 0 else -1
+    target_week_index = week_index + step
+    while 0 <= target_week_index < len(weeks):
+        week_item = weeks[target_week_index]
+        if any(day.get('has_lessons') for day in week_item.get('week_days', [])):
+            return target_week_index
+        target_week_index += step
+
+    return None
+
+
+def _find_search_adjacent_day_ref_v2(weeks, week_index, day_index, delta):
+    """Находит соседний день с занятиями, пропуская пустые даты и недели."""
+    refs = _search_lesson_day_refs_v2(weeks)
+    if not refs or delta == 0:
+        return None
+
+    step = 1 if delta > 0 else -1
+    for position, (ref_week_index, ref_day_index, _) in enumerate(refs):
+        if ref_week_index == week_index and ref_day_index == day_index:
+            target_position = position + step
+            if 0 <= target_position < len(refs):
+                target_ref = refs[target_position]
+                return target_ref[0], target_ref[1]
+            return None
+
+    current_date = None
+    if 0 <= week_index < len(weeks):
+        week_days = weeks[week_index].get('week_days', [])
+        if 0 <= day_index < len(week_days):
+            current_date = week_days[day_index].get('date_obj')
+
+    if current_date is None:
+        target_ref = refs[0] if step > 0 else refs[-1]
+        return target_ref[0], target_ref[1]
+
+    if step > 0:
+        for ref_week_index, ref_day_index, ref_date in refs:
+            if ref_date > current_date or (
+                ref_date == current_date and (ref_week_index, ref_day_index) > (week_index, day_index)
+            ):
+                return ref_week_index, ref_day_index
+        return None
+
+    for ref_week_index, ref_day_index, ref_date in reversed(refs):
+        if ref_date < current_date or (
+            ref_date == current_date and (ref_week_index, ref_day_index) < (week_index, day_index)
+        ):
+            return ref_week_index, ref_day_index
+    return None
+
+
+def _find_search_adjacent_calendar_day_ref_v2(weeks, week_index, day_index, delta):
+    """Находит соседний день по календарю, включая пустые даты."""
+    if not weeks or delta == 0:
+        return None
+
+    step = 1 if delta > 0 else -1
+    current_week_index = week_index
+    current_day_index = day_index + step
+
+    while 0 <= current_week_index < len(weeks):
+        week_days = weeks[current_week_index].get('week_days', [])
+        if 0 <= current_day_index < len(week_days):
+            return current_week_index, current_day_index
+
+        current_week_index += step
+        if not (0 <= current_week_index < len(weeks)):
+            break
+
+        next_week_days = weeks[current_week_index].get('week_days', [])
+        current_day_index = 0 if step > 0 else len(next_week_days) - 1
+
+    return None
+
+
+def _build_search_week_overview_text_v2(search_kind, entity_value, week_item):
+    """Формирует страницу недели для найденной сущности."""
+    meta = SEARCH_TYPES[search_kind]
+    month_label = _search_month_label_v2(week_item.get('month_key'))
+    week_range = _week_date_range_text(week_item['week_days'])
+    lessons_days = sum(1 for item in week_item['week_days'] if item.get('has_lessons'))
+
+    lines = [
+        f"<b>{meta['title']}</b>",
+        f"{meta['entity_emoji']} {meta['entity_label']}: <b>{html.escape(entity_value)}</b>",
+        f"🗓️ Месяц: <b>{html.escape(month_label)}</b>",
+        f"📆 Неделя месяца: <b>{week_item.get('month_week_number', '-')}</b> ({week_range})",
+        f"📚 Дней с занятиями: <b>{lessons_days}</b>",
+        '',
+        '👇 Нажмите на нужный день.',
+    ]
+    return '\n'.join(lines)
+
+
+def _search_empty_day_text_v2(search_kind):
+    """Возвращает текст для пустого дня поиска."""
+    if search_kind == 'teacher':
+        return '😌 В этот день у преподавателя занятий нет.'
+    if search_kind == 'room':
+        return '😌 В этот день аудитория свободна.'
+    return '😌 В этот день по этому предмету занятий нет.'
+
+
+def _search_lesson_lines_v2(search_kind, occurrence):
+    """Формирует строки одного занятия для детального экрана дня."""
+    time_text = html.escape(_normalize_cell_text(occurrence.get('time_text')) or 'Время не указано')
+    course_name = html.escape(_normalize_cell_text(occurrence.get('course_name')) or 'Курс не указан')
+    group_code = html.escape(_normalize_cell_text(occurrence.get('group_code')) or 'Группа не указана')
+    subject = html.escape(
+        _normalize_cell_text(occurrence.get('subject')) or _normalize_cell_text(occurrence.get('lesson_text')) or 'Без названия'
+    )
+    teacher = html.escape(_normalize_cell_text(occurrence.get('teacher')))
+    room = html.escape(_normalize_cell_text(occurrence.get('room')))
+    period_label = html.escape(_normalize_cell_text(occurrence.get('period_label')))
+
+    lines = [
+        f"• ⏰ <b>{time_text}</b>",
+        f"  🎓 {course_name} | 👥 {group_code}",
+        f"  📚 {subject}",
+    ]
+
+    if teacher and search_kind != 'teacher':
+        lines.append(f"  👨‍🏫 {teacher}")
+    if room and search_kind != 'room':
+        lines.append(f"  🏫 {room}")
+    if period_label:
+        lines.append(f"  🗂️ {period_label}")
+
+    return lines
+
+
+def _build_search_day_view_text_v2(search_kind, entity_value, week_item, day_index):
+    """Формирует подробную страницу дня для найденной сущности."""
+    week_days = week_item['week_days']
+    if not week_days:
+        return '⚠️ Неделя не содержит дней', 0
+
+    day_index = day_index % len(week_days)
+    day_item = week_days[day_index]
+    meta = SEARCH_TYPES[search_kind]
+
+    header_day = f"{day_item['date_short']} ({day_item['day_title']})"
+    if day_item['is_today']:
+        header_day += ' | Сегодня'
+
+    month_label = _search_month_label_v2(week_item.get('month_key'))
+    week_range = _week_date_range_text(week_days)
+    lines = [
+        f"<b>{meta['title']}</b>",
+        f"{meta['entity_emoji']} {meta['entity_label']}: <b>{html.escape(entity_value)}</b>",
+        f"🗓️ Месяц: <b>{html.escape(month_label)}</b>",
+        f"📆 Неделя месяца: <b>{week_item.get('month_week_number', '-')}</b> ({week_range})",
+        f"📅 День: <b>{html.escape(header_day)}</b>",
+        '',
+    ]
+
+    entries = day_item.get('entries', [])
+    if not entries:
+        lines.append(_search_empty_day_text_v2(search_kind))
+    else:
+        for occurrence in entries:
+            lines.extend(_search_lesson_lines_v2(search_kind, occurrence))
+            lines.append('')
+
+    return '\n'.join(line for line in lines if line is not None).strip(), day_index
+
+
+def _build_search_week_keyboard_v2(token, week_item, show_empty):
+    """Строит клавиатуру недели для найденной сущности."""
+    week_index = week_item['week_index']
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+
+    for day_index, day_item in enumerate(week_item['week_days']):
+        if not show_empty and not day_item.get('has_lessons'):
+            continue
+
+        day_button_text = f"{day_item['date_short']} ({day_item['day_title']})"
+        if day_item['is_today']:
+            day_button_text += ' | Сегодня 💠'
+        elif show_empty and not day_item.get('has_lessons'):
+            day_button_text += ' | Нет занятий ⚠️'
+
+        keyboard.add(
+            types.InlineKeyboardButton(
+                text=day_button_text[:64],
+                callback_data=_search_day_callback_data(token, week_index, day_index, show_empty),
+            )
+        )
+
+    if not show_empty and not any(day.get('has_lessons') for day in week_item['week_days']):
+        keyboard.add(types.InlineKeyboardButton(text='😌 Нет пар', callback_data='search_noop'))
+
+    keyboard.row(
+        types.InlineKeyboardButton(text='⬅️ Назад', callback_data=_search_shift_callback_data(token, week_index, -1, show_empty)),
+        types.InlineKeyboardButton(text=f"📆 Неделя {week_item.get('month_week_number', '-')}"[:64], callback_data='search_noop'),
+        types.InlineKeyboardButton(text='Вперед ➡️', callback_data=_search_shift_callback_data(token, week_index, 1, show_empty)),
+    )
+    keyboard.row(
+        types.InlineKeyboardButton(
+            text='🙈 Скрыть пустые' if show_empty else '👀 Показать пустые',
+            callback_data=f"search_toggleweek_{token}_{week_index}_{0 if show_empty else 1}",
+        ),
+        types.InlineKeyboardButton(text='🎯 Ближайший день', callback_data=_search_nearest_callback_data(token, show_empty)),
+    )
+    keyboard.row(
+        types.InlineKeyboardButton(text='🔎 Новый поиск', callback_data='search_start'),
+    )
+    return keyboard
+
+
+def _build_search_day_keyboard_v2(token, weeks, week_index, selected_day_index, show_empty):
+    """Строит клавиатуру дня для найденной сущности."""
+    week_item = weeks[week_index]
+    week_days = week_item['week_days']
+    keyboard = types.InlineKeyboardMarkup(row_width=3)
+    if show_empty:
+        previous_day_ref = _find_search_adjacent_calendar_day_ref_v2(weeks, week_index, selected_day_index, -1)
+        next_day_ref = _find_search_adjacent_calendar_day_ref_v2(weeks, week_index, selected_day_index, 1)
+    else:
+        previous_day_ref = _find_search_adjacent_day_ref_v2(weeks, week_index, selected_day_index, -1)
+        next_day_ref = _find_search_adjacent_day_ref_v2(weeks, week_index, selected_day_index, 1)
+
+    keyboard.row(
+        types.InlineKeyboardButton(
+            text='⬅️ Предыдущий день',
+            callback_data=(
+                _search_day_callback_data(token, previous_day_ref[0], previous_day_ref[1], show_empty)
+                if previous_day_ref
+                else 'search_noop'
+            ),
+        ),
+        types.InlineKeyboardButton(
+            text='Следующий день ➡️',
+            callback_data=(
+                _search_day_callback_data(token, next_day_ref[0], next_day_ref[1], show_empty)
+                if next_day_ref
+                else 'search_noop'
+            ),
+        ),
+    )
+
+    day_buttons = []
+    for day_index, day_item in enumerate(week_days):
+        if not show_empty and not day_item.get('has_lessons'):
+            continue
+
+        button_text = f"{_short_day_name(day_item['day_name'])} {day_item['date_short'][:5]}"
+        if day_index == selected_day_index:
+            button_text = f"* {button_text}"
+        elif day_item['is_today']:
+            button_text = f"{button_text} *"
+
+        day_buttons.append(
+            types.InlineKeyboardButton(
+                text=button_text[:64],
+                callback_data=_search_day_callback_data(token, week_index, day_index, show_empty),
+            )
+        )
+
+
+    keyboard.row(
+        types.InlineKeyboardButton(text='🎯 Ближайший день', callback_data=_search_nearest_callback_data(token, show_empty)),
+    )
+    keyboard.row(
+        types.InlineKeyboardButton(text='↩️ Назад к неделе', callback_data=_search_week_callback_data(token, week_index, show_empty)),
+    )
+
+    keyboard.row(types.InlineKeyboardButton(text='🔎 Новый поиск', callback_data='search_start'))
+    return keyboard
+
+
+def _build_search_week_picker_keyboard_v2(token, weeks, months, current_week_index, current_month_index):
+    """Строит клавиатуру выбора недели для найденной сущности."""
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    if not months:
+        return keyboard
+
+    current_month_index = max(0, min(current_month_index, len(months) - 1))
+    month_item = months[current_month_index]
+
+    for week_index in month_item['week_indices']:
+        week_item = weeks[week_index]
+        range_text = _week_date_range_text(week_item['week_days'])
+        selected_prefix = '• ' if week_index == current_week_index else ''
+        button_text = f"{selected_prefix}📆 Неделя {week_item.get('month_week_number', '-')} ({range_text})"
+        keyboard.add(
+            types.InlineKeyboardButton(
+                text=button_text[:64],
+                callback_data=f"search_weeksel_{token}_{week_index}",
+            )
+        )
+
+    keyboard.row(
+        types.InlineKeyboardButton(
+            text='⬅️ Назад',
+            callback_data=f"search_monthview_{token}_{current_month_index - 1}" if current_month_index > 0 else 'search_noop',
+        ),
+        types.InlineKeyboardButton(text=f"🗓️ {month_item['label']}"[:64], callback_data='search_noop'),
+        types.InlineKeyboardButton(
+            text='Вперед ➡️',
+            callback_data=f"search_monthview_{token}_{current_month_index + 1}"
+            if current_month_index + 1 < len(months)
+            else 'search_noop',
+        ),
+    )
+    keyboard.row(
+        types.InlineKeyboardButton(text='↩️ К неделе', callback_data=f"search_week_{token}_{current_week_index}"),
+        types.InlineKeyboardButton(text='🗓️ Все месяцы', callback_data=f"search_monthpick_{token}_{current_week_index}"),
+    )
+    keyboard.add(types.InlineKeyboardButton(text='🔎 Новый поиск', callback_data='search_start'))
+    return keyboard
+
+
+def _build_search_month_picker_keyboard_v2(token, months, current_month_index, current_week_index):
+    """Строит клавиатуру выбора месяца для найденной сущности."""
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    for month_item in months:
+        selected_prefix = '• ' if month_item['month_index'] == current_month_index else ''
+        button_text = f"{selected_prefix}🗓️ {month_item['label']}"
+        keyboard.add(
+            types.InlineKeyboardButton(
+                text=button_text[:64],
+                callback_data=f"search_monthsel_{token}_{month_item['month_index']}",
+            )
+        )
+
+    keyboard.add(types.InlineKeyboardButton(text='↩️ К неделе', callback_data=f"search_week_{token}_{current_week_index}"))
+    keyboard.add(types.InlineKeyboardButton(text='🔎 Новый поиск', callback_data='search_start'))
+    return keyboard
+
+
+async def _load_search_entity_context_v2(target, token, *, edit: bool):
+    """Загружает найденную сущность и строит календарную структуру поиска."""
+    payload = await _load_search_payload(token, 'search_entity')
+    if not payload:
+        if edit:
+            await target.answer('Не удалось открыть сохраненный результат поиска.', show_alert=True)
+        else:
+            await target.answer('Не удалось открыть сохраненный результат поиска.')
+        return None
+
+    search_kind = payload.get('search_kind')
+    entity_value = payload.get('entity')
+    if search_kind not in SEARCH_TYPES or not entity_value:
+        if edit:
+            await target.answer('Некорректные данные поиска.', show_alert=True)
+        else:
+            await target.answer('Некорректные данные поиска.')
+        return None
+
+    occurrences = _search_occurrences_for_entity(search_kind, entity_value)
+    if not occurrences:
+        if edit:
+            await target.answer('По выбранной сущности занятий больше не найдено.', show_alert=True)
+        else:
+            await target.answer('По выбранной сущности занятий больше не найдено.')
+        return None
+
+    weeks, months = _build_search_weeks_v2(occurrences)
+    if not weeks:
+        if edit:
+            await target.answer('У найденной сущности нет дат для построения расписания.', show_alert=True)
+        else:
+            await target.answer('У найденной сущности нет дат для построения расписания.')
+        return None
+
+    return {
+        'search_kind': search_kind,
+        'entity_value': entity_value,
+        'occurrences': occurrences,
+        'weeks': weeks,
+        'months': months,
+    }
+
+async def _render_search_entity(message, token, week_index: int | None, *, edit: bool, show_empty: bool = False):
+    """Открывает найденную сущность в формате недельного расписания."""
+    context = await _load_search_entity_context_v2(message, token, edit=edit)
+    if not context:
+        return False
+
+    weeks = context['weeks']
+    if week_index is None:
+        week_index = _pick_search_initial_week_index_v2(weeks)
+
+    week_index = max(0, min(week_index, len(weeks) - 1))
+    week_item = weeks[week_index]
+    text = _build_search_week_overview_text_v2(context['search_kind'], context['entity_value'], week_item)
+    keyboard = _build_search_week_keyboard_v2(token, week_item, show_empty)
+
+    if edit:
+        await _safe_edit_text(message.message, text, reply_markup=keyboard, parse_mode='HTML')
+        await message.answer()
+    else:
+        await message.answer(text, reply_markup=keyboard, parse_mode='HTML')
+
+    return True
+
+
+async def _render_search_day_view_v2(callback_query: types.CallbackQuery, token, week_index, day_index, show_empty: bool = False):
+    """Показывает подробный экран дня для найденной сущности."""
+    context = await _load_search_entity_context_v2(callback_query, token, edit=True)
+    if not context:
+        return
+
+    weeks = context['weeks']
+    week_index = max(0, min(week_index, len(weeks) - 1))
+    week_item = weeks[week_index]
+    week_days = week_item['week_days']
+
+    if not week_days:
+        await callback_query.answer('⚠️ Неделя не содержит дней', show_alert=True)
+        return
+
+    text, selected_day_index = _build_search_day_view_text_v2(
+        context['search_kind'],
+        context['entity_value'],
+        week_item,
+        day_index,
+    )
+    keyboard = _build_search_day_keyboard_v2(token, weeks, week_index, selected_day_index, show_empty)
+
+    await _safe_edit_text(callback_query.message, text, reply_markup=keyboard, parse_mode='HTML')
+    await callback_query.answer()
+
+
+async def _render_search_week_picker_v2(callback_query: types.CallbackQuery, token, week_index, month_index: int | None = None):
+    """Показывает выбор недели для найденной сущности."""
+    context = await _load_search_entity_context_v2(callback_query, token, edit=True)
+    if not context:
+        return
+
+    weeks = context['weeks']
+    months = context['months']
+    week_index = max(0, min(week_index, len(weeks) - 1))
+
+    if month_index is None:
+        month_index = _search_month_index_for_week_v2(weeks, week_index)
+    month_index = max(0, min(month_index, len(months) - 1))
+
+    month_item = months[month_index]
+    meta = SEARCH_TYPES[context['search_kind']]
+    text = (
+        f"<b>{meta['title']}</b>\n"
+        f"{meta['entity_emoji']} {meta['entity_label']}: <b>{html.escape(context['entity_value'])}</b>\n"
+        f"🗓️ Месяц: <b>{html.escape(month_item['label'])}</b>\n\n"
+        "👇 Выберите неделю."
+    )
+    keyboard = _build_search_week_picker_keyboard_v2(token, weeks, months, week_index, month_index)
+    await _safe_edit_text(callback_query.message, text, reply_markup=keyboard, parse_mode='HTML')
+    await callback_query.answer()
+
+
+async def _render_search_month_picker_v2(callback_query: types.CallbackQuery, token, week_index):
+    """Показывает выбор месяца для найденной сущности."""
+    context = await _load_search_entity_context_v2(callback_query, token, edit=True)
+    if not context:
+        return
+
+    weeks = context['weeks']
+    months = context['months']
+    week_index = max(0, min(week_index, len(weeks) - 1))
+    current_month_index = _search_month_index_for_week_v2(weeks, week_index)
+    meta = SEARCH_TYPES[context['search_kind']]
+
+    text = (
+        f"<b>{meta['title']}</b>\n"
+        f"{meta['entity_emoji']} {meta['entity_label']}: <b>{html.escape(context['entity_value'])}</b>\n\n"
+        "👇 Выберите месяц."
+    )
+    keyboard = _build_search_month_picker_keyboard_v2(token, months, current_month_index, week_index)
+    await _safe_edit_text(callback_query.message, text, reply_markup=keyboard, parse_mode='HTML')
+    await callback_query.answer()
+
+
+async def search_open_entity(callback_query: types.CallbackQuery, state: FSMContext):
+    """Открывает расписание выбранной найденной сущности."""
+    token = callback_query.data[len('search_entity_'):]
+    await _render_search_entity(callback_query, token, None, edit=True)
+
+
+async def search_open_week(callback_query: types.CallbackQuery, state: FSMContext):
+    """Открывает выбранную неделю найденной сущности."""
+    payload = callback_query.data[len('search_week_'):]
+    try:
+        token, week_index, show_empty = _search_parse_week_payload(payload)
+    except ValueError:
+        await callback_query.answer('⚠️ Некорректная неделя', show_alert=True)
+        return
+
+    await _render_search_entity(callback_query, token, week_index, edit=True, show_empty=show_empty)
+
+
+async def search_shift_week(callback_query: types.CallbackQuery, state: FSMContext):
+    """Переключает неделю поиска вперед или назад."""
+    payload = callback_query.data[len('search_shift_'):]
+    try:
+        token, week_index, delta, show_empty = _search_parse_shift_payload(payload)
+    except ValueError:
+        await callback_query.answer('⚠️ Некорректный шаг недели', show_alert=True)
+        return
+
+    context = await _load_search_entity_context_v2(callback_query, token, edit=True)
+    if not context:
+        return
+
+    week_index = max(0, min(week_index, len(context['weeks']) - 1))
+    if show_empty:
+        target_week_index = week_index + delta
+        if target_week_index < 0:
+            target_week_index = None
+        elif target_week_index >= len(context['weeks']):
+            target_week_index = None
+    else:
+        target_week_index = _find_search_week_with_lessons_v2(context['weeks'], week_index, delta)
+    if delta < 0 and target_week_index is None:
+        await callback_query.answer('📭 Предыдущих недель больше нет.', show_alert=True)
+        return
+    if delta > 0 and target_week_index is None:
+        await callback_query.answer(
+            '📭 Следующих недель нет. Как они появятся, мы вам обязательно сообщим.',
+            show_alert=True,
+        )
+        return
+
+    await _render_search_entity(callback_query, token, target_week_index, edit=True, show_empty=show_empty)
+
+
+async def search_open_day(callback_query: types.CallbackQuery, state: FSMContext):
+    """Открывает день найденной сущности со сквозной навигацией между неделями."""
+    payload = callback_query.data[len('search_day_'):]
+    try:
+        token, week_index, day_index, show_empty = _search_parse_day_payload(payload)
+    except ValueError:
+        await callback_query.answer('⚠️ Некорректный день', show_alert=True)
+        return
+
+    context = await _load_search_entity_context_v2(callback_query, token, edit=True)
+    if not context:
+        return
+
+    weeks = context['weeks']
+    if not weeks:
+        await callback_query.answer('📭 Для выбранной сущности нет расписания', show_alert=True)
+        return
+
+    week_index = max(0, min(week_index, len(weeks) - 1))
+    current_week_days = weeks[week_index]['week_days']
+
+    if 0 <= day_index < len(current_week_days):
+        if show_empty or current_week_days[day_index].get('has_lessons'):
+            await _render_search_day_view_v2(callback_query, token, week_index, day_index, show_empty=show_empty)
+            return
+
+    direction = -1 if day_index < 0 else 1
+    anchor_day_index = 0 if day_index < 0 else max(len(current_week_days) - 1, 0)
+    if show_empty:
+        target_day_ref = _find_search_adjacent_calendar_day_ref_v2(weeks, week_index, anchor_day_index, direction)
+    else:
+        target_day_ref = _find_search_adjacent_day_ref_v2(weeks, week_index, anchor_day_index, direction)
+    if target_day_ref:
+        await _render_search_day_view_v2(
+            callback_query,
+            token,
+            target_day_ref[0],
+            target_day_ref[1],
+            show_empty=show_empty,
+        )
+        return
+
+    if direction < 0:
+        await callback_query.answer('📭 Предыдущих дней больше нет.', show_alert=True)
+        return
+
+    await callback_query.answer(
+        '📭 Следующих дней нет. Как они появятся, мы вам обязательно сообщим.',
+        show_alert=True,
+    )
+
+
+async def search_open_nearest_days(callback_query: types.CallbackQuery, state: FSMContext):
+    """Открывает ближайший следующий день с занятиями."""
+    payload = callback_query.data[len('search_nearest_'):]
+    token, show_empty = _search_parse_nearest_payload(payload)
+    context = await _load_search_entity_context_v2(callback_query, token, edit=True)
+    if not context:
+        return
+
+    nearest_day_ref = _pick_search_next_day_ref_v2(context['weeks'])
+    if not nearest_day_ref:
+        await callback_query.answer('📭 Ближайших следующих дней с занятиями пока нет.', show_alert=True)
+        return
+
+    await _render_search_day_view_v2(
+        callback_query,
+        token,
+        nearest_day_ref[0],
+        nearest_day_ref[1],
+        show_empty=show_empty,
+    )
+
+
+async def search_toggle_empty_week(callback_query: types.CallbackQuery, state: FSMContext):
+    """Переключает показ пустых дней на экране недели поиска."""
+    payload = callback_query.data[len('search_toggleweek_'):]
+    parts = payload.rsplit('_', 2)
+    if len(parts) != 3:
+        await callback_query.answer('⚠️ Некорректный режим отображения', show_alert=True)
+        return
+
+    token, week_index_text, show_empty_text = parts
+    try:
+        week_index = int(week_index_text)
+    except ValueError:
+        await callback_query.answer('⚠️ Некорректный режим отображения', show_alert=True)
+        return
+
+    show_empty = _search_show_empty_flag(show_empty_text)
+    context = await _load_search_entity_context_v2(callback_query, token, edit=True)
+    if not context:
+        return
+
+    weeks = context['weeks']
+    week_index = max(0, min(week_index, len(weeks) - 1))
+    if not show_empty and not any(day.get('has_lessons') for day in weeks[week_index]['week_days']):
+        week_index = _pick_search_initial_week_index_v2(weeks)
+
+    await _render_search_entity(callback_query, token, week_index, edit=True, show_empty=show_empty)
+
+
+async def search_toggle_empty_day(callback_query: types.CallbackQuery, state: FSMContext):
+    """Переключает показ пустых дней на экране дня поиска."""
+    payload = callback_query.data[len('search_toggleday_'):]
+    parts = payload.rsplit('_', 3)
+    if len(parts) != 4:
+        await callback_query.answer('⚠️ Некорректный режим отображения', show_alert=True)
+        return
+
+    token, week_index_text, day_index_text, show_empty_text = parts
+    try:
+        week_index = int(week_index_text)
+        day_index = int(day_index_text)
+    except ValueError:
+        await callback_query.answer('⚠️ Некорректный режим отображения', show_alert=True)
+        return
+
+    show_empty = _search_show_empty_flag(show_empty_text)
+    context = await _load_search_entity_context_v2(callback_query, token, edit=True)
+    if not context:
+        return
+
+    weeks = context['weeks']
+    week_index = max(0, min(week_index, len(weeks) - 1))
+    week_days = weeks[week_index]['week_days']
+
+    if show_empty:
+        if not week_days:
+            await callback_query.answer('📭 Для выбранной недели нет дней.', show_alert=True)
+            return
+        day_index = max(0, min(day_index, len(week_days) - 1))
+        await _render_search_day_view_v2(callback_query, token, week_index, day_index, show_empty=True)
+        return
+
+    if 0 <= day_index < len(week_days) and week_days[day_index].get('has_lessons'):
+        await _render_search_day_view_v2(callback_query, token, week_index, day_index, show_empty=False)
+        return
+
+    nearest_day_ref = _pick_search_next_day_ref_v2(weeks) or _pick_search_nearest_day_ref_v2(weeks)
+    if not nearest_day_ref:
+        await callback_query.answer('📭 Для выбранной сущности нет дней с занятиями.', show_alert=True)
+        return
+
+    await _render_search_day_view_v2(
+        callback_query,
+        token,
+        nearest_day_ref[0],
+        nearest_day_ref[1],
+        show_empty=False,
+    )
+
+
+async def search_pick_week(callback_query: types.CallbackQuery, state: FSMContext):
+    """Открывает выбор недели для найденной сущности."""
+    payload = callback_query.data[len('search_weekpick_'):]
+    token, separator, week_index_text = payload.rpartition('_')
+    if not separator:
+        await callback_query.answer('⚠️ Некорректный выбор недели', show_alert=True)
+        return
+
+    try:
+        week_index = int(week_index_text)
+    except ValueError:
+        await callback_query.answer('⚠️ Некорректный выбор недели', show_alert=True)
+        return
+
+    await _render_search_week_picker_v2(callback_query, token, week_index)
+
+
+async def search_choose_week(callback_query: types.CallbackQuery, state: FSMContext):
+    """Выбирает неделю из списка для найденной сущности."""
+    payload = callback_query.data[len('search_weeksel_'):]
+    token, separator, week_index_text = payload.rpartition('_')
+    if not separator:
+        await callback_query.answer('⚠️ Некорректная неделя', show_alert=True)
+        return
+
+    try:
+        week_index = int(week_index_text)
+    except ValueError:
+        await callback_query.answer('⚠️ Некорректная неделя', show_alert=True)
+        return
+
+    await _render_search_entity(callback_query, token, week_index, edit=True)
+
+
+async def search_pick_month(callback_query: types.CallbackQuery, state: FSMContext):
+    """Открывает выбор месяца для найденной сущности."""
+    payload = callback_query.data[len('search_monthpick_'):]
+    token, separator, week_index_text = payload.rpartition('_')
+    if not separator:
+        await callback_query.answer('⚠️ Некорректный выбор месяца', show_alert=True)
+        return
+
+    try:
+        week_index = int(week_index_text)
+    except ValueError:
+        await callback_query.answer('⚠️ Некорректный выбор месяца', show_alert=True)
+        return
+
+    await _render_search_month_picker_v2(callback_query, token, week_index)
+
+
+async def search_view_month(callback_query: types.CallbackQuery, state: FSMContext):
+    """Листает месяцы на экране выбора недели для найденной сущности."""
+    payload = callback_query.data[len('search_monthview_'):]
+    token, separator, month_index_text = payload.rpartition('_')
+    if not separator:
+        await callback_query.answer('⚠️ Некорректный месяц', show_alert=True)
+        return
+
+    try:
+        month_index = int(month_index_text)
+    except ValueError:
+        await callback_query.answer('⚠️ Некорректный месяц', show_alert=True)
+        return
+
+    context = await _load_search_entity_context_v2(callback_query, token, edit=True)
+    if not context:
+        return
+
+    months = context['months']
+    if not months:
+        await callback_query.answer('📭 Для выбранной сущности нет месяцев', show_alert=True)
+        return
+
+    if month_index < 0 or month_index >= len(months):
+        await callback_query.answer('📭 Больше месяцев нет.', show_alert=True)
+        return
+
+    current_week_index = _pick_search_week_index_for_month_v2(context['weeks'], months[month_index])
+    await _render_search_week_picker_v2(callback_query, token, current_week_index, month_index)
+
+
+async def search_choose_month(callback_query: types.CallbackQuery, state: FSMContext):
+    """Выбирает месяц и открывает ближайшую неделю этого месяца."""
+    payload = callback_query.data[len('search_monthsel_'):]
+    token, separator, month_index_text = payload.rpartition('_')
+    if not separator:
+        await callback_query.answer('⚠️ Некорректный месяц', show_alert=True)
+        return
+
+    try:
+        month_index = int(month_index_text)
+    except ValueError:
+        await callback_query.answer('⚠️ Некорректный месяц', show_alert=True)
+        return
+
+    context = await _load_search_entity_context_v2(callback_query, token, edit=True)
+    if not context:
+        return
+
+    months = context['months']
+    if month_index < 0 or month_index >= len(months):
+        await callback_query.answer('⚠️ Некорректный месяц', show_alert=True)
+        return
+
+    week_index = _pick_search_week_index_for_month_v2(context['weeks'], months[month_index])
+    await _render_search_entity(callback_query, token, week_index, edit=True)
 
 
 def _build_period_to_course(course_name, group_code):
@@ -2428,7 +3569,6 @@ async def calendar_open_day(callback_query: types.CallbackQuery, state: FSMConte
     direction = -1 if day_index < 0 else 1
     course_name = user_data.get('selected_course_name') or _course_name(course)
     timeline = _build_group_week_timeline(course_name, group_code)
-
     if not timeline:
         await callback_query.answer('📭 Для выбранной группы нет расписания', show_alert=True)
         return
@@ -2446,14 +3586,11 @@ async def calendar_open_day(callback_query: types.CallbackQuery, state: FSMConte
         current_timeline_index = 0
 
     target_timeline_index = current_timeline_index + direction
-
     while 0 <= target_timeline_index < len(timeline):
         target = timeline[target_timeline_index]
         target_week_days = _build_week_day_items(target['course'], group_code, target['week_label'])
-
         if target_week_days:
             target_day_index = len(target_week_days) - 1 if direction < 0 else 0
-
             await _update_user_selection(
                 state,
                 _telegram_id_from_callback(callback_query),
@@ -2463,10 +3600,8 @@ async def calendar_open_day(callback_query: types.CallbackQuery, state: FSMConte
                 selected_week_index=target['week_index'],
                 selected_day_index=target_day_index,
             )
-
             await _render_day_view(callback_query, state, target_day_index)
             return
-
         target_timeline_index += direction
 
     if direction < 0:
@@ -2838,6 +3973,17 @@ def register_handlers_client(dp: Dispatcher):
     dp.register_callback_query_handler(search_choose_kind, Text(startswith='search_kind_'), state='*')
     dp.register_callback_query_handler(search_open_entity, Text(startswith='search_entity_'), state='*')
     dp.register_callback_query_handler(search_change_page, Text(startswith='search_page_'), state='*')
+    dp.register_callback_query_handler(search_open_week, Text(startswith='search_week_'), state='*')
+    dp.register_callback_query_handler(search_shift_week, Text(startswith='search_shift_'), state='*')
+    dp.register_callback_query_handler(search_open_day, Text(startswith='search_day_'), state='*')
+    dp.register_callback_query_handler(search_open_nearest_days, Text(startswith='search_nearest_'), state='*')
+    dp.register_callback_query_handler(search_toggle_empty_week, Text(startswith='search_toggleweek_'), state='*')
+    dp.register_callback_query_handler(search_toggle_empty_day, Text(startswith='search_toggleday_'), state='*')
+    dp.register_callback_query_handler(search_pick_week, Text(startswith='search_weekpick_'), state='*')
+    dp.register_callback_query_handler(search_choose_week, Text(startswith='search_weeksel_'), state='*')
+    dp.register_callback_query_handler(search_pick_month, Text(startswith='search_monthpick_'), state='*')
+    dp.register_callback_query_handler(search_view_month, Text(startswith='search_monthview_'), state='*')
+    dp.register_callback_query_handler(search_choose_month, Text(startswith='search_monthsel_'), state='*')
     dp.register_callback_query_handler(search_noop, Text(equals='search_noop'), state='*')
     dp.register_callback_query_handler(process_course_choice, Text(startswith="course_"))
     dp.register_callback_query_handler(process_group_choice, Text(startswith="group_"))
@@ -2866,3 +4012,4 @@ def register_handlers_client(dp: Dispatcher):
     dp.register_callback_query_handler(settings_shift_digest_time, Text(startswith="settings_digest_time_"))
     dp.register_callback_query_handler(settings_time_noop, Text(equals="settings_time_noop"))
     dp.register_callback_query_handler(change_group, Text(startswith="change_group"))
+
