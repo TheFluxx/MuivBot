@@ -43,6 +43,26 @@ class UserScheduleState(Base):
     updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
+class UserDailyNotification(Base):
+    """Факт отправки ежедневной рассылки пользователю."""
+
+    __tablename__ = 'user_daily_notifications'
+    __table_args__ = (
+        UniqueConstraint(
+            'telegram_id',
+            'notification_type',
+            'target_date',
+            name='uq_user_daily_notification',
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    telegram_id = Column(BigInteger, nullable=False, index=True)
+    notification_type = Column(String(64), nullable=False, index=True)
+    target_date = Column(Date, nullable=False, index=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+
 class SchedulePeriod(Base):
     """Период расписания (например, месяц/семестр из имени файла)."""
 

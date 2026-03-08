@@ -9,6 +9,7 @@ from db_api.database import get_session
 from db_api.tables import (
     Users,
     UserScheduleState,
+    UserDailyNotification,
     ScheduleCourse,
     ScheduleGroup,
     ScheduleLesson,
@@ -169,6 +170,37 @@ async def get_users_with_selected_groups(group_codes=None):
                 }
             )
         return users
+
+
+async def was_daily_notification_sent(telegram_id: int, notification_type: str, target_date):
+    """Проверяет, отправлялась ли уже ежедневная рассылка пользователю на дату."""
+    async with get_session() as session:
+        result = await session.execute(
+            select(UserDailyNotification.id).where(
+                UserDailyNotification.telegram_id == telegram_id,
+                UserDailyNotification.notification_type == str(notification_type).strip(),
+                UserDailyNotification.target_date == target_date,
+            )
+        )
+        return result.scalar_one_or_none() is not None
+
+
+async def mark_daily_notification_sent(telegram_id: int, notification_type: str, target_date):
+    """Фиксирует успешную отправку ежедневной рассылки пользователю."""
+    async with get_session() as session:
+        session.add(
+            UserDailyNotification(
+                telegram_id=telegram_id,
+                notification_type=str(notification_type).strip()[:64],
+                target_date=target_date,
+            )
+        )
+        try:
+            await session.commit()
+            return True
+        except IntegrityError:
+            await session.rollback()
+            return False
 
 async def replace_schedule_snapshot(
     schedule_data: Dict[str, Dict[str, Dict[str, list]]],

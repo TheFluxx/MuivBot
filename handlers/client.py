@@ -1161,6 +1161,31 @@ def _build_day_view_text(course, group_code, week_label, week_days, day_index):
 
     return '\n'.join(lines), day_index
 
+
+def build_day_schedule_payload_by_date(course_name, group_code, target_date):
+    """Возвращает данные страницы дня по конкретной дате."""
+    target_day = _find_day_by_date(course_name, group_code, target_date)
+    if target_day is None:
+        return None
+
+    text, day_index = _build_day_view_text(
+        target_day['course'],
+        group_code,
+        target_day['week_label'],
+        target_day['week_days'],
+        target_day['day_index'],
+    )
+
+    return {
+        'selected_course': target_day['course'],
+        'selected_week_index': target_day['week_index'],
+        'selected_day_index': day_index,
+        'week_label': target_day['week_label'],
+        'week_days': target_day['week_days'],
+        'text': text,
+        'keyboard': _build_day_keyboard(target_day['week_days'], day_index),
+    }
+
 def _build_week_keyboard(week_label, week_days):
     """Строит клавиатуру страницы недели."""
     keyboard = types.InlineKeyboardMarkup(row_width=1)
@@ -1425,9 +1450,9 @@ async def _show_relative_day_schedule(message: types.Message, state: FSMContext,
 
     course_name = user_data.get('selected_course_name') or _course_name(course)
     target_date = datetime.now().date() + timedelta(days=day_shift)
-    target_day = _find_day_by_date(course_name, group_code, target_date)
+    day_payload = build_day_schedule_payload_by_date(course_name, group_code, target_date)
 
-    if target_day is None:
+    if day_payload is None:
         await message.answer(
             f"📭 На {target_date.strftime('%d.%m.%y')} для группы {group_code} нет занятий или дата еще не опубликована."
         )
@@ -1437,21 +1462,12 @@ async def _show_relative_day_schedule(message: types.Message, state: FSMContext,
         state,
         _telegram_id_from_message(message),
         selected_course_name=course_name,
-        selected_course=target_day['course'],
+        selected_course=day_payload['selected_course'],
         selected_group=group_code,
-        selected_week_index=target_day['week_index'],
-        selected_day_index=target_day['day_index'],
+        selected_week_index=day_payload['selected_week_index'],
+        selected_day_index=day_payload['selected_day_index'],
     )
-
-    text, day_index = _build_day_view_text(
-        target_day['course'],
-        group_code,
-        target_day['week_label'],
-        target_day['week_days'],
-        target_day['day_index'],
-    )
-    keyboard = _build_day_keyboard(target_day['week_days'], day_index)
-    await message.answer(text, reply_markup=keyboard, parse_mode='HTML')
+    await message.answer(day_payload['text'], reply_markup=day_payload['keyboard'], parse_mode='HTML')
 
 
 async def schedule_today(message: types.Message, state: FSMContext):

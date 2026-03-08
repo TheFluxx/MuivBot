@@ -1,8 +1,10 @@
 import asyncio
+import html
 import logging
 import re
 import secrets
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from aiogram import types
 from aiogram.dispatcher import FSMContext
@@ -16,6 +18,7 @@ from handlers import client
 from muiv_schedule_monitor import POLL_SECONDS, check_for_schedule_updates
 
 monitor_task = None
+daily_digest_task = None
 
 DEFAULT_TIME_SLOTS = [
     '8:20-9:50',
@@ -40,6 +43,20 @@ EMPTY_DATE_MARKERS = {'', 'не указана', 'дата не указана',
 MONITOR_DIFF_CACHE = {}
 MONITOR_OPEN_CACHE = {}
 MONITOR_CACHE_LIMIT = 4000
+DAILY_TOMORROW_HOUR = 20
+DAILY_TOMORROW_MINUTE = 0
+DAILY_TOMORROW_NOTIFICATION_TYPE = 'tomorrow_evening'
+
+
+def _load_moscow_timezone():
+    """Возвращает часовой пояс Москвы без зависимости от внешнего tzdata."""
+    try:
+        return ZoneInfo('Europe/Moscow')
+    except ZoneInfoNotFoundError:
+        return timezone(timedelta(hours=3), name='MSK')
+
+
+MOSCOW_TZ = _load_moscow_timezone()
 
 
 def setup_handlers(dispatcher):
@@ -211,6 +228,124 @@ def _store_diff_callback(
         },
     )
     return f'mon_diff_{token}'
+
+
+def _now_moscow() -> datetime:
+    """Возвращает текущее время по Москве."""
+    return datetime.now(MOSCOW_TZ)
+
+
+def _build_daily_digest_header(target_date: date) -> str:
+    """Формирует заголовок вечерней рассылки на завтра."""
+    weekday_name = WEEKDAY_NAMES[target_date.weekday()]
+    return f"🌙 <b>Расписание на завтра</b>\n📅 <b>{target_date.strftime('%d.%m.%y')} ({weekday_name})</b>"
+
+
+def _build_daily_digest_empty_text(group_code: str, target_date: date) -> str:
+    """Формирует сообщение, если на завтра нет опубликованного расписания."""
+    return (
+        f"{_build_daily_digest_header(target_date)}\n\n"
+        f"👥 Группа: <b>{html.escape(str(group_code))}</b>\n"
+        "📭 На завтра занятий нет или расписание еще не опубликовано."
+    )
+
+
+async def _send_daily_tomorrow_digest():
+    """Отправляет вечером расписание на завтра всем пользователям с выбранной группой."""
+    target_date = _now_moscow().date() + timedelta(days=1)
+    users = await db_commands.get_users_with_selected_groups()
+
+    sent_count = 0
+    skipped_count = 0
+
+    for user in users:
+        telegram_id = user.get('telegram_id')
+        group_code = user.get('selected_group')
+        selected_course = user.get('selected_course')
+        course_name = user.get('selected_course_name') or _course_name_from_key(selected_course or '')
+
+        if not telegram_id or not group_code or not course_name:
+            continue
+
+        already_sent = await db_commands.was_daily_notification_sent(
+            telegram_id,
+            DAILY_TOMORROW_NOTIFICATION_TYPE,
+            target_date,
+        )
+        if already_sent:
+            skipped_count += 1
+            continue
+
+        try:
+            day_payload = client.build_day_schedule_payload_by_date(course_name, group_code, target_date)
+            reply_markup = None
+
+            if day_payload is not None:
+                await db_commands.upsert_user_schedule_state(
+                    telegram_id,
+                    selected_course_name=course_name,
+                    selected_course=day_payload['selected_course'],
+                    selected_group=group_code,
+                    selected_week_index=day_payload['selected_week_index'],
+                    selected_day_index=day_payload['selected_day_index'],
+                )
+                text = f"{_build_daily_digest_header(target_date)}\n\n{day_payload['text']}"
+                reply_markup = day_payload['keyboard']
+            else:
+                text = _build_daily_digest_empty_text(group_code, target_date)
+
+            await bot.send_message(
+                telegram_id,
+                text,
+                reply_markup=reply_markup,
+                parse_mode='HTML',
+            )
+            await db_commands.mark_daily_notification_sent(
+                telegram_id,
+                DAILY_TOMORROW_NOTIFICATION_TYPE,
+                target_date,
+            )
+            sent_count += 1
+        except Exception as send_error:
+            print(f'[DIGEST][WARN] cannot send tomorrow digest to {telegram_id}: {send_error}')
+
+    return {
+        'target_date': target_date,
+        'sent_count': sent_count,
+        'skipped_count': skipped_count,
+        'users_count': len(users),
+    }
+
+
+async def _daily_tomorrow_digest_loop():
+    """Фоновый цикл вечерней рассылки расписания на завтра."""
+    last_target_date = None
+    await asyncio.sleep(10)
+
+    while True:
+        try:
+            now = _now_moscow()
+            target_date = now.date() + timedelta(days=1)
+            send_time_reached = (now.hour, now.minute) >= (DAILY_TOMORROW_HOUR, DAILY_TOMORROW_MINUTE)
+
+            if send_time_reached and last_target_date != target_date:
+                stats = await _send_daily_tomorrow_digest()
+                last_target_date = target_date
+                print(
+                    '[DIGEST] target_date={target_date}, sent={sent}, skipped={skipped}, users={users}'.format(
+                        target_date=stats['target_date'],
+                        sent=stats['sent_count'],
+                        skipped=stats['skipped_count'],
+                        users=stats['users_count'],
+                    )
+                )
+
+            await asyncio.sleep(60 if send_time_reached else 30)
+        except asyncio.CancelledError:
+            raise
+        except Exception as loop_error:
+            print(f'[DIGEST][ERR] loop failed: {loop_error}')
+            await asyncio.sleep(60)
 
 
 async def monitor_show_change_details(callback_query: types.CallbackQuery):
@@ -658,7 +793,7 @@ async def _schedule_monitor_loop():
 
 async def on_startup(dispatcher):
     """Инициализация БД, расписания и фонового мониторинга при запуске."""
-    global monitor_task
+    global monitor_task, daily_digest_task
 
     await create_base()
     setup_handlers(dispatcher)
@@ -690,17 +825,31 @@ async def on_startup(dispatcher):
         monitor_task = asyncio.create_task(_schedule_monitor_loop())
         print(f'✅ Монитор расписания запущен (интервал {POLL_SECONDS} сек)')
 
+    if daily_digest_task is None or daily_digest_task.done():
+        daily_digest_task = asyncio.create_task(_daily_tomorrow_digest_loop())
+        print(
+            '✅ Вечерняя рассылка расписания запущена '
+            f'({DAILY_TOMORROW_HOUR:02d}:{DAILY_TOMORROW_MINUTE:02d} МСК)'
+        )
+
     print('Бот запущен!')
 
 
 async def on_shutdown(dispatcher):
     """Останавливает фоновые задачи при завершении бота."""
-    global monitor_task
+    global monitor_task, daily_digest_task
 
     if monitor_task and not monitor_task.done():
         monitor_task.cancel()
         try:
             await monitor_task
+        except asyncio.CancelledError:
+            pass
+
+    if daily_digest_task and not daily_digest_task.done():
+        daily_digest_task.cancel()
+        try:
+            await daily_digest_task
         except asyncio.CancelledError:
             pass
 
