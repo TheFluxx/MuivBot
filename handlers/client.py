@@ -1,4 +1,5 @@
 import asyncio
+import secrets
 import os
 import re
 import html
@@ -7,6 +8,7 @@ from datetime import datetime, timedelta
 from aiogram import types, Dispatcher
 from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters import Text
+from aiogram.dispatcher.filters.state import State, StatesGroup
 from aiogram.utils.exceptions import MessageNotModified
 import xlrd
 from db_api import db_commands
@@ -17,8 +19,15 @@ def get_main_keyboard():
     """Создает основную клавиатуру бота."""
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
     kb.add(types.KeyboardButton("📅 Мое расписание"))
+    kb.add(types.KeyboardButton("🔎 Поиск"))
     kb.add(types.KeyboardButton("💼 Настройки"))
     return kb
+
+
+class SearchDialog(StatesGroup):
+    """Состояния диалога поиска."""
+
+    waiting_query = State()
 
 async def cmd_start(message: types.Message):
     """Обрабатывает команду /start и регистрирует пользователя."""
@@ -179,6 +188,33 @@ USER_SELECTION_KEYS = (
     'daily_digest_hour',
     'daily_digest_minute',
 )
+SEARCH_CALLBACK_CACHE = {}
+SEARCH_CALLBACK_LIMIT = 3000
+SEARCH_PAGE_SIZE = 4
+SEARCH_TYPES = {
+    'teacher': {
+        'title': '👨‍🏫 Поиск по преподавателю',
+        'entity_emoji': '👨‍🏫',
+        'entity_label': 'Преподаватель',
+        'prompt': 'Напишите преподавателя. Пример: `Леденчук` или `Леденчук Н.С.`',
+        'empty': 'По такому преподавателю ничего не найдено.',
+    },
+    'room': {
+        'title': '🏫 Поиск по аудитории',
+        'entity_emoji': '🏫',
+        'entity_label': 'Аудитория',
+        'prompt': 'Напишите аудиторию. Пример: `125`, `ауд. 125`, `спортзал`',
+        'empty': 'По такой аудитории ничего не найдено.',
+    },
+    'subject': {
+        'title': '📚 Поиск по предмету',
+        'entity_emoji': '📚',
+        'entity_label': 'Предмет',
+        'prompt': 'Напишите предмет. Пример: `математика` или `принятия решений`',
+        'empty': 'По такому предмету ничего не найдено.',
+    },
+}
+ROOM_PATTERN = re.compile(r'(?i)\b(?:ауд\.?|каб\.?|кабинет|лаб\.?|лаборатория|спортзал|зал)\s*[^,;|]*')
 
 
 def _telegram_id_from_message(message: types.Message):
@@ -579,11 +615,36 @@ def parse_excel_file():
                     if lesson_info.lower() in IGNORED_LESSON_VALUES:
                         continue
 
+                    lesson_details = ''
+                    if row_idx + 1 < sheet.nrows:
+                        next_row = sheet.row_values(row_idx + 1)
+                        next_first_cell = _normalize_cell_text(next_row[0]) if next_row else ''
+                        next_time_cell = next_row[2] if len(next_row) > 2 else None
+                        next_time_str = _format_excel_time(next_time_cell, workbook.datemode)
+                        next_week_label = _find_week_label(next_row) if next_row else None
+
+                        is_details_row = (
+                            not next_week_label
+                            and next_first_cell.lower() not in DAY_NAMES
+                            and (not next_time_str or next_time_str.lower() == TIME_HEADER)
+                        )
+
+                        if is_details_row and col_idx < len(next_row):
+                            lesson_details = _normalize_cell_text(next_row[col_idx])
+                            if lesson_details.lower() in IGNORED_LESSON_VALUES:
+                                lesson_details = ''
+
+                    lesson_text = lesson_info
+                    if lesson_details and lesson_details not in lesson_info:
+                        lesson_text = f"{lesson_info} | {lesson_details}"
+
                     schedule_entry = {
                         "day": current_day,
                         "date": current_date,
                         "time": time_str,
-                        "lesson": lesson_info,
+                        "lesson": lesson_text,
+                        "subject": lesson_info,
+                        "details": lesson_details,
                         "week": current_week,
                     }
                     schedule_data[course_key][group_code][current_week].append(schedule_entry)
@@ -915,6 +976,557 @@ async def _safe_edit_text(message: types.Message, text: str, reply_markup=None, 
         await message.edit_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
     except MessageNotModified:
         pass
+
+
+def _search_normalize_text(value):
+    """Нормализует текст для поиска."""
+    return _normalize_cell_text(value).casefold().replace('ё', 'е')
+
+
+def _search_cache_put(payload):
+    """Сохраняет payload поиска в кэш и возвращает токен."""
+    token = secrets.token_hex(6)
+    while token in SEARCH_CALLBACK_CACHE:
+        token = secrets.token_hex(6)
+
+    SEARCH_CALLBACK_CACHE[token] = payload
+
+    while len(SEARCH_CALLBACK_CACHE) > SEARCH_CALLBACK_LIMIT:
+        first_key = next(iter(SEARCH_CALLBACK_CACHE))
+        SEARCH_CALLBACK_CACHE.pop(first_key, None)
+
+    return token
+
+
+async def _store_search_payload(payload_type, payload):
+    """Сохраняет payload поиска в память и базу данных."""
+    token = _search_cache_put(payload)
+    await db_commands.save_bot_callback_payload(token, payload_type, payload)
+    return token
+
+
+async def _load_search_payload(token, payload_type):
+    """Загружает payload поиска из памяти или базы данных."""
+    payload = SEARCH_CALLBACK_CACHE.get(token)
+    if payload is not None:
+        return payload
+
+    payload = await db_commands.get_bot_callback_payload(token, payload_type)
+    if payload is not None:
+        SEARCH_CALLBACK_CACHE[token] = payload
+    return payload
+
+
+def _extract_subject_from_lesson(lesson_text):
+    """Извлекает предмет из текста занятия."""
+    text = _normalize_cell_text(lesson_text)
+    if not text:
+        return ''
+    if '|' in text:
+        return text.split('|', 1)[0].strip(' ,;')
+    return text
+
+
+def _extract_teacher_from_lesson(lesson_text):
+    """Извлекает преподавателя из текста занятия."""
+    text = _normalize_cell_text(lesson_text)
+    if '|' not in text:
+        return ''
+
+    meta = text.split('|', 1)[1].strip()
+    meta = ROOM_PATTERN.sub('', meta)
+    meta = re.sub(r'\s+', ' ', meta)
+    meta = re.sub(r'^[,; ]+|[,; ]+$', '', meta)
+    return meta
+
+
+def _extract_room_from_lesson(lesson_text):
+    """Извлекает аудиторию из текста занятия."""
+    text = _normalize_cell_text(lesson_text)
+    if not text:
+        return ''
+
+    rooms = []
+    for match in ROOM_PATTERN.findall(text):
+        room_text = re.sub(r'\s+', ' ', match).strip(' ,;')
+        if room_text and room_text not in rooms:
+            rooms.append(room_text)
+
+    return ' / '.join(rooms)
+
+
+def _collect_search_occurrences():
+    """Собирает занятия для поиска по преподавателю, аудитории и предмету."""
+    occurrences = []
+
+    for course_key in sorted(schedule_data.keys()):
+        for group_code in sorted(schedule_data.get(course_key, {}).keys()):
+            weeks = schedule_data.get(course_key, {}).get(group_code, {})
+            for week_label in sorted(weeks.keys(), key=_week_sort_key):
+                for entry in weeks.get(week_label, []):
+                    lesson_text = _normalize_cell_text(entry.get('lesson'))
+                    if not lesson_text:
+                        continue
+
+                    parsed_date = _parse_schedule_date(entry.get('date'))
+                    date_obj = parsed_date.date() if parsed_date else None
+                    date_text = _normalize_cell_text(entry.get('date')) or DEFAULT_DATE
+                    day_name = _normalize_cell_text(entry.get('day')).lower()
+
+                    occurrences.append(
+                        {
+                            'course': course_key,
+                            'course_name': _course_name(course_key),
+                            'period_label': _period_label_for_course(course_key),
+                            'group_code': group_code,
+                            'week_label': week_label,
+                            'day_name': day_name,
+                            'date_obj': date_obj,
+                            'date_text': date_text,
+                            'time_text': _normalize_cell_text(entry.get('time')),
+                            'lesson_text': lesson_text,
+                            'subject': _extract_subject_from_lesson(lesson_text),
+                            'teacher': _extract_teacher_from_lesson(lesson_text),
+                            'room': _extract_room_from_lesson(lesson_text),
+                        }
+                    )
+
+    return occurrences
+
+
+def _search_entity_matches(search_kind, query_text):
+    """Ищет сущности нужного типа по подстроке."""
+    normalized_query = _search_normalize_text(query_text)
+    if len(normalized_query) < 2:
+        return []
+
+    matches = {}
+    for occurrence in _collect_search_occurrences():
+        entity_value = _normalize_cell_text(occurrence.get(search_kind))
+        if not entity_value:
+            continue
+
+        normalized_value = _search_normalize_text(entity_value)
+        if normalized_query not in normalized_value:
+            continue
+
+        item = matches.setdefault(
+            entity_value,
+            {
+                'entity': entity_value,
+                'normalized': normalized_value,
+                'lessons_count': 0,
+                'dates': set(),
+                'first_date': occurrence.get('date_obj'),
+            },
+        )
+        item['lessons_count'] += 1
+        item['dates'].add(occurrence.get('date_text'))
+
+        current_date = occurrence.get('date_obj')
+        if item['first_date'] is None or (current_date is not None and current_date < item['first_date']):
+            item['first_date'] = current_date
+
+    result = []
+    for item in matches.values():
+        item['dates_count'] = len(item['dates'])
+        result.append(item)
+
+    result.sort(
+        key=lambda item: (
+            not item['normalized'].startswith(normalized_query),
+            item['normalized'] != normalized_query,
+            -item['lessons_count'],
+            item['first_date'] is None,
+            item['first_date'] or datetime.max.date(),
+            item['entity'],
+        )
+    )
+    return result
+
+
+def _search_occurrences_for_entity(search_kind, entity_value):
+    """Возвращает все занятия для выбранной сущности."""
+    occurrences = [
+        occurrence
+        for occurrence in _collect_search_occurrences()
+        if _normalize_cell_text(occurrence.get(search_kind)) == _normalize_cell_text(entity_value)
+    ]
+    occurrences.sort(
+        key=lambda item: (
+            item['date_obj'] is None,
+            item['date_obj'] or datetime.max.date(),
+            _normalize_cell_text(item.get('time_text')),
+            item.get('group_code'),
+            item.get('course_name'),
+        )
+    )
+    return occurrences
+
+
+def _format_search_date_caption(date_obj, date_text, day_name):
+    """Форматирует дату для результатов поиска."""
+    if date_obj is not None:
+        weekday_names = (
+            'понедельник',
+            'вторник',
+            'среда',
+            'четверг',
+            'пятница',
+            'суббота',
+            'воскресенье',
+        )
+        return f"{date_obj.strftime('%d.%m.%y')} ({weekday_names[date_obj.weekday()]})"
+    fallback_day = _normalize_cell_text(day_name)
+    if fallback_day:
+        return f"{_normalize_cell_text(date_text)} ({fallback_day})"
+    return _normalize_cell_text(date_text)
+
+
+def _group_search_occurrences_by_date(occurrences):
+    """Группирует найденные занятия по датам."""
+    groups = []
+    current_key = None
+    current_group = None
+
+    for occurrence in occurrences:
+        group_key = (occurrence.get('date_obj'), occurrence.get('date_text'), occurrence.get('day_name'))
+        if current_key != group_key:
+            current_group = {
+                'date_obj': occurrence.get('date_obj'),
+                'date_text': occurrence.get('date_text'),
+                'day_name': occurrence.get('day_name'),
+                'items': [],
+            }
+            groups.append(current_group)
+            current_key = group_key
+
+        current_group['items'].append(occurrence)
+
+    return groups
+
+
+def _search_result_lines_for_occurrence(search_kind, occurrence):
+    """Формирует строки одного занятия в выдаче поиска."""
+    lines = [
+        (
+            f"• ⏰ <b>{html.escape(_normalize_cell_text(occurrence.get('time_text')) or 'Время не указано')}</b>"
+            f" | 🎓 {html.escape(_normalize_cell_text(occurrence.get('course_name')))}"
+            f" | 👥 {html.escape(_normalize_cell_text(occurrence.get('group_code')))}"
+        ),
+        f"  📚 {html.escape(_normalize_cell_text(occurrence.get('subject')) or occurrence.get('lesson_text'))}",
+    ]
+
+    teacher = _normalize_cell_text(occurrence.get('teacher'))
+    room = _normalize_cell_text(occurrence.get('room'))
+    period_label = _normalize_cell_text(occurrence.get('period_label'))
+
+    if teacher and search_kind != 'teacher':
+        lines.append(f"  👨‍🏫 {html.escape(teacher)}")
+    if room and search_kind != 'room':
+        lines.append(f"  🏫 {html.escape(room)}")
+    if period_label:
+        lines.append(f"  🗂️ {html.escape(period_label)}")
+
+    return lines
+
+
+def _build_search_results_text(search_kind, entity_value, occurrences, page_index):
+    """Формирует страницу расписания выбранной сущности."""
+    meta = SEARCH_TYPES[search_kind]
+    date_groups = _group_search_occurrences_by_date(occurrences)
+    pages_count = max(1, (len(date_groups) + SEARCH_PAGE_SIZE - 1) // SEARCH_PAGE_SIZE)
+    page_index = max(0, min(page_index, pages_count - 1))
+
+    start = page_index * SEARCH_PAGE_SIZE
+    end = start + SEARCH_PAGE_SIZE
+    page_groups = date_groups[start:end]
+
+    lines = [
+        f"<b>{meta['title']}</b>",
+        f"{meta['entity_emoji']} <b>{html.escape(entity_value)}</b>",
+        f"📚 Занятий: <b>{len(occurrences)}</b>",
+        f"📅 Дат: <b>{len(date_groups)}</b>",
+        f"📄 Страница: <b>{page_index + 1}/{pages_count}</b>",
+        '',
+    ]
+
+    for group in page_groups:
+        lines.append(
+            f"<b>📅 {_format_search_date_caption(group.get('date_obj'), group.get('date_text'), group.get('day_name'))}</b>"
+        )
+        for occurrence in group.get('items', []):
+            lines.extend(_search_result_lines_for_occurrence(search_kind, occurrence))
+        lines.append('')
+
+    if not page_groups:
+        lines.append('📭 По выбранной сущности занятий не найдено.')
+
+    return '\n'.join(lines).strip(), pages_count
+
+
+def _build_search_type_keyboard():
+    """Строит клавиатуру выбора типа поиска."""
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    keyboard.add(types.InlineKeyboardButton(text='👨‍🏫 По преподавателю', callback_data='search_kind_teacher'))
+    keyboard.add(types.InlineKeyboardButton(text='🏫 По аудитории', callback_data='search_kind_room'))
+    keyboard.add(types.InlineKeyboardButton(text='📚 По предмету', callback_data='search_kind_subject'))
+    return keyboard
+
+
+def _build_search_query_keyboard():
+    """Строит клавиатуру экрана ввода поискового запроса."""
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    keyboard.add(types.InlineKeyboardButton(text='↩️ К видам поиска', callback_data='search_start'))
+    return keyboard
+
+
+def _build_search_matches_keyboard(match_buttons):
+    """Строит клавиатуру списка найденных вариантов."""
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    for button in match_buttons:
+        keyboard.add(button)
+    keyboard.add(types.InlineKeyboardButton(text='🔎 Новый поиск', callback_data='search_start'))
+    return keyboard
+
+
+def _build_search_entity_keyboard(token, page_index, pages_count):
+    """Строит клавиатуру страницы найденной сущности."""
+    keyboard = types.InlineKeyboardMarkup(row_width=3)
+
+    if pages_count > 1:
+        keyboard.row(
+            types.InlineKeyboardButton(
+                text='⬅️',
+                callback_data=f'search_page_{token}_{page_index - 1}' if page_index > 0 else 'search_noop',
+            ),
+            types.InlineKeyboardButton(text=f'📄 {page_index + 1}/{pages_count}', callback_data='search_noop'),
+            types.InlineKeyboardButton(
+                text='➡️',
+                callback_data=f'search_page_{token}_{page_index + 1}'
+                if page_index + 1 < pages_count
+                else 'search_noop',
+            ),
+        )
+
+    keyboard.add(types.InlineKeyboardButton(text='🔎 Новый поиск', callback_data='search_start'))
+    return keyboard
+
+
+async def _render_search_start(message_or_callback, state: FSMContext, *, edit: bool):
+    """Показывает стартовый экран поиска."""
+    await state.finish()
+    text = (
+        "<b>🔎 Поиск по расписанию</b>\n\n"
+        "Можно искать не только по группе, но и по:\n"
+        "• преподавателю\n"
+        "• аудитории\n"
+        "• предмету\n\n"
+        "👇 Выберите, что именно хотите найти."
+    )
+
+    if edit:
+        await _safe_edit_text(
+            message_or_callback.message,
+            text,
+            reply_markup=_build_search_type_keyboard(),
+            parse_mode='HTML',
+        )
+        await message_or_callback.answer()
+    else:
+        await message_or_callback.answer(text, reply_markup=_build_search_type_keyboard(), parse_mode='HTML')
+
+
+async def _render_search_entity(message, token, page_index, *, edit: bool):
+    """Показывает страницу найденной сущности."""
+    payload = await _load_search_payload(token, 'search_entity')
+    if not payload:
+        if edit:
+            await message.answer('Не удалось открыть сохраненный результат поиска.', show_alert=True)
+        else:
+            await message.answer('Не удалось открыть сохраненный результат поиска.')
+        return False
+
+    search_kind = payload.get('search_kind')
+    entity_value = payload.get('entity')
+    if search_kind not in SEARCH_TYPES or not entity_value:
+        if edit:
+            await message.answer('Некорректные данные поиска.', show_alert=True)
+        else:
+            await message.answer('Некорректные данные поиска.')
+        return False
+
+    occurrences = _search_occurrences_for_entity(search_kind, entity_value)
+    if not occurrences:
+        if edit:
+            await message.answer('По выбранной сущности занятий больше не найдено.', show_alert=True)
+        else:
+            await message.answer('По выбранной сущности занятий больше не найдено.')
+        return False
+
+    text, pages_count = _build_search_results_text(search_kind, entity_value, occurrences, page_index)
+    keyboard = _build_search_entity_keyboard(token, max(0, min(page_index, pages_count - 1)), pages_count)
+
+    if edit:
+        await _safe_edit_text(message.message, text, reply_markup=keyboard, parse_mode='HTML')
+        await message.answer()
+    else:
+        await message.answer(text, reply_markup=keyboard, parse_mode='HTML')
+
+    return True
+
+
+async def search_entrypoint(message: types.Message, state: FSMContext):
+    """Открывает меню поиска."""
+    await _render_search_start(message, state, edit=False)
+
+
+async def search_start_callback(callback_query: types.CallbackQuery, state: FSMContext):
+    """Открывает меню поиска по callback-кнопке."""
+    await _render_search_start(callback_query, state, edit=True)
+
+
+async def search_choose_kind(callback_query: types.CallbackQuery, state: FSMContext):
+    """Выбирает тип поиска и просит ввести запрос."""
+    search_kind = callback_query.data[len('search_kind_'):]
+    if search_kind not in SEARCH_TYPES:
+        await callback_query.answer('⚠️ Неизвестный тип поиска', show_alert=True)
+        return
+
+    await state.set_state(SearchDialog.waiting_query.state)
+    await state.update_data(search_kind=search_kind)
+
+    meta = SEARCH_TYPES[search_kind]
+    text = (
+        f"<b>{meta['title']}</b>\n\n"
+        f"{meta['prompt']}\n\n"
+        "Я найду подходящие варианты и покажу расписание красиво по датам."
+    )
+    await _safe_edit_text(
+        callback_query.message,
+        text,
+        reply_markup=_build_search_query_keyboard(),
+        parse_mode='HTML',
+    )
+    await callback_query.answer()
+
+
+async def search_receive_query(message: types.Message, state: FSMContext):
+    """Принимает текст запроса для поиска."""
+    text_value = _normalize_cell_text(message.text)
+    if not text_value:
+        await message.answer('Введите текст для поиска.')
+        return
+
+    if text_value == '📅 Мое расписание':
+        await state.finish()
+        await my_schedule(message, state)
+        return
+    if text_value == '💼 Настройки':
+        await state.finish()
+        await settings(message, state)
+        return
+    if text_value == '🔎 Поиск':
+        await _render_search_start(message, state, edit=False)
+        return
+    if _search_normalize_text(text_value) in {'отмена', 'cancel'}:
+        await state.finish()
+        await message.answer('Поиск отменен.', reply_markup=get_main_keyboard())
+        return
+
+    state_data = await state.get_data()
+    search_kind = state_data.get('search_kind')
+    if search_kind not in SEARCH_TYPES:
+        await _render_search_start(message, state, edit=False)
+        return
+
+    matches = _search_entity_matches(search_kind, text_value)
+    meta = SEARCH_TYPES[search_kind]
+
+    if not matches:
+        await message.answer(
+            f"😕 {meta['empty']}\n\nПопробуйте написать короче или точнее.\n{meta['prompt']}",
+            parse_mode='HTML',
+        )
+        return
+
+    await state.finish()
+
+    if len(matches) == 1:
+        token = await _store_search_payload(
+            'search_entity',
+            {
+                'search_kind': search_kind,
+                'entity': matches[0]['entity'],
+            },
+        )
+        await _render_search_entity(message, token, 0, edit=False)
+        return
+
+    buttons = []
+    for match in matches[:10]:
+        token = await _store_search_payload(
+            'search_entity',
+            {
+                'search_kind': search_kind,
+                'entity': match['entity'],
+            },
+        )
+        button_text = (
+            f"{meta['entity_emoji']} {match['entity']} · "
+            f"{match['dates_count']} дн. / {match['lessons_count']} пар"
+        )
+        buttons.append(
+            types.InlineKeyboardButton(
+                text=button_text[:64],
+                callback_data=f'search_entity_{token}',
+            )
+        )
+
+    lines = [
+        f"<b>{meta['title']}</b>",
+        f"🔎 Запрос: <b>{html.escape(text_value)}</b>",
+        '',
+        f"Найдено вариантов: <b>{len(matches)}</b>",
+        '👇 Выберите нужный вариант:',
+    ]
+    if len(matches) > 10:
+        lines.append('')
+        lines.append('Показываю первые 10 совпадений. Если нужно, уточните запрос.')
+
+    await message.answer(
+        '\n'.join(lines),
+        reply_markup=_build_search_matches_keyboard(buttons),
+        parse_mode='HTML',
+    )
+
+
+async def search_open_entity(callback_query: types.CallbackQuery, state: FSMContext):
+    """Открывает расписание выбранной найденной сущности."""
+    token = callback_query.data[len('search_entity_'):]
+    await _render_search_entity(callback_query, token, 0, edit=True)
+
+
+async def search_change_page(callback_query: types.CallbackQuery, state: FSMContext):
+    """Листает страницы найденной сущности."""
+    payload = callback_query.data[len('search_page_'):]
+    token, separator, page_text = payload.rpartition('_')
+    if not separator:
+        await callback_query.answer('⚠️ Некорректная страница', show_alert=True)
+        return
+
+    try:
+        page_index = int(page_text)
+    except ValueError:
+        await callback_query.answer('⚠️ Некорректная страница', show_alert=True)
+        return
+
+    await _render_search_entity(callback_query, token, page_index, edit=True)
+
+
+async def search_noop(callback_query: types.CallbackQuery):
+    """Служебная кнопка поиска."""
+    await callback_query.answer()
 
 
 def _build_period_to_course(course_name, group_code):
@@ -2211,14 +2823,22 @@ async def settings_time_noop(callback_query: types.CallbackQuery):
 def register_handlers_client(dp: Dispatcher):
     """Регистрирует обработчики сообщений и callback-кнопок."""
     dp.register_message_handler(cmd_start, commands=['start'])
+    dp.register_message_handler(search_entrypoint, commands=['search'], state='*')
     dp.register_message_handler(schedule_today, commands=['today'])
     dp.register_message_handler(schedule_tomorrow, commands=['tomorrow'])
+    dp.register_message_handler(search_entrypoint, text='🔎 Поиск', state='*')
     dp.register_message_handler(settings, text='💼 Настройки')
     dp.register_message_handler(my_schedule, text='📅 Мое расписание')
     dp.register_message_handler(schedule_today, lambda message: message.text and message.text.casefold() == 'на сегодня')
     dp.register_message_handler(schedule_tomorrow, lambda message: message.text and message.text.casefold() == 'на завтра')
+    dp.register_message_handler(search_receive_query, state=SearchDialog.waiting_query)
     
     # Регистрация колбеков
+    dp.register_callback_query_handler(search_start_callback, Text(equals='search_start'), state='*')
+    dp.register_callback_query_handler(search_choose_kind, Text(startswith='search_kind_'), state='*')
+    dp.register_callback_query_handler(search_open_entity, Text(startswith='search_entity_'), state='*')
+    dp.register_callback_query_handler(search_change_page, Text(startswith='search_page_'), state='*')
+    dp.register_callback_query_handler(search_noop, Text(equals='search_noop'), state='*')
     dp.register_callback_query_handler(process_course_choice, Text(startswith="course_"))
     dp.register_callback_query_handler(process_group_choice, Text(startswith="group_"))
     dp.register_callback_query_handler(show_schedule_day, Text(startswith="show_schedule_"))
