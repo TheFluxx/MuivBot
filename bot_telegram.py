@@ -43,8 +43,8 @@ EMPTY_DATE_MARKERS = {'', 'не указана', 'дата не указана',
 MONITOR_DIFF_CACHE = {}
 MONITOR_OPEN_CACHE = {}
 MONITOR_CACHE_LIMIT = 4000
-DAILY_TOMORROW_HOUR = 20
-DAILY_TOMORROW_MINUTE = 0
+DEFAULT_DAILY_TOMORROW_HOUR = db_commands.DEFAULT_DAILY_DIGEST_HOUR
+DEFAULT_DAILY_TOMORROW_MINUTE = db_commands.DEFAULT_DAILY_DIGEST_MINUTE
 DAILY_TOMORROW_NOTIFICATION_TYPE = 'tomorrow_evening'
 
 
@@ -250,21 +250,54 @@ def _build_daily_digest_empty_text(group_code: str, target_date: date) -> str:
     )
 
 
-async def _send_daily_tomorrow_digest():
-    """Отправляет вечером расписание на завтра всем пользователям с выбранной группой."""
-    target_date = _now_moscow().date() + timedelta(days=1)
+def _daily_digest_preferences(user: dict) -> tuple[bool, int, int]:
+    """Возвращает нормализованные настройки ежедневной рассылки пользователя."""
+    enabled = user.get('daily_digest_enabled')
+    hour = user.get('daily_digest_hour')
+    minute = user.get('daily_digest_minute')
+
+    if enabled is None:
+        enabled = db_commands.DEFAULT_DAILY_DIGEST_ENABLED
+    else:
+        enabled = bool(enabled)
+
+    try:
+        hour = int(hour)
+    except (TypeError, ValueError):
+        hour = DEFAULT_DAILY_TOMORROW_HOUR
+
+    try:
+        minute = int(minute)
+    except (TypeError, ValueError):
+        minute = DEFAULT_DAILY_TOMORROW_MINUTE
+
+    return enabled, hour % 24, max(0, min(59, minute))
+
+
+async def _send_daily_tomorrow_digest(now_moscow: datetime):
+    """Отправляет вечернюю рассылку на завтра пользователям, для которых уже наступило их время."""
+    target_date = now_moscow.date() + timedelta(days=1)
     users = await db_commands.get_users_with_selected_groups()
 
     sent_count = 0
     skipped_count = 0
+    disabled_count = 0
+    waiting_count = 0
 
     for user in users:
         telegram_id = user.get('telegram_id')
         group_code = user.get('selected_group')
         selected_course = user.get('selected_course')
         course_name = user.get('selected_course_name') or _course_name_from_key(selected_course or '')
+        digest_enabled, digest_hour, digest_minute = _daily_digest_preferences(user)
 
         if not telegram_id or not group_code or not course_name:
+            continue
+        if not digest_enabled:
+            disabled_count += 1
+            continue
+        if (now_moscow.hour, now_moscow.minute) < (digest_hour, digest_minute):
+            waiting_count += 1
             continue
 
         already_sent = await db_commands.was_daily_notification_sent(
@@ -313,34 +346,34 @@ async def _send_daily_tomorrow_digest():
         'target_date': target_date,
         'sent_count': sent_count,
         'skipped_count': skipped_count,
+        'disabled_count': disabled_count,
+        'waiting_count': waiting_count,
         'users_count': len(users),
     }
 
 
 async def _daily_tomorrow_digest_loop():
     """Фоновый цикл вечерней рассылки расписания на завтра."""
-    last_target_date = None
     await asyncio.sleep(10)
 
     while True:
         try:
             now = _now_moscow()
-            target_date = now.date() + timedelta(days=1)
-            send_time_reached = (now.hour, now.minute) >= (DAILY_TOMORROW_HOUR, DAILY_TOMORROW_MINUTE)
-
-            if send_time_reached and last_target_date != target_date:
-                stats = await _send_daily_tomorrow_digest()
-                last_target_date = target_date
+            stats = await _send_daily_tomorrow_digest(now)
+            if stats['sent_count'] > 0:
                 print(
-                    '[DIGEST] target_date={target_date}, sent={sent}, skipped={skipped}, users={users}'.format(
+                    '[DIGEST] target_date={target_date}, sent={sent}, skipped={skipped}, '
+                    'disabled={disabled}, waiting={waiting}, users={users}'.format(
                         target_date=stats['target_date'],
                         sent=stats['sent_count'],
                         skipped=stats['skipped_count'],
+                        disabled=stats['disabled_count'],
+                        waiting=stats['waiting_count'],
                         users=stats['users_count'],
                     )
                 )
 
-            await asyncio.sleep(60 if send_time_reached else 30)
+            await asyncio.sleep(30)
         except asyncio.CancelledError:
             raise
         except Exception as loop_error:
@@ -829,7 +862,7 @@ async def on_startup(dispatcher):
         daily_digest_task = asyncio.create_task(_daily_tomorrow_digest_loop())
         print(
             '✅ Вечерняя рассылка расписания запущена '
-            f'({DAILY_TOMORROW_HOUR:02d}:{DAILY_TOMORROW_MINUTE:02d} МСК)'
+            f'(время по умолчанию {DEFAULT_DAILY_TOMORROW_HOUR:02d}:{DEFAULT_DAILY_TOMORROW_MINUTE:02d} МСК)'
         )
 
     print('Бот запущен!')

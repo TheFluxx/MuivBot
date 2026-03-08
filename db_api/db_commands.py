@@ -29,12 +29,18 @@ DAY_ORDER_MAP = {
 }
 
 EMPTY_DATE_MARKERS = {'', 'не указана', 'none', 'null'}
+DEFAULT_DAILY_DIGEST_ENABLED = True
+DEFAULT_DAILY_DIGEST_HOUR = 20
+DEFAULT_DAILY_DIGEST_MINUTE = 0
 USER_SCHEDULE_FIELDS = (
     'selected_course',
     'selected_course_name',
     'selected_group',
     'selected_week_index',
     'selected_day_index',
+    'daily_digest_enabled',
+    'daily_digest_hour',
+    'daily_digest_minute',
 )
 
 
@@ -67,6 +73,31 @@ def _parse_iso_date(date_text: Any):
         return datetime.strptime(normalized, '%Y-%m-%d').date()
     except ValueError:
         return None
+
+
+def _normalize_daily_digest_enabled(value: Any) -> bool:
+    """Нормализует флаг включения ежедневной рассылки."""
+    if value is None:
+        return DEFAULT_DAILY_DIGEST_ENABLED
+    return bool(value)
+
+
+def _normalize_daily_digest_hour(value: Any) -> int:
+    """Нормализует час ежедневной рассылки."""
+    try:
+        hour = int(value)
+    except (TypeError, ValueError):
+        return DEFAULT_DAILY_DIGEST_HOUR
+    return hour % 24
+
+
+def _normalize_daily_digest_minute(value: Any) -> int:
+    """Нормализует минуту ежедневной рассылки."""
+    try:
+        minute = int(value)
+    except (TypeError, ValueError):
+        return DEFAULT_DAILY_DIGEST_MINUTE
+    return max(0, min(59, minute))
 
 
 async def registration_check(telegram_id):
@@ -106,6 +137,9 @@ async def get_user_schedule_state(telegram_id: int):
             'selected_group': state_row.selected_group,
             'selected_week_index': state_row.selected_week_index,
             'selected_day_index': state_row.selected_day_index,
+            'daily_digest_enabled': _normalize_daily_digest_enabled(state_row.daily_digest_enabled),
+            'daily_digest_hour': _normalize_daily_digest_hour(state_row.daily_digest_hour),
+            'daily_digest_minute': _normalize_daily_digest_minute(state_row.daily_digest_minute),
         }
 
 
@@ -114,6 +148,13 @@ async def upsert_user_schedule_state(telegram_id: int, **kwargs):
     payload = {key: kwargs.get(key) for key in USER_SCHEDULE_FIELDS if key in kwargs}
     if not payload:
         return None
+
+    if 'daily_digest_enabled' in payload:
+        payload['daily_digest_enabled'] = _normalize_daily_digest_enabled(payload.get('daily_digest_enabled'))
+    if 'daily_digest_hour' in payload:
+        payload['daily_digest_hour'] = _normalize_daily_digest_hour(payload.get('daily_digest_hour'))
+    if 'daily_digest_minute' in payload:
+        payload['daily_digest_minute'] = _normalize_daily_digest_minute(payload.get('daily_digest_minute'))
 
     async with get_session() as session:
         result = await session.execute(
@@ -137,6 +178,9 @@ async def upsert_user_schedule_state(telegram_id: int, **kwargs):
             'selected_group': state_row.selected_group,
             'selected_week_index': state_row.selected_week_index,
             'selected_day_index': state_row.selected_day_index,
+            'daily_digest_enabled': _normalize_daily_digest_enabled(state_row.daily_digest_enabled),
+            'daily_digest_hour': _normalize_daily_digest_hour(state_row.daily_digest_hour),
+            'daily_digest_minute': _normalize_daily_digest_minute(state_row.daily_digest_minute),
         }
 
 
@@ -149,6 +193,9 @@ async def get_users_with_selected_groups(group_codes=None):
             UserScheduleState.selected_group,
             UserScheduleState.selected_course,
             UserScheduleState.selected_course_name,
+            UserScheduleState.daily_digest_enabled,
+            UserScheduleState.daily_digest_hour,
+            UserScheduleState.daily_digest_minute,
         ).where(UserScheduleState.selected_group.is_not(None))
 
         if group_codes:
@@ -167,6 +214,9 @@ async def get_users_with_selected_groups(group_codes=None):
                     'selected_group': row.selected_group,
                     'selected_course': row.selected_course,
                     'selected_course_name': row.selected_course_name,
+                    'daily_digest_enabled': _normalize_daily_digest_enabled(row.daily_digest_enabled),
+                    'daily_digest_hour': _normalize_daily_digest_hour(row.daily_digest_hour),
+                    'daily_digest_minute': _normalize_daily_digest_minute(row.daily_digest_minute),
                 }
             )
         return users

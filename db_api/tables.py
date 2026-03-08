@@ -2,6 +2,7 @@ from datetime import datetime
 
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     Column,
     Date,
     DateTime,
@@ -40,6 +41,9 @@ class UserScheduleState(Base):
     selected_group = Column(String(64), nullable=True)
     selected_week_index = Column(Integer, nullable=True)
     selected_day_index = Column(Integer, nullable=True)
+    daily_digest_enabled = Column(Boolean, nullable=False, default=True)
+    daily_digest_hour = Column(Integer, nullable=False, default=20)
+    daily_digest_minute = Column(Integer, nullable=False, default=0)
     updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 

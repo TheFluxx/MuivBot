@@ -37,12 +37,61 @@ async def cmd_start(message: types.Message):
     else:
         await message.reply("Вы уже зарегистрированы.", reply_markup=get_main_keyboard())
 
-async def settings(message: types.Message, state: FSMContext):
-    """Показывает раздел настроек."""
-    user_data = await _get_user_data_with_db_fallback(state, _telegram_id_from_message(message))
+def _digest_settings_from_user_data(user_data):
+    """Возвращает нормализованные настройки вечерней рассылки."""
+    enabled = user_data.get('daily_digest_enabled')
+    hour = user_data.get('daily_digest_hour')
+    minute = user_data.get('daily_digest_minute')
 
+    if enabled is None:
+        enabled = db_commands.DEFAULT_DAILY_DIGEST_ENABLED
+    else:
+        enabled = bool(enabled)
+
+    try:
+        hour = int(hour)
+    except (TypeError, ValueError):
+        hour = db_commands.DEFAULT_DAILY_DIGEST_HOUR
+
+    try:
+        minute = int(minute)
+    except (TypeError, ValueError):
+        minute = db_commands.DEFAULT_DAILY_DIGEST_MINUTE
+
+    return enabled, hour % 24, max(0, min(59, minute))
+
+
+def _build_settings_text(user_data):
+    """Формирует текст экрана настроек."""
     course = user_data.get('selected_course')
     group_code = user_data.get('selected_group')
+    digest_enabled, digest_hour, digest_minute = _digest_settings_from_user_data(user_data)
+
+    lines = ['<b>💼 Настройки</b>', '']
+
+    if course and group_code:
+        lines.append(f"🎓 Курс: <b>{html.escape(_course_display(course))}</b>")
+        lines.append(f"👥 Группа: <b>{html.escape(group_code)}</b>")
+    else:
+        lines.append("👥 Группа: <b>не выбрана</b>")
+
+    lines.append('')
+    lines.append(
+        f"🔔 Вечерняя рассылка: <b>{'включена ✅' if digest_enabled else 'выключена ❌'}</b>"
+    )
+    lines.append(f"🕒 Время рассылки: <b>{digest_hour:02d}:{digest_minute:02d} МСК</b>")
+
+    if not group_code:
+        lines.append('')
+        lines.append('ℹ️ Рассылка начнет работать после выбора группы.')
+
+    return '\n'.join(lines)
+
+
+def _build_settings_keyboard(user_data):
+    """Строит клавиатуру экрана настроек."""
+    group_code = user_data.get('selected_group')
+    digest_enabled, digest_hour, digest_minute = _digest_settings_from_user_data(user_data)
 
     keyboard = types.InlineKeyboardMarkup(row_width=1)
     keyboard.add(
@@ -51,14 +100,38 @@ async def settings(message: types.Message, state: FSMContext):
             callback_data="change_group",
         )
     )
+    keyboard.add(
+        types.InlineKeyboardButton(
+            text="🔕 Выключить рассылку" if digest_enabled else "🔔 Включить рассылку",
+            callback_data="settings_digest_toggle",
+        )
+    )
+    keyboard.row(
+        types.InlineKeyboardButton(text='◀️', callback_data='settings_digest_time_-1'),
+        types.InlineKeyboardButton(
+            text=f"🕒 {digest_hour:02d}:{digest_minute:02d}",
+            callback_data='settings_time_noop',
+        ),
+        types.InlineKeyboardButton(text='▶️', callback_data='settings_digest_time_1'),
+    )
+    return keyboard
 
-    lines = ["💼 Настройки"]
-    if course and group_code:
-        lines.append("")
-        lines.append(f"🎓 Курс: {_course_display(course)}")
-        lines.append(f"👥 Группа: {group_code}")
 
-    await message.answer("\n".join(lines), reply_markup=keyboard)
+async def _render_settings_view(target_message: types.Message, state: FSMContext, telegram_id, *, edit: bool = False):
+    """Показывает или обновляет экран настроек."""
+    user_data = await _get_user_data_with_db_fallback(state, telegram_id)
+    text = _build_settings_text(user_data)
+    keyboard = _build_settings_keyboard(user_data)
+
+    if edit:
+        await _safe_edit_text(target_message, text, reply_markup=keyboard, parse_mode='HTML')
+    else:
+        await target_message.answer(text, reply_markup=keyboard, parse_mode='HTML')
+
+
+async def settings(message: types.Message, state: FSMContext):
+    """Показывает раздел настроек."""
+    await _render_settings_view(message, state, _telegram_id_from_message(message), edit=False)
 
 # Словари для хранения расписания
 schedule_data = {}
@@ -102,6 +175,9 @@ USER_SELECTION_KEYS = (
     'selected_group',
     'selected_week_index',
     'selected_day_index',
+    'daily_digest_enabled',
+    'daily_digest_hour',
+    'daily_digest_minute',
 )
 
 
@@ -140,8 +216,14 @@ async def _get_user_data_with_db_fallback(state: FSMContext, telegram_id):
     """Возвращает пользовательские данные из FSM с подгрузкой из БД при необходимости."""
     user_data = await state.get_data()
 
-    # Если ключевой выбор уже есть в FSM, используем его.
-    if user_data.get('selected_course') and user_data.get('selected_group'):
+    required_keys = (
+        'selected_course',
+        'selected_group',
+        'daily_digest_enabled',
+        'daily_digest_hour',
+        'daily_digest_minute',
+    )
+    if all(key in user_data and user_data.get(key) is not None for key in required_keys):
         return user_data
 
     db_payload = await _load_user_selection_from_db(telegram_id)
@@ -2071,6 +2153,60 @@ async def change_group(callback_query: types.CallbackQuery):
     await callback_query.answer()
 
 
+async def settings_open(callback_query: types.CallbackQuery, state: FSMContext):
+    """Открывает или обновляет экран настроек."""
+    await _render_settings_view(
+        callback_query.message,
+        state,
+        _telegram_id_from_callback(callback_query),
+        edit=True,
+    )
+    await callback_query.answer()
+
+
+async def settings_toggle_digest(callback_query: types.CallbackQuery, state: FSMContext):
+    """Переключает ежедневную вечернюю рассылку."""
+    telegram_id = _telegram_id_from_callback(callback_query)
+    user_data = await _get_user_data_with_db_fallback(state, telegram_id)
+    digest_enabled, _, _ = _digest_settings_from_user_data(user_data)
+
+    await _update_user_selection(
+        state,
+        telegram_id,
+        daily_digest_enabled=not digest_enabled,
+    )
+    await _render_settings_view(callback_query.message, state, telegram_id, edit=True)
+    await callback_query.answer('Настройки рассылки обновлены')
+
+
+async def settings_shift_digest_time(callback_query: types.CallbackQuery, state: FSMContext):
+    """Сдвигает время ежедневной рассылки на час."""
+    try:
+        delta = int(callback_query.data.rsplit('_', 1)[1])
+    except (ValueError, IndexError):
+        await callback_query.answer('⚠️ Некорректное время', show_alert=True)
+        return
+
+    telegram_id = _telegram_id_from_callback(callback_query)
+    user_data = await _get_user_data_with_db_fallback(state, telegram_id)
+    _, digest_hour, digest_minute = _digest_settings_from_user_data(user_data)
+    digest_hour = (digest_hour + delta) % 24
+
+    await _update_user_selection(
+        state,
+        telegram_id,
+        daily_digest_hour=digest_hour,
+        daily_digest_minute=digest_minute,
+    )
+    await _render_settings_view(callback_query.message, state, telegram_id, edit=True)
+    await callback_query.answer(f'Новое время: {digest_hour:02d}:{digest_minute:02d} МСК')
+
+
+async def settings_time_noop(callback_query: types.CallbackQuery):
+    """Служебная кнопка времени на экране настроек."""
+    await callback_query.answer()
+
+
 # Регистрация хендлеров
 def register_handlers_client(dp: Dispatcher):
     """Регистрирует обработчики сообщений и callback-кнопок."""
@@ -2105,4 +2241,8 @@ def register_handlers_client(dp: Dispatcher):
     dp.register_callback_query_handler(refresh_schedule, Text(startswith="refresh_"))
     dp.register_callback_query_handler(back_to_courses, Text(startswith="back_to_courses"))
     dp.register_callback_query_handler(main_menu, Text(startswith="main_menu"))
+    dp.register_callback_query_handler(settings_open, Text(equals="settings_open"))
+    dp.register_callback_query_handler(settings_toggle_digest, Text(equals="settings_digest_toggle"))
+    dp.register_callback_query_handler(settings_shift_digest_time, Text(startswith="settings_digest_time_"))
+    dp.register_callback_query_handler(settings_time_noop, Text(equals="settings_time_noop"))
     dp.register_callback_query_handler(change_group, Text(startswith="change_group"))

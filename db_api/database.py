@@ -1,5 +1,6 @@
 from contextlib import asynccontextmanager
 
+from sqlalchemy import inspect, text
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import declarative_base, sessionmaker
 
@@ -14,10 +15,40 @@ engine = create_async_engine(
 )
 
 
+def _run_schema_migrations(sync_conn):
+    """Добавляет недостающие колонки в существующие таблицы без отдельного мигратора."""
+    inspector = inspect(sync_conn)
+    table_names = set(inspector.get_table_names())
+
+    if 'user_schedule_states' in table_names:
+        existing_columns = {column['name'] for column in inspector.get_columns('user_schedule_states')}
+        alter_statements = []
+
+        if 'daily_digest_enabled' not in existing_columns:
+            alter_statements.append(
+                "ALTER TABLE user_schedule_states "
+                "ADD COLUMN daily_digest_enabled BOOLEAN NOT NULL DEFAULT TRUE"
+            )
+        if 'daily_digest_hour' not in existing_columns:
+            alter_statements.append(
+                "ALTER TABLE user_schedule_states "
+                "ADD COLUMN daily_digest_hour INTEGER NOT NULL DEFAULT 20"
+            )
+        if 'daily_digest_minute' not in existing_columns:
+            alter_statements.append(
+                "ALTER TABLE user_schedule_states "
+                "ADD COLUMN daily_digest_minute INTEGER NOT NULL DEFAULT 0"
+            )
+
+        for statement in alter_statements:
+            sync_conn.execute(text(statement))
+
+
 async def create_base():
     """Создает таблицы, если они еще не существуют."""
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await conn.run_sync(_run_schema_migrations)
 
 
 def async_session_generator():
