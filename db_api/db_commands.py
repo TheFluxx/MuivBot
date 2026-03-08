@@ -1,3 +1,4 @@
+import json
 import re
 from datetime import datetime
 from typing import Any, Dict
@@ -7,6 +8,7 @@ from sqlalchemy.exc import IntegrityError
 
 from db_api.database import get_session
 from db_api.tables import (
+    BotCallbackPayload,
     Users,
     UserScheduleState,
     UserDailyNotification,
@@ -251,6 +253,49 @@ async def mark_daily_notification_sent(telegram_id: int, notification_type: str,
         except IntegrityError:
             await session.rollback()
             return False
+
+
+async def save_bot_callback_payload(token: str, payload_type: str, payload: dict):
+    """Сохраняет payload callback-кнопки в базе данных."""
+    payload_json = json.dumps(payload, ensure_ascii=False, separators=(',', ':'), sort_keys=True)
+
+    async with get_session() as session:
+        result = await session.execute(
+            select(BotCallbackPayload).where(BotCallbackPayload.token == str(token).strip())
+        )
+        row = result.scalar_one_or_none()
+
+        if row is None:
+            row = BotCallbackPayload(
+                token=str(token).strip(),
+                payload_type=str(payload_type).strip()[:32],
+                payload_json=payload_json,
+            )
+            session.add(row)
+        else:
+            row.payload_type = str(payload_type).strip()[:32]
+            row.payload_json = payload_json
+            row.created_at = datetime.utcnow()
+
+        await session.commit()
+
+
+async def get_bot_callback_payload(token: str, payload_type: str | None = None):
+    """Возвращает сохраненный payload callback-кнопки из базы данных."""
+    async with get_session() as session:
+        query = select(BotCallbackPayload).where(BotCallbackPayload.token == str(token).strip())
+        if payload_type:
+            query = query.where(BotCallbackPayload.payload_type == str(payload_type).strip())
+
+        result = await session.execute(query)
+        row = result.scalar_one_or_none()
+        if row is None:
+            return None
+
+        try:
+            return json.loads(row.payload_json)
+        except json.JSONDecodeError:
+            return None
 
 async def replace_schedule_snapshot(
     schedule_data: Dict[str, Dict[str, Dict[str, list]]],

@@ -67,6 +67,18 @@ class UserDailyNotification(Base):
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
 
 
+class BotCallbackPayload(Base):
+    """Сохраненный payload callback-кнопки для переживания перезапуска бота."""
+
+    __tablename__ = 'bot_callback_payloads'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    token = Column(String(32), nullable=False, unique=True, index=True)
+    payload_type = Column(String(32), nullable=False, index=True)
+    payload_json = Column(Text, nullable=False)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+
 class SchedulePeriod(Base):
     """Период расписания (например, месяц/семестр из имени файла)."""
 
