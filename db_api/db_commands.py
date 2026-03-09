@@ -403,6 +403,56 @@ async def get_admin_user_details(telegram_id: int):
         'updated_at': row.updated_at,
     }
 
+
+async def get_admin_message_recipients(
+    course_key: str | None = None,
+    group_code: str | None = None,
+):
+    """Возвращает получателей для админ-сообщения с учетом фильтров курса и группы."""
+    normalized_course = str(course_key or '').strip() or None
+    normalized_group = str(group_code or '').strip() or None
+
+    async with get_session() as session:
+        query = (
+            select(
+                Users.telegram_id,
+                Users.username,
+                UserScheduleState.selected_course,
+                UserScheduleState.selected_course_name,
+                UserScheduleState.selected_group,
+            )
+            .select_from(Users)
+            .outerjoin(UserScheduleState, UserScheduleState.telegram_id == Users.telegram_id)
+        )
+
+        if normalized_course:
+            query = query.where(UserScheduleState.selected_course == normalized_course)
+
+        if normalized_group:
+            query = query.where(UserScheduleState.selected_group == normalized_group)
+
+        result = await session.execute(query.order_by(Users.id.desc()))
+        rows = result.all()
+
+    recipients = []
+    for row in rows:
+        course_value = str(row.selected_course or '').strip() or None
+        course_label = str(row.selected_course_name or '').strip()
+        if course_value and not course_label:
+            course_label = _course_name_from_key(course_value)
+
+        recipients.append(
+            {
+                'telegram_id': row.telegram_id,
+                'username': str(row.username or '').strip() or None,
+                'selected_course': course_value,
+                'selected_course_name': course_label or None,
+                'selected_group': str(row.selected_group or '').strip() or None,
+            }
+        )
+
+    return recipients
+
 async def get_user_schedule_state(telegram_id: int):
     """Возвращает сохраненные настройки расписания пользователя."""
     async with get_session() as session:

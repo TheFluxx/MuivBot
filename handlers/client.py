@@ -37,6 +37,10 @@ class AdminAuthDialog(StatesGroup):
     waiting_login = State()
     waiting_password = State()
 
+
+class AdminMessageDialog(StatesGroup):
+    waiting_text = State()
+
 async def cmd_start(message: types.Message):
     """Обрабатывает команду /start и регистрирует пользователя."""
     telegram_id = message.from_user.id
@@ -339,14 +343,70 @@ def _build_admin_user_details_text(user_details: dict):
     return '\n'.join(lines)
 
 
-def _build_admin_user_details_keyboard():
+def _build_admin_user_details_keyboard(target_telegram_id: int):
     """Строит клавиатуру карточки пользователя."""
     keyboard = types.InlineKeyboardMarkup(row_width=1)
+    keyboard.add(
+        types.InlineKeyboardButton(
+            text='✉️ Написать пользователю',
+            callback_data=f'admin_users_message_{target_telegram_id}',
+        )
+    )
     keyboard.add(types.InlineKeyboardButton(text='⬅️ К списку пользователей', callback_data='admin_users_back'))
     keyboard.row(
         types.InlineKeyboardButton(text='🔄 Обновить список', callback_data='admin_users'),
         types.InlineKeyboardButton(text='⬅️ В админку', callback_data='admin_open'),
     )
+    return keyboard
+
+
+def _build_admin_message_target_label(user_details: dict):
+    """Возвращает короткое имя получателя для экрана отправки сообщения."""
+    username = _normalize_cell_text(user_details.get('username'))
+    if username:
+        return f'@{username}'
+    return f"ID {user_details.get('telegram_id')}"
+
+
+def _build_admin_message_compose_text(
+    mode: str,
+    *,
+    target_label: str | None = None,
+    recipients_count: int | None = None,
+    course_label: str | None = None,
+    group_label: str | None = None,
+):
+    """Формирует экран ввода текста для админ-сообщения."""
+    if mode == 'single':
+        return '\n'.join(
+            [
+                '<b>✉️ Сообщение пользователю</b>',
+                '',
+                f"Получатель: <b>{html.escape(target_label or 'неизвестно')}</b>",
+                '',
+                'Отправьте следующим сообщением текст.',
+                'Для отмены нажмите кнопку ниже или напишите «Отмена».',
+            ]
+        )
+
+    return '\n'.join(
+        [
+            '<b>📣 Сообщение по фильтру</b>',
+            '',
+            f"🎓 Курс: <b>{html.escape(course_label or 'Все курсы')}</b>",
+            f"👥 Группа: <b>{html.escape(group_label or 'Все группы')}</b>",
+            f"👤 Получателей: <b>{int(recipients_count or 0)}</b>",
+            '',
+            'Отправьте следующим сообщением текст рассылки.',
+            'Для отмены нажмите кнопку ниже или напишите «Отмена».',
+        ]
+    )
+
+
+def _build_admin_message_compose_keyboard():
+    """Строит клавиатуру экрана ввода админ-сообщения."""
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    keyboard.add(types.InlineKeyboardButton(text='⬅️ Отмена', callback_data='admin_message_cancel'))
     return keyboard
 
 
@@ -393,6 +453,14 @@ def _build_admin_users_keyboard(page_data: dict, course_label: str | None, group
 
     if course_label or group_label:
         keyboard.add(types.InlineKeyboardButton(text='🧹 Сбросить фильтры', callback_data='admin_users_reset'))
+
+    if int(page_data.get('total', 0) or 0) > 0:
+        keyboard.add(
+            types.InlineKeyboardButton(
+                text='📣 Написать по фильтру',
+                callback_data='admin_users_broadcast',
+            )
+        )
 
     for item in page_data.get('items') or []:
         keyboard.add(
@@ -470,15 +538,49 @@ def _build_admin_filter_keyboard(options, selected_value, prefix: str, page: int
     return keyboard
 
 
-async def _render_admin_users_view(target, state: FSMContext, telegram_id, *, edit: bool):
-    """Показывает список пользователей с фильтрами по курсу и группе."""
-    if not await db_commands.is_admin_authorized(telegram_id):
-        if edit:
-            await target.answer('⚠️ Сначала войдите в админ-панель через /admin', show_alert=True)
-        else:
-            await target.answer('⚠️ Сначала войдите в админ-панель через /admin')
-        return False
+def _admin_message_is_cancel(text_value: str) -> bool:
+    """Проверяет, что администратор отменил ввод сообщения."""
+    return _search_normalize_text(text_value) in {'отмена', 'cancel'}
 
+
+async def _safe_edit_message_text_by_id(
+    chat_id: int,
+    message_id: int,
+    text: str,
+    reply_markup=None,
+    parse_mode: str | None = None,
+):
+    """Безопасно редактирует сообщение по chat_id/message_id."""
+    try:
+        await bot.edit_message_text(
+            text=text,
+            chat_id=chat_id,
+            message_id=message_id,
+            reply_markup=reply_markup,
+            parse_mode=parse_mode,
+        )
+    except MessageNotModified:
+        pass
+
+
+async def _clear_admin_message_context(state: FSMContext):
+    """Сбрасывает служебные данные экрана отправки админ-сообщения."""
+    await state.reset_state(with_data=False)
+    await state.update_data(
+        admin_message_mode=None,
+        admin_message_target_telegram_id=None,
+        admin_message_target_label=None,
+        admin_message_course_filter=None,
+        admin_message_group_filter=None,
+        admin_message_recipients_count=None,
+        admin_message_origin_view=None,
+        admin_message_origin_chat_id=None,
+        admin_message_origin_message_id=None,
+    )
+
+
+async def _build_admin_users_view_payload(state: FSMContext):
+    """Собирает текст и клавиатуру списка пользователей с учетом фильтров."""
     user_data = await state.get_data()
     course_filter, group_filter, page = _get_admin_users_view_state(user_data)
     course_filters = await db_commands.get_admin_user_course_filters()
@@ -511,6 +613,84 @@ async def _render_admin_users_view(target, state: FSMContext, telegram_id, *, ed
 
     text = _build_admin_users_text(page_data, course_labels.get(course_filter), group_filter)
     keyboard = _build_admin_users_keyboard(page_data, course_labels.get(course_filter), group_filter)
+    return text, keyboard
+
+
+async def _render_admin_user_details_view(target, telegram_id: int, target_telegram_id: int, *, edit: bool):
+    """Показывает карточку выбранного пользователя."""
+    if not await db_commands.is_admin_authorized(telegram_id):
+        if edit:
+            await target.answer('⚠️ Сначала войдите в админ-панель через /admin', show_alert=True)
+        else:
+            await target.answer('⚠️ Сначала войдите в админ-панель через /admin')
+        return False
+
+    user_details = await db_commands.get_admin_user_details(target_telegram_id)
+    if not user_details:
+        if edit:
+            await target.answer('⚠️ Пользователь не найден', show_alert=True)
+        else:
+            await target.answer('⚠️ Пользователь не найден')
+        return False
+
+    text = _build_admin_user_details_text(user_details)
+    keyboard = _build_admin_user_details_keyboard(target_telegram_id)
+
+    if edit:
+        await _safe_edit_text(target.message, text, reply_markup=keyboard, parse_mode='HTML')
+        await target.answer()
+    else:
+        await target.answer(text, reply_markup=keyboard, parse_mode='HTML')
+
+    return True
+
+
+async def _restore_admin_message_origin(state: FSMContext):
+    """Возвращает админа к исходному экрану после отправки или отмены."""
+    user_data = await state.get_data()
+    chat_id = user_data.get('admin_message_origin_chat_id')
+    message_id = user_data.get('admin_message_origin_message_id')
+    origin_view = user_data.get('admin_message_origin_view')
+
+    if not chat_id or not message_id:
+        return
+
+    if origin_view == 'user_details':
+        target_telegram_id = user_data.get('admin_message_target_telegram_id')
+        if target_telegram_id:
+            user_details = await db_commands.get_admin_user_details(int(target_telegram_id))
+        else:
+            user_details = None
+        if user_details:
+            await _safe_edit_message_text_by_id(
+                int(chat_id),
+                int(message_id),
+                _build_admin_user_details_text(user_details),
+                reply_markup=_build_admin_user_details_keyboard(int(target_telegram_id)),
+                parse_mode='HTML',
+            )
+            return
+
+    text, keyboard = await _build_admin_users_view_payload(state)
+    await _safe_edit_message_text_by_id(
+        int(chat_id),
+        int(message_id),
+        text,
+        reply_markup=keyboard,
+        parse_mode='HTML',
+    )
+
+
+async def _render_admin_users_view(target, state: FSMContext, telegram_id, *, edit: bool):
+    """Показывает список пользователей с фильтрами по курсу и группе."""
+    if not await db_commands.is_admin_authorized(telegram_id):
+        if edit:
+            await target.answer('⚠️ Сначала войдите в админ-панель через /admin', show_alert=True)
+        else:
+            await target.answer('⚠️ Сначала войдите в админ-панель через /admin')
+        return False
+
+    text, keyboard = await _build_admin_users_view_payload(state)
 
     if edit:
         await _safe_edit_text(target.message, text, reply_markup=keyboard, parse_mode='HTML')
@@ -712,8 +892,8 @@ async def admin_users_back_to_list(callback_query: types.CallbackQuery, state: F
     await _render_admin_users_view(callback_query, state, _telegram_id_from_callback(callback_query), edit=True)
 
 
-async def admin_users_show_details(callback_query: types.CallbackQuery, state: FSMContext):
-    """Открывает карточку выбранного пользователя отдельным сообщением."""
+async def admin_users_start_single_message(callback_query: types.CallbackQuery, state: FSMContext):
+    """Открывает ввод сообщения для одного пользователя."""
     telegram_id = _telegram_id_from_callback(callback_query)
     if not await db_commands.is_admin_authorized(telegram_id):
         await callback_query.answer('⚠️ Сначала войдите в админ-панель через /admin', show_alert=True)
@@ -730,10 +910,162 @@ async def admin_users_show_details(callback_query: types.CallbackQuery, state: F
         await callback_query.answer('⚠️ Пользователь не найден', show_alert=True)
         return
 
-    text = _build_admin_user_details_text(user_details)
-    keyboard = _build_admin_user_details_keyboard()
-    await _safe_edit_text(callback_query.message, text, reply_markup=keyboard, parse_mode='HTML')
+    await state.update_data(
+        admin_message_mode='single',
+        admin_message_target_telegram_id=target_telegram_id,
+        admin_message_target_label=_build_admin_message_target_label(user_details),
+        admin_message_course_filter=None,
+        admin_message_group_filter=None,
+        admin_message_recipients_count=1,
+        admin_message_origin_view='user_details',
+        admin_message_origin_chat_id=callback_query.message.chat.id,
+        admin_message_origin_message_id=callback_query.message.message_id,
+    )
+    await state.set_state(AdminMessageDialog.waiting_text.state)
+
+    await _safe_edit_text(
+        callback_query.message,
+        _build_admin_message_compose_text(
+            'single',
+            target_label=_build_admin_message_target_label(user_details),
+        ),
+        reply_markup=_build_admin_message_compose_keyboard(),
+        parse_mode='HTML',
+    )
     await callback_query.answer()
+
+
+async def admin_users_start_filtered_message(callback_query: types.CallbackQuery, state: FSMContext):
+    """Открывает ввод сообщения для пользователей по текущим фильтрам."""
+    telegram_id = _telegram_id_from_callback(callback_query)
+    if not await db_commands.is_admin_authorized(telegram_id):
+        await callback_query.answer('⚠️ Сначала войдите в админ-панель через /admin', show_alert=True)
+        return
+
+    user_data = await state.get_data()
+    course_filter, group_filter, _ = _get_admin_users_view_state(user_data)
+    recipients = await db_commands.get_admin_message_recipients(course_filter, group_filter)
+    if not recipients:
+        await callback_query.answer('⚠️ По выбранным фильтрам получателей нет', show_alert=True)
+        return
+
+    course_label = 'Все курсы'
+    if course_filter:
+        course_filters = await db_commands.get_admin_user_course_filters()
+        course_label = next(
+            (item['label'] for item in course_filters if item['value'] == course_filter),
+            course_filter,
+        )
+
+    await state.update_data(
+        admin_message_mode='filtered',
+        admin_message_target_telegram_id=None,
+        admin_message_target_label=None,
+        admin_message_course_filter=course_filter,
+        admin_message_group_filter=group_filter,
+        admin_message_recipients_count=len(recipients),
+        admin_message_origin_view='users',
+        admin_message_origin_chat_id=callback_query.message.chat.id,
+        admin_message_origin_message_id=callback_query.message.message_id,
+    )
+    await state.set_state(AdminMessageDialog.waiting_text.state)
+
+    await _safe_edit_text(
+        callback_query.message,
+        _build_admin_message_compose_text(
+            'filtered',
+            recipients_count=len(recipients),
+            course_label=course_label,
+            group_label=group_filter,
+        ),
+        reply_markup=_build_admin_message_compose_keyboard(),
+        parse_mode='HTML',
+    )
+    await callback_query.answer()
+
+
+async def admin_users_show_details(callback_query: types.CallbackQuery, state: FSMContext):
+    """Открывает карточку выбранного пользователя отдельным сообщением."""
+    telegram_id = _telegram_id_from_callback(callback_query)
+    try:
+        target_telegram_id = int(callback_query.data.rsplit('_', 1)[1])
+    except (TypeError, ValueError, IndexError):
+        await callback_query.answer('⚠️ Пользователь не найден', show_alert=True)
+        return
+
+    await _render_admin_user_details_view(
+        callback_query,
+        telegram_id,
+        target_telegram_id,
+        edit=True,
+    )
+
+
+async def admin_message_cancel(callback_query: types.CallbackQuery, state: FSMContext):
+    """Отменяет ввод админ-сообщения и возвращает предыдущий экран."""
+    telegram_id = _telegram_id_from_callback(callback_query)
+    if not await db_commands.is_admin_authorized(telegram_id):
+        await callback_query.answer('⚠️ Сначала войдите в админ-панель через /admin', show_alert=True)
+        return
+
+    await _restore_admin_message_origin(state)
+    await _clear_admin_message_context(state)
+    await callback_query.answer('Отправка отменена')
+
+
+async def admin_receive_message_text(message: types.Message, state: FSMContext):
+    """Получает текст админ-сообщения и отправляет его выбранным получателям."""
+    telegram_id = _telegram_id_from_message(message)
+    if not await db_commands.is_admin_authorized(telegram_id):
+        await _clear_admin_message_context(state)
+        await message.answer('⚠️ Сначала войдите в админ-панель через /admin')
+        return
+
+    text_value = message.text or message.caption or ''
+    text_value = text_value.strip()
+    if not text_value:
+        await message.answer('Отправьте текстовое сообщение или нажмите «Отмена».')
+        return
+
+    if _admin_message_is_cancel(text_value):
+        await _restore_admin_message_origin(state)
+        await _clear_admin_message_context(state)
+        await message.answer('Отправка отменена.')
+        return
+
+    user_data = await state.get_data()
+    mode = user_data.get('admin_message_mode')
+
+    if mode == 'single':
+        target_telegram_id = user_data.get('admin_message_target_telegram_id')
+        recipients = [{'telegram_id': int(target_telegram_id)}] if target_telegram_id else []
+    else:
+        recipients = await db_commands.get_admin_message_recipients(
+            user_data.get('admin_message_course_filter'),
+            user_data.get('admin_message_group_filter'),
+        )
+
+    if not recipients:
+        await _restore_admin_message_origin(state)
+        await _clear_admin_message_context(state)
+        await message.answer('⚠️ Получатели не найдены.')
+        return
+
+    success_count = 0
+    failed_count = 0
+    for recipient in recipients:
+        try:
+            await bot.send_message(int(recipient['telegram_id']), text_value)
+            success_count += 1
+        except Exception:
+            failed_count += 1
+
+    await _restore_admin_message_origin(state)
+    await _clear_admin_message_context(state)
+    await message.answer(
+        f'✅ Отправлено: {success_count}\n'
+        f'❌ Ошибок: {failed_count}'
+    )
 
 
 async def admin_users_noop(callback_query: types.CallbackQuery):
@@ -4917,6 +5249,7 @@ def register_handlers_client(dp: Dispatcher):
     dp.register_message_handler(schedule_tomorrow, lambda message: message.text and message.text.casefold() == 'на завтра')
     dp.register_message_handler(admin_receive_login, state=AdminAuthDialog.waiting_login)
     dp.register_message_handler(admin_receive_password, state=AdminAuthDialog.waiting_password)
+    dp.register_message_handler(admin_receive_message_text, state=AdminMessageDialog.waiting_text)
     dp.register_message_handler(search_receive_query, state=SearchDialog.waiting_query)
     
     # Регистрация колбеков
@@ -4972,6 +5305,9 @@ def register_handlers_client(dp: Dispatcher):
     dp.register_callback_query_handler(admin_users_set_course, Text(startswith='admin_users_course_set_'), state='*')
     dp.register_callback_query_handler(admin_users_set_group, Text(startswith='admin_users_group_set_'), state='*')
     dp.register_callback_query_handler(admin_users_back_to_list, Text(equals='admin_users_back'), state='*')
+    dp.register_callback_query_handler(admin_users_start_filtered_message, Text(equals='admin_users_broadcast'), state='*')
+    dp.register_callback_query_handler(admin_users_start_single_message, Text(startswith='admin_users_message_'), state='*')
+    dp.register_callback_query_handler(admin_message_cancel, Text(equals='admin_message_cancel'), state='*')
     dp.register_callback_query_handler(admin_users_show_details, Text(startswith='admin_users_info_'), state='*')
     dp.register_callback_query_handler(admin_users_clear_course, Text(equals='admin_users_course_clear'), state='*')
     dp.register_callback_query_handler(admin_users_clear_group, Text(equals='admin_users_group_clear'), state='*')
