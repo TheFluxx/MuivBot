@@ -12,5 +12,8 @@ DB_PASSWORD = env.str('DB_PASSWORD')
 DB_HOST = env.str('DB_HOST')
 DB_NAME = env.str('DB_NAME')
 
+ADMIN_LOGIN = env.str('ADMIN_LOGIN', '')
+ADMIN_PASSWORD = env.str('ADMIN_PASSWORD', '')
+
 
 

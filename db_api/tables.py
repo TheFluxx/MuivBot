@@ -1,4 +1,4 @@
-from datetime import datetime
+﻿from datetime import datetime
 
 from sqlalchemy import (
     BigInteger,
@@ -26,6 +26,16 @@ class Users(Base):
     telegram_id = Column(BigInteger, nullable=False)
     username = Column(String)
     referrer_id = Column(BigInteger)
+
+class BotAdminSession(Base):
+    """Авторизованная админ-сессия в Telegram-боте."""
+
+    __tablename__ = 'bot_admin_sessions'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    telegram_id = Column(BigInteger, nullable=False, unique=True, index=True)
+    login = Column(String(128), nullable=False)
+    authorized_at = Column(DateTime, nullable=False, default=datetime.utcnow)
 
 
 
@@ -176,3 +186,4 @@ class ScheduleLesson(Base):
     lesson_order = Column(Integer, nullable=False, default=0)
 
     week = relationship('ScheduleWeek', back_populates='lessons')
+

@@ -3,11 +3,12 @@ import re
 from datetime import datetime
 from typing import Any, Dict
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
 
 from db_api.database import get_session
 from db_api.tables import (
+    BotAdminSession,
     BotCallbackPayload,
     Users,
     UserScheduleState,
@@ -121,6 +122,105 @@ async def register_user(telegram_id, username, referrer_id):
             await session.commit()
         except IntegrityError:
             await session.rollback()
+
+
+async def get_admin_session(telegram_id: int):
+    """Возвращает админ-сессию пользователя, если она активна."""
+    async with get_session() as session:
+        result = await session.execute(
+            select(BotAdminSession).where(BotAdminSession.telegram_id == telegram_id)
+        )
+        session_row = result.scalar_one_or_none()
+        if session_row is None:
+            return None
+
+        return {
+            'telegram_id': session_row.telegram_id,
+            'login': session_row.login,
+            'authorized_at': session_row.authorized_at,
+        }
+
+
+async def is_admin_authorized(telegram_id: int) -> bool:
+    """Проверяет, авторизован ли пользователь в админ-панели."""
+    return await get_admin_session(telegram_id) is not None
+
+
+async def authorize_admin(telegram_id: int, login: str):
+    """Создает или обновляет админ-сессию пользователя."""
+    normalized_login = str(login).strip()
+
+    async with get_session() as session:
+        result = await session.execute(
+            select(BotAdminSession).where(BotAdminSession.telegram_id == telegram_id)
+        )
+        session_row = result.scalar_one_or_none()
+
+        if session_row is None:
+            session_row = BotAdminSession(
+                telegram_id=telegram_id,
+                login=normalized_login,
+                authorized_at=datetime.utcnow(),
+            )
+            session.add(session_row)
+        else:
+            session_row.login = normalized_login
+            session_row.authorized_at = datetime.utcnow()
+
+        await session.commit()
+
+        return {
+            'telegram_id': session_row.telegram_id,
+            'login': session_row.login,
+            'authorized_at': session_row.authorized_at,
+        }
+
+
+async def revoke_admin(telegram_id: int) -> bool:
+    """Завершает админ-сессию пользователя."""
+    async with get_session() as session:
+        result = await session.execute(
+            select(BotAdminSession).where(BotAdminSession.telegram_id == telegram_id)
+        )
+        session_row = result.scalar_one_or_none()
+        if session_row is None:
+            return False
+
+        await session.delete(session_row)
+        await session.commit()
+        return True
+
+
+async def get_admin_dashboard_stats():
+    """Возвращает сводную статистику для админ-панели."""
+    async with get_session() as session:
+        total_users = await session.scalar(select(func.count(Users.id)))
+        users_with_group = await session.scalar(
+            select(func.count(UserScheduleState.id)).where(UserScheduleState.selected_group.is_not(None))
+        )
+        users_with_digest = await session.scalar(
+            select(func.count(UserScheduleState.id)).where(UserScheduleState.daily_digest_enabled.is_(True))
+        )
+        active_admins = await session.scalar(select(func.count(BotAdminSession.id)))
+        periods_count = await session.scalar(select(func.count(SchedulePeriod.id)))
+        courses_count = await session.scalar(select(func.count(ScheduleCourse.id)))
+        groups_count = await session.scalar(select(func.count(ScheduleGroup.id)))
+        weeks_count = await session.scalar(select(func.count(ScheduleWeek.id)))
+        days_count = await session.scalar(select(func.count(ScheduleWeekDay.id)))
+        lessons_count = await session.scalar(select(func.count(ScheduleLesson.id)))
+
+        return {
+            'total_users': int(total_users or 0),
+            'users_with_group': int(users_with_group or 0),
+            'users_with_digest': int(users_with_digest or 0),
+            'active_admins': int(active_admins or 0),
+            'periods_count': int(periods_count or 0),
+            'courses_count': int(courses_count or 0),
+            'groups_count': int(groups_count or 0),
+            'weeks_count': int(weeks_count or 0),
+            'days_count': int(days_count or 0),
+            'lessons_count': int(lessons_count or 0),
+        }
 
 
 async def get_user_schedule_state(telegram_id: int):

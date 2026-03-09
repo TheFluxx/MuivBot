@@ -13,6 +13,7 @@ from aiogram.utils.exceptions import MessageNotModified
 import xlrd
 from db_api import db_commands
 from create_bot import bot
+from data.config import ADMIN_LOGIN, ADMIN_PASSWORD
 
 # Создаем клавиатуру
 def get_main_keyboard():
@@ -28,6 +29,13 @@ class SearchDialog(StatesGroup):
     """Состояния диалога поиска."""
 
     waiting_query = State()
+
+
+class AdminAuthDialog(StatesGroup):
+    """Состояния входа в админ-панель."""
+
+    waiting_login = State()
+    waiting_password = State()
 
 async def cmd_start(message: types.Message):
     """Обрабатывает команду /start и регистрирует пользователя."""
@@ -60,19 +68,203 @@ def _commands_help_text():
         "• <code>/subject Эконометрика</code> - найти расписание предмета\n"
         "• <code>/today</code> - показать расписание на сегодня\n"
         "• <code>/tomorrow</code> - показать расписание на завтра\n"
+        "• <code>/admin</code> - вход в админ-панель\n"
         "• <code>/help</code> - показать эту справку\n\n"
         "<b>Примеры</b>\n"
         "• <code>/group ИД 30.1/Б3-22</code>\n"
         "• <code>/date 14.03.26</code>\n"
         "• <code>/teacher Леденчук</code>\n"
         "• <code>/room ауд. 125</code>\n"
-        "• <code>/subject Математические модели</code>"
+        "• <code>/subject Математические модели</code>\n"
+        "• <code>/admin</code>"
     )
 
 
 async def cmd_help(message: types.Message):
     """Показывает пользователю список команд с примерами."""
     await message.answer(_commands_help_text(), reply_markup=get_main_keyboard(), parse_mode='HTML')
+
+
+async def admin_command(message: types.Message, state: FSMContext):
+    """Запускает вход в админ-панель или открывает ее для авторизованного пользователя."""
+    await state.finish()
+
+    if not _admin_panel_enabled():
+        await message.answer(
+            "⚠️ Админ-панель не настроена.\nДобавьте <code>ADMIN_LOGIN</code> и <code>ADMIN_PASSWORD</code> в .env.",
+            parse_mode='HTML',
+        )
+        return
+
+    telegram_id = _telegram_id_from_message(message)
+    if telegram_id is not None and await db_commands.is_admin_authorized(telegram_id):
+        await _render_admin_panel(message, telegram_id, edit=False)
+        return
+
+    await state.set_state(AdminAuthDialog.waiting_login.state)
+    await message.answer(
+        "🛠️ Вход в админ-панель\n\nВведите логин.\nДля отмены напишите <b>Отмена</b>.",
+        parse_mode='HTML',
+    )
+
+
+async def admin_receive_login(message: types.Message, state: FSMContext):
+    """Принимает логин для входа в админ-панель."""
+    text_value = _normalize_cell_text(message.text)
+    if not text_value:
+        await message.answer('Введите логин.')
+        return
+
+    if _search_normalize_text(text_value) in {'отмена', 'cancel'}:
+        await state.finish()
+        await message.answer('Вход в админ-панель отменен.', reply_markup=get_main_keyboard())
+        return
+
+    await state.update_data(admin_login=text_value)
+    await state.set_state(AdminAuthDialog.waiting_password.state)
+    await message.answer(
+        "🔒 Теперь введите пароль.\nДля отмены напишите <b>Отмена</b>.",
+        parse_mode='HTML',
+    )
+
+
+async def admin_receive_password(message: types.Message, state: FSMContext):
+    """Принимает пароль и завершает вход в админ-панель."""
+    password_text = _normalize_cell_text(message.text)
+    if not password_text:
+        await message.answer('Введите пароль.')
+        return
+
+    if _search_normalize_text(password_text) in {'отмена', 'cancel'}:
+        await state.finish()
+        await message.answer('Вход в админ-панель отменен.', reply_markup=get_main_keyboard())
+        return
+
+    state_data = await state.get_data()
+    login_text = state_data.get('admin_login', '')
+
+    if not _is_admin_credentials_valid(login_text, password_text):
+        await state.set_state(AdminAuthDialog.waiting_login.state)
+        await state.update_data(admin_login=None)
+        await message.answer(
+            "⚠️ Неверный логин или пароль.\nВведите логин заново или напишите <b>Отмена</b>.",
+            parse_mode='HTML',
+        )
+        return
+
+    telegram_id = _telegram_id_from_message(message)
+    await db_commands.authorize_admin(telegram_id, login_text)
+    await state.finish()
+    await message.answer('✅ Вход выполнен.')
+    await _render_admin_panel(message, telegram_id, edit=False)
+
+
+def _admin_panel_enabled():
+    """Проверяет, настроена ли админ-панель через .env."""
+    return bool(_normalize_cell_text(ADMIN_LOGIN) and _normalize_cell_text(ADMIN_PASSWORD))
+
+
+def _is_admin_credentials_valid(login_text: str, password_text: str) -> bool:
+    """Проверяет логин и пароль админ-панели."""
+    normalized_login = _normalize_cell_text(login_text)
+    normalized_password = _normalize_cell_text(password_text)
+    return (
+        secrets.compare_digest(normalized_login, _normalize_cell_text(ADMIN_LOGIN))
+        and secrets.compare_digest(normalized_password, _normalize_cell_text(ADMIN_PASSWORD))
+    )
+
+
+def _build_admin_panel_keyboard():
+    """Строит клавиатуру админ-панели."""
+    keyboard = types.InlineKeyboardMarkup(row_width=2)
+    keyboard.row(
+        types.InlineKeyboardButton(text='🔄 Обновить', callback_data='admin_refresh'),
+        types.InlineKeyboardButton(text='🚪 Выйти', callback_data='admin_logout'),
+    )
+    keyboard.add(types.InlineKeyboardButton(text='🏠 В главное меню', callback_data='main_menu'))
+    return keyboard
+
+
+def _build_admin_panel_text(stats: dict, session_data: dict | None):
+    """Формирует текст админ-панели."""
+    login_value = html.escape(_normalize_cell_text((session_data or {}).get('login')) or 'неизвестно')
+    authorized_at = (session_data or {}).get('authorized_at')
+    if authorized_at:
+        authorized_text = authorized_at.strftime('%d.%m.%Y %H:%M:%S')
+    else:
+        authorized_text = 'неизвестно'
+
+    lines = [
+        '<b>🛠️ Админ-панель</b>',
+        '',
+        f'👤 Логин: <b>{login_value}</b>',
+        f'🕒 Вход выполнен: <b>{authorized_text}</b>',
+        '',
+        '<b>📊 Статистика</b>',
+        f"• Пользователей: <b>{stats.get('total_users', 0)}</b>",
+        f"• С выбранной группой: <b>{stats.get('users_with_group', 0)}</b>",
+        f"• С включенной рассылкой: <b>{stats.get('users_with_digest', 0)}</b>",
+        f"• Активных админ-сессий: <b>{stats.get('active_admins', 0)}</b>",
+        '',
+        '<b>📚 Расписание</b>',
+        f"• Периодов: <b>{stats.get('periods_count', 0)}</b>",
+        f"• Курсов: <b>{stats.get('courses_count', 0)}</b>",
+        f"• Групп: <b>{stats.get('groups_count', 0)}</b>",
+        f"• Недель: <b>{stats.get('weeks_count', 0)}</b>",
+        f"• Дней: <b>{stats.get('days_count', 0)}</b>",
+        f"• Занятий: <b>{stats.get('lessons_count', 0)}</b>",
+    ]
+    return '\n'.join(lines)
+
+
+async def _render_admin_panel(target, telegram_id, *, edit: bool):
+    """Показывает экран админ-панели."""
+    if not await db_commands.is_admin_authorized(telegram_id):
+        if edit:
+            await target.answer('⚠️ Сначала войдите в админ-панель через /admin', show_alert=True)
+        else:
+            await target.answer('⚠️ Сначала войдите в админ-панель через /admin')
+        return False
+
+    stats = await db_commands.get_admin_dashboard_stats()
+    session_data = await db_commands.get_admin_session(telegram_id)
+    text = _build_admin_panel_text(stats, session_data)
+    keyboard = _build_admin_panel_keyboard()
+
+    if edit:
+        await _safe_edit_text(target.message, text, reply_markup=keyboard, parse_mode='HTML')
+        await target.answer()
+    else:
+        await target.answer(text, reply_markup=keyboard, parse_mode='HTML')
+
+    return True
+
+
+async def admin_open(callback_query: types.CallbackQuery, state: FSMContext):
+    """Открывает админ-панель по callback-кнопке."""
+    await _render_admin_panel(callback_query, _telegram_id_from_callback(callback_query), edit=True)
+
+
+async def admin_refresh(callback_query: types.CallbackQuery, state: FSMContext):
+    """Обновляет данные на экране админ-панели."""
+    await _render_admin_panel(callback_query, _telegram_id_from_callback(callback_query), edit=True)
+
+
+async def admin_logout(callback_query: types.CallbackQuery, state: FSMContext):
+    """Завершает админ-сессию пользователя."""
+    telegram_id = _telegram_id_from_callback(callback_query)
+    if telegram_id is not None:
+        await db_commands.revoke_admin(telegram_id)
+
+    await state.finish()
+    await _safe_edit_text(
+        callback_query.message,
+        "🔒 Вы вышли из админ-панели.",
+        reply_markup=types.InlineKeyboardMarkup().add(
+            types.InlineKeyboardButton(text='🏠 В главное меню', callback_data='main_menu')
+        ),
+    )
+    await callback_query.answer()
 
 
 def _digest_settings_from_user_data(user_data):
@@ -4233,6 +4425,7 @@ def register_handlers_client(dp: Dispatcher):
     """Регистрирует обработчики сообщений и callback-кнопок."""
     dp.register_message_handler(cmd_start, commands=['start'])
     dp.register_message_handler(cmd_help, commands=['help'], state='*')
+    dp.register_message_handler(admin_command, commands=['admin'], state='*')
     dp.register_message_handler(search_entrypoint, commands=['search'], state='*')
     dp.register_message_handler(group_command, commands=['group'], state='*')
     dp.register_message_handler(date_command, commands=['date'], state='*')
@@ -4246,6 +4439,8 @@ def register_handlers_client(dp: Dispatcher):
     dp.register_message_handler(my_schedule, text='📅 Мое расписание')
     dp.register_message_handler(schedule_today, lambda message: message.text and message.text.casefold() == 'на сегодня')
     dp.register_message_handler(schedule_tomorrow, lambda message: message.text and message.text.casefold() == 'на завтра')
+    dp.register_message_handler(admin_receive_login, state=AdminAuthDialog.waiting_login)
+    dp.register_message_handler(admin_receive_password, state=AdminAuthDialog.waiting_password)
     dp.register_message_handler(search_receive_query, state=SearchDialog.waiting_query)
     
     # Регистрация колбеков
@@ -4291,4 +4486,7 @@ def register_handlers_client(dp: Dispatcher):
     dp.register_callback_query_handler(settings_toggle_digest, Text(equals="settings_digest_toggle"))
     dp.register_callback_query_handler(settings_shift_digest_time, Text(startswith="settings_digest_time_"))
     dp.register_callback_query_handler(settings_time_noop, Text(equals="settings_time_noop"))
+    dp.register_callback_query_handler(admin_open, Text(equals='admin_open'), state='*')
+    dp.register_callback_query_handler(admin_refresh, Text(equals='admin_refresh'), state='*')
+    dp.register_callback_query_handler(admin_logout, Text(equals='admin_logout'), state='*')
     dp.register_callback_query_handler(change_group, Text(startswith="change_group"))
