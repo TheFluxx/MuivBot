@@ -198,6 +198,7 @@ SEARCH_TYPES = {
         'entity_label': 'Преподаватель',
         'prompt': 'Напишите преподавателя. Пример: `Леденчук` или `Леденчук Н.С.`',
         'empty': 'По такому преподавателю ничего не найдено.',
+        'command_example': '/teacher Простомолотов',
     },
     'room': {
         'title': '🏫 Поиск по аудитории',
@@ -205,6 +206,7 @@ SEARCH_TYPES = {
         'entity_label': 'Аудитория',
         'prompt': 'Напишите аудиторию. Пример: `125`, `ауд. 125`, `спортзал`',
         'empty': 'По такой аудитории ничего не найдено.',
+        'command_example': '/room 505',
     },
     'subject': {
         'title': '📚 Поиск по предмету',
@@ -212,6 +214,7 @@ SEARCH_TYPES = {
         'entity_label': 'Предмет',
         'prompt': 'Напишите предмет. Пример: `математика` или `принятия решений`',
         'empty': 'По такому предмету ничего не найдено.',
+        'command_example': '/subject Эконометрика',
     },
 }
 ROOM_PATTERN = re.compile(r'(?i)\b(?:ауд\.?|каб\.?|кабинет|лаб\.?|лаборатория|спортзал|зал)\s*[^,;|]*')
@@ -1472,6 +1475,80 @@ async def search_choose_kind(callback_query: types.CallbackQuery, state: FSMCont
     await callback_query.answer()
 
 
+async def _process_search_query(message: types.Message, state: FSMContext, search_kind: str, text_value: str):
+    """Обрабатывает текстовый запрос поиска и показывает результаты."""
+    if search_kind not in SEARCH_TYPES:
+        await _render_search_start(message, state, edit=False)
+        return
+
+    normalized_text = _normalize_cell_text(text_value)
+    meta = SEARCH_TYPES[search_kind]
+    if not normalized_text:
+        await message.answer(
+            f"⚠️ После команды укажите запрос.\nПример: <code>{meta['command_example']}</code>",
+            parse_mode='HTML',
+        )
+        return
+
+    matches = _search_entity_matches(search_kind, normalized_text)
+    if not matches:
+        await message.answer(
+            f"😕 {meta['empty']}\n\nПопробуйте написать короче или точнее.\n{meta['prompt']}",
+            parse_mode='HTML',
+        )
+        return
+
+    await state.finish()
+
+    if len(matches) == 1:
+        token = await _store_search_payload(
+            'search_entity',
+            {
+                'search_kind': search_kind,
+                'entity': matches[0]['entity'],
+            },
+        )
+        await _render_search_entity(message, token, None, edit=False, show_empty=False)
+        return
+
+    buttons = []
+    for match in matches[:10]:
+        token = await _store_search_payload(
+            'search_entity',
+            {
+                'search_kind': search_kind,
+                'entity': match['entity'],
+            },
+        )
+        button_text = (
+            f"{meta['entity_emoji']} {match['entity']} · "
+            f"{match['dates_count']} дн. / {match['lessons_count']} пар"
+        )
+        buttons.append(
+            types.InlineKeyboardButton(
+                text=button_text[:64],
+                callback_data=f'search_entity_{token}',
+            )
+        )
+
+    lines = [
+        f"<b>{meta['title']}</b>",
+        f"🔎 Запрос: <b>{html.escape(normalized_text)}</b>",
+        '',
+        f"Найдено вариантов: <b>{len(matches)}</b>",
+        '👇 Выберите нужный вариант:',
+    ]
+    if len(matches) > 10:
+        lines.append('')
+        lines.append('Показываю первые 10 совпадений. Если нужно, уточните запрос.')
+
+    await message.answer(
+        '\n'.join(lines),
+        reply_markup=_build_search_matches_keyboard(buttons),
+        parse_mode='HTML',
+    )
+
+
 async def search_receive_query(message: types.Message, state: FSMContext):
     """Принимает текст запроса для поиска."""
     text_value = _normalize_cell_text(message.text)
@@ -1497,69 +1574,28 @@ async def search_receive_query(message: types.Message, state: FSMContext):
 
     state_data = await state.get_data()
     search_kind = state_data.get('search_kind')
-    if search_kind not in SEARCH_TYPES:
-        await _render_search_start(message, state, edit=False)
-        return
+    await _process_search_query(message, state, search_kind, text_value)
 
-    matches = _search_entity_matches(search_kind, text_value)
-    meta = SEARCH_TYPES[search_kind]
 
-    if not matches:
-        await message.answer(
-            f"😕 {meta['empty']}\n\nПопробуйте написать короче или точнее.\n{meta['prompt']}",
-            parse_mode='HTML',
-        )
-        return
-
+async def _handle_search_command(message: types.Message, state: FSMContext, search_kind: str):
+    """Обрабатывает slash-команду поиска с аргументом."""
     await state.finish()
+    await _process_search_query(message, state, search_kind, message.get_args())
 
-    if len(matches) == 1:
-        token = await _store_search_payload(
-            'search_entity',
-            {
-                'search_kind': search_kind,
-                'entity': matches[0]['entity'],
-            },
-        )
-        await _render_search_entity(message, token, None, edit=False)
-        return
 
-    buttons = []
-    for match in matches[:10]:
-        token = await _store_search_payload(
-            'search_entity',
-            {
-                'search_kind': search_kind,
-                'entity': match['entity'],
-            },
-        )
-        button_text = (
-            f"{meta['entity_emoji']} {match['entity']} · "
-            f"{match['dates_count']} дн. / {match['lessons_count']} пар"
-        )
-        buttons.append(
-            types.InlineKeyboardButton(
-                text=button_text[:64],
-                callback_data=f'search_entity_{token}',
-            )
-        )
+async def search_teacher_command(message: types.Message, state: FSMContext):
+    """Ищет расписание преподавателя по команде /teacher."""
+    await _handle_search_command(message, state, 'teacher')
 
-    lines = [
-        f"<b>{meta['title']}</b>",
-        f"🔎 Запрос: <b>{html.escape(text_value)}</b>",
-        '',
-        f"Найдено вариантов: <b>{len(matches)}</b>",
-        '👇 Выберите нужный вариант:',
-    ]
-    if len(matches) > 10:
-        lines.append('')
-        lines.append('Показываю первые 10 совпадений. Если нужно, уточните запрос.')
 
-    await message.answer(
-        '\n'.join(lines),
-        reply_markup=_build_search_matches_keyboard(buttons),
-        parse_mode='HTML',
-    )
+async def search_room_command(message: types.Message, state: FSMContext):
+    """Ищет расписание аудитории по команде /room."""
+    await _handle_search_command(message, state, 'room')
+
+
+async def search_subject_command(message: types.Message, state: FSMContext):
+    """Ищет расписание предмета по команде /subject."""
+    await _handle_search_command(message, state, 'subject')
 
 
 async def search_open_entity(callback_query: types.CallbackQuery, state: FSMContext):
@@ -3959,6 +3995,9 @@ def register_handlers_client(dp: Dispatcher):
     """Регистрирует обработчики сообщений и callback-кнопок."""
     dp.register_message_handler(cmd_start, commands=['start'])
     dp.register_message_handler(search_entrypoint, commands=['search'], state='*')
+    dp.register_message_handler(search_teacher_command, commands=['teacher'], state='*')
+    dp.register_message_handler(search_room_command, commands=['room'], state='*')
+    dp.register_message_handler(search_subject_command, commands=['subject'], state='*')
     dp.register_message_handler(schedule_today, commands=['today'])
     dp.register_message_handler(schedule_tomorrow, commands=['tomorrow'])
     dp.register_message_handler(search_entrypoint, text='🔎 Поиск', state='*')
@@ -4012,4 +4051,3 @@ def register_handlers_client(dp: Dispatcher):
     dp.register_callback_query_handler(settings_shift_digest_time, Text(startswith="settings_digest_time_"))
     dp.register_callback_query_handler(settings_time_noop, Text(equals="settings_time_noop"))
     dp.register_callback_query_handler(change_group, Text(startswith="change_group"))
-
