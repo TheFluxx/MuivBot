@@ -54,6 +54,7 @@ class UserScheduleState(Base):
     daily_digest_enabled = Column(Boolean, nullable=False, default=True)
     daily_digest_hour = Column(Integer, nullable=False, default=20)
     daily_digest_minute = Column(Integer, nullable=False, default=0)
+    event_notifications_enabled = Column(Boolean, nullable=False, default=True)
     updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
@@ -87,6 +88,22 @@ class BotCallbackPayload(Base):
     payload_type = Column(String(32), nullable=False, index=True)
     payload_json = Column(Text, nullable=False)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+
+class BotEvent(Base):
+    """Сохраненное мероприятие бота."""
+
+    __tablename__ = 'bot_events'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    title = Column(String(255), nullable=False)
+    description = Column(Text, nullable=False)
+    event_at = Column(DateTime, nullable=False, index=True)
+    attachment_type = Column(String(32), nullable=True, index=True)
+    attachment_payload = Column(Text, nullable=True)
+    created_by_telegram_id = Column(BigInteger, nullable=True, index=True)
+    created_by_login = Column(String(128), nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
 
 
 class SchedulePeriod(Base):

@@ -21,6 +21,7 @@ def get_main_keyboard():
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
     kb.add(types.KeyboardButton("📅 Мое расписание"))
     kb.add(types.KeyboardButton("🔎 Поиск"))
+    kb.add(types.KeyboardButton("🎉 События"))
     kb.add(types.KeyboardButton("💼 Настройки"))
     return kb
 
@@ -40,6 +41,12 @@ class AdminAuthDialog(StatesGroup):
 
 class AdminMessageDialog(StatesGroup):
     waiting_text = State()
+
+
+class AdminEventDialog(StatesGroup):
+    waiting_datetime = State()
+    waiting_text = State()
+    waiting_attachment = State()
 
 async def cmd_start(message: types.Message):
     """Обрабатывает команду /start и регистрирует пользователя."""
@@ -181,7 +188,10 @@ def _is_admin_credentials_valid(login_text: str, password_text: str) -> bool:
 def _build_admin_panel_keyboard():
     """Строит клавиатуру админ-панели."""
     keyboard = types.InlineKeyboardMarkup(row_width=2)
-    keyboard.add(types.InlineKeyboardButton(text='👥 Пользователи', callback_data='admin_users'))
+    keyboard.row(
+        types.InlineKeyboardButton(text='👥 Пользователи', callback_data='admin_users'),
+        types.InlineKeyboardButton(text='📣 Создать событие', callback_data='admin_event_create'),
+    )
     keyboard.row(
         types.InlineKeyboardButton(text='🔄 Обновить', callback_data='admin_refresh'),
         types.InlineKeyboardButton(text='🚪 Выйти', callback_data='admin_logout'),
@@ -210,6 +220,7 @@ def _build_admin_panel_text(stats: dict, session_data: dict | None):
         f"• С выбранной группой: <b>{stats.get('users_with_group', 0)}</b>",
         f"• С включенной рассылкой: <b>{stats.get('users_with_digest', 0)}</b>",
         f"• Активных админ-сессий: <b>{stats.get('active_admins', 0)}</b>",
+        f"• Событий в базе: <b>{stats.get('events_count', 0)}</b>",
         '',
         '<b>📚 Расписание</b>',
         f"• Периодов: <b>{stats.get('periods_count', 0)}</b>",
@@ -320,6 +331,9 @@ def _build_admin_user_details_text(user_details: dict):
     else:
         digest_text = 'выключена ❌'
 
+    event_notifications_enabled = user_details.get('event_notifications_enabled')
+    event_notifications_text = 'включены ✅' if event_notifications_enabled is not False else 'выключены ❌'
+
     referrer_id = user_details.get('referrer_id')
     if referrer_id in (None, 0):
         referrer_text = 'нет'
@@ -337,6 +351,7 @@ def _build_admin_user_details_text(user_details: dict):
         f"🎓 Курс: <b>{html.escape(course_text)}</b>",
         f"👥 Группа: <b>{html.escape(group_text)}</b>",
         f"🔔 Рассылка: <b>{html.escape(digest_text)}</b>",
+        f"🎉 События: <b>{html.escape(event_notifications_text)}</b>",
         f"🔗 Реферал: <b>{html.escape(referrer_text)}</b>",
         f"🕒 Обновлено: <b>{html.escape(updated_text)}</b>",
     ]
@@ -407,6 +422,58 @@ def _build_admin_message_compose_keyboard():
     """Строит клавиатуру экрана ввода админ-сообщения."""
     keyboard = types.InlineKeyboardMarkup(row_width=1)
     keyboard.add(types.InlineKeyboardButton(text='⬅️ Отмена', callback_data='admin_message_cancel'))
+    return keyboard
+
+
+def _build_admin_event_datetime_text():
+    """Формирует экран ввода даты и времени события."""
+    return (
+        '<b>📣 Новое событие</b>\n\n'
+        'Введите дату и время события.\n'
+        'Поддерживаются форматы:\n'
+        '• <code>14.03.2026 18:30</code>\n'
+        '• <code>14.03.26 18:30</code>\n'
+        '• <code>2026-03-14 18:30</code>'
+    )
+
+
+def _build_admin_event_text_prompt(event_at: datetime):
+    """Формирует экран ввода текста события."""
+    return (
+        '<b>📝 Текст события</b>\n\n'
+        f"Дата и время: <b>{html.escape(_format_event_datetime(event_at))}</b>\n\n"
+        'Отправьте текст события следующим сообщением.\n'
+        'Для отмены нажмите кнопку ниже или напишите «Отмена».'
+    )
+
+
+def _build_admin_event_attachment_prompt(event_at: datetime, description: str):
+    """Формирует экран ввода вложения события."""
+    preview = _normalize_cell_text(description).replace('\n', ' ').strip()
+    if len(preview) > 100:
+        preview = f'{preview[:99].rstrip()}…'
+
+    return (
+        '<b>📎 Вложение к событию</b>\n\n'
+        f"Дата и время: <b>{html.escape(_format_event_datetime(event_at))}</b>\n"
+        f"Текст: <b>{html.escape(preview or 'без текста')}</b>\n\n"
+        'Теперь можно отправить одно вложение:\n'
+        '• фото\n'
+        '• видео\n'
+        '• GIF\n'
+        '• документ\n'
+        '• аудио\n'
+        '• локацию\n\n'
+        'Если вложение не нужно, нажмите кнопку ниже.'
+    )
+
+
+def _build_admin_event_step_keyboard(*, allow_skip: bool = False):
+    """Строит клавиатуру шагов создания события."""
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    if allow_skip:
+        keyboard.add(types.InlineKeyboardButton(text='✅ Без вложения', callback_data='admin_event_skip'))
+    keyboard.add(types.InlineKeyboardButton(text='⬅️ Отмена', callback_data='admin_event_cancel'))
     return keyboard
 
 
@@ -563,6 +630,460 @@ async def _safe_edit_message_text_by_id(
         pass
 
 
+def _event_weekday_name(event_at: datetime | None):
+    """Возвращает русское название дня недели для события."""
+    if not isinstance(event_at, datetime):
+        return 'Неизвестно'
+
+    weekday_index = event_at.weekday()
+    if 0 <= weekday_index < len(EVENT_WEEKDAY_NAMES):
+        return EVENT_WEEKDAY_NAMES[weekday_index].capitalize()
+    return 'Неизвестно'
+
+
+def _format_event_datetime(event_at: datetime | None):
+    """Форматирует дату и время события для интерфейса."""
+    if not isinstance(event_at, datetime):
+        return 'не указано'
+    return f"{event_at.strftime('%d.%m.%Y %H:%M')} ({_event_weekday_name(event_at)})"
+
+
+def _parse_admin_event_datetime(text_value: str):
+    """Разбирает дату и время события из текста администратора."""
+    normalized = _normalize_cell_text(text_value)
+    if not normalized:
+        return None
+
+    formats = (
+        '%d.%m.%Y %H:%M',
+        '%d.%m.%y %H:%M',
+        '%Y-%m-%d %H:%M',
+        '%d.%m.%Y %H.%M',
+        '%d.%m.%y %H.%M',
+    )
+    for fmt in formats:
+        try:
+            return datetime.strptime(normalized, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _event_title_from_description(description: str):
+    """Строит короткий заголовок события по его описанию."""
+    normalized = str(description or '').strip()
+    if not normalized:
+        return 'Событие'
+
+    for line in normalized.splitlines():
+        line = line.strip()
+        if line:
+            return line[:255]
+    return normalized[:255] or 'Событие'
+
+
+def _event_is_finished(event: dict):
+    """Проверяет, завершилось ли событие."""
+    event_at = event.get('event_at')
+    return isinstance(event_at, datetime) and event_at < datetime.now()
+
+
+def _event_attachment_label(attachment_type: str | None):
+    """Возвращает человекочитаемое название вложения события."""
+    labels = {
+        'photo': 'Фото',
+        'video': 'Видео',
+        'animation': 'GIF',
+        'document': 'Документ',
+        'audio': 'Аудио',
+        'location': 'Локация',
+        'venue': 'Локация',
+    }
+    return labels.get(_normalize_cell_text(attachment_type).lower(), 'Вложение')
+
+
+def _event_description_for_display(description: str, limit: int = 3200):
+    """Ограничивает описание события для безопасного вывода в Telegram."""
+    normalized = str(description or '').strip()
+    if len(normalized) <= limit:
+        return normalized
+    return f'{normalized[: limit - 1].rstrip()}…'
+
+
+def _build_event_notice_text(event: dict):
+    """Формирует текст уведомления о новом событии."""
+    event_at = event.get('event_at')
+    lines = [
+        '<b>📣 Новое событие</b>',
+        '',
+        f"📝 Название: <b>{html.escape(_normalize_cell_text(event.get('title')) or 'Событие')}</b>",
+        f"🗓️ Когда: <b>{html.escape(_format_event_datetime(event_at))}</b>",
+    ]
+
+    attachment_type = event.get('attachment_type')
+    if attachment_type:
+        lines.append(f"📎 Вложение: <b>{html.escape(_event_attachment_label(attachment_type))}</b>")
+
+    description = _event_description_for_display(event.get('description') or '')
+    if description:
+        lines.extend(['', html.escape(description)])
+
+    return '\n'.join(lines)
+
+
+def _serialize_event_attachment(message: types.Message):
+    """Извлекает поддерживаемое вложение события из сообщения администратора."""
+    content_type = _normalize_cell_text(getattr(message, 'content_type', '')).lower()
+
+    if content_type == 'photo' and message.photo:
+        return 'photo', {'file_id': message.photo[-1].file_id}
+    if content_type == 'video' and message.video:
+        return 'video', {'file_id': message.video.file_id}
+    if content_type == 'animation' and message.animation:
+        return 'animation', {'file_id': message.animation.file_id}
+    if content_type == 'document' and message.document:
+        return 'document', {'file_id': message.document.file_id}
+    if content_type == 'audio' and message.audio:
+        return 'audio', {'file_id': message.audio.file_id}
+    if content_type == 'location' and message.location:
+        return 'location', {
+            'latitude': message.location.latitude,
+            'longitude': message.location.longitude,
+        }
+    if content_type == 'venue' and message.venue:
+        return 'venue', {
+            'latitude': message.venue.location.latitude,
+            'longitude': message.venue.location.longitude,
+            'title': message.venue.title,
+            'address': message.venue.address,
+        }
+
+    return None, None
+
+
+async def _send_event_attachment(chat_id: int, attachment_type: str | None, attachment_payload: dict | None):
+    """Отправляет вложение события пользователю."""
+    if not attachment_type or not attachment_payload:
+        return
+
+    if attachment_type == 'photo':
+        await bot.send_photo(chat_id, attachment_payload.get('file_id'))
+        return
+    if attachment_type == 'video':
+        await bot.send_video(chat_id, attachment_payload.get('file_id'))
+        return
+    if attachment_type == 'animation':
+        await bot.send_animation(chat_id, attachment_payload.get('file_id'))
+        return
+    if attachment_type == 'document':
+        await bot.send_document(chat_id, attachment_payload.get('file_id'))
+        return
+    if attachment_type == 'audio':
+        await bot.send_audio(chat_id, attachment_payload.get('file_id'))
+        return
+    if attachment_type == 'location':
+        await bot.send_location(
+            chat_id,
+            latitude=attachment_payload.get('latitude'),
+            longitude=attachment_payload.get('longitude'),
+        )
+        return
+    if attachment_type == 'venue':
+        await bot.send_venue(
+            chat_id,
+            latitude=attachment_payload.get('latitude'),
+            longitude=attachment_payload.get('longitude'),
+            title=attachment_payload.get('title') or 'Локация',
+            address=attachment_payload.get('address') or 'Адрес не указан',
+        )
+
+
+async def _send_event_attachment_with_caption(
+    chat_id: int,
+    attachment_type: str | None,
+    attachment_payload: dict | None,
+    text: str,
+    reply_markup,
+):
+    """Пытается отправить событие одним сообщением: вложение, подпись и кнопки."""
+    if not attachment_type or not attachment_payload:
+        return False
+
+    if attachment_type == 'photo':
+        await bot.send_photo(
+            chat_id,
+            attachment_payload.get('file_id'),
+            caption=text,
+            parse_mode='HTML',
+            reply_markup=reply_markup,
+        )
+        return True
+    if attachment_type == 'video':
+        await bot.send_video(
+            chat_id,
+            attachment_payload.get('file_id'),
+            caption=text,
+            parse_mode='HTML',
+            reply_markup=reply_markup,
+        )
+        return True
+    if attachment_type == 'animation':
+        await bot.send_animation(
+            chat_id,
+            attachment_payload.get('file_id'),
+            caption=text,
+            parse_mode='HTML',
+            reply_markup=reply_markup,
+        )
+        return True
+    if attachment_type == 'document':
+        await bot.send_document(
+            chat_id,
+            attachment_payload.get('file_id'),
+            caption=text,
+            parse_mode='HTML',
+            reply_markup=reply_markup,
+        )
+        return True
+    if attachment_type == 'audio':
+        await bot.send_audio(
+            chat_id,
+            attachment_payload.get('file_id'),
+            caption=text,
+            parse_mode='HTML',
+            reply_markup=reply_markup,
+        )
+        return True
+
+    return False
+
+
+def _build_event_open_keyboard():
+    """Строит клавиатуру перехода к списку событий из рассылки."""
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    keyboard.add(types.InlineKeyboardButton(text='🎉 Все события', callback_data='events_open_all'))
+    return keyboard
+
+
+async def _send_event_announcement(chat_id: int, event: dict):
+    """Отправляет пользователю анонс события и его вложение."""
+    text = _build_event_notice_text(event)
+    keyboard = _build_event_open_keyboard()
+    attachment_type = event.get('attachment_type')
+    attachment_payload = event.get('attachment_payload')
+
+    if attachment_type and attachment_payload:
+        try:
+            sent_as_single_message = await _send_event_attachment_with_caption(
+                chat_id,
+                attachment_type,
+                attachment_payload,
+                text,
+                keyboard,
+            )
+            if sent_as_single_message:
+                return
+        except Exception:
+            pass
+
+        await _send_event_attachment(chat_id, attachment_type, attachment_payload)
+
+    await bot.send_message(
+        chat_id,
+        text,
+        parse_mode='HTML',
+        reply_markup=keyboard,
+    )
+
+
+def _split_events_for_user_view(events: list[dict]):
+    """Разделяет события на будущие и завершенные списки."""
+    now = datetime.now()
+    upcoming_events = []
+    finished_events = []
+    undated_events = []
+
+    for event in events:
+        event_at = event.get('event_at')
+        if not isinstance(event_at, datetime):
+            undated_events.append(event)
+            continue
+
+        if event_at >= now:
+            upcoming_events.append(event)
+        else:
+            finished_events.append(event)
+
+    upcoming_events.sort(key=lambda item: (item.get('event_at'), int(item.get('id', 0))))
+    finished_events.sort(key=lambda item: (item.get('event_at'), int(item.get('id', 0))), reverse=True)
+    undated_events.sort(key=lambda item: int(item.get('id', 0)), reverse=True)
+    upcoming_events.extend(undated_events)
+    return upcoming_events, finished_events
+
+
+def _events_for_user_view(events: list[dict], mode: str):
+    """Возвращает нужный пользователю список событий."""
+    upcoming_events, finished_events = _split_events_for_user_view(events)
+    if mode == 'past':
+        return finished_events
+    return upcoming_events
+
+
+def _pick_events_initial_page(events: list[dict], mode: str):
+    """Возвращает стартовую страницу выбранного списка событий."""
+    if not events:
+        return 0
+    return 0
+
+
+def _event_page_for_id(events: list[dict], event_id: int, mode: str):
+    """Возвращает страницу списка, на которой находится событие."""
+    for index, item in enumerate(events):
+        if int(item.get('id', 0)) == int(event_id):
+            return index // EVENTS_PAGE_SIZE
+    return _pick_events_initial_page(events, mode)
+
+
+def _build_event_button_text(event: dict):
+    """Строит подпись inline-кнопки события."""
+    event_at = event.get('event_at')
+    title = _normalize_cell_text(event.get('title')) or 'Событие'
+    if len(title) > 24:
+        title = f'{title[:23].rstrip()}…'
+
+    date_part = event_at.strftime('%d.%m %H:%M') if isinstance(event_at, datetime) else 'без даты'
+    if _event_is_finished(event):
+        label = f'✅ Завершено • {date_part} • {title}'
+    else:
+        label = f'🗓️ {date_part} • {title}'
+
+    if len(label) > 64:
+        return f'{label[:63].rstrip()}…'
+    return label
+
+
+def _build_events_list_text(events: list[dict], page: int, total_pages: int, mode: str, all_events: list[dict]):
+    """Формирует текст экрана списка событий."""
+    upcoming_events, finished_events = _split_events_for_user_view(all_events)
+    title = '🎉 События' if mode == 'upcoming' else '✅ Завершенные события'
+
+    lines = [
+        f'<b>{title}</b>',
+        '',
+        f"📄 Страница: <b>{page + 1}/{total_pages}</b> • Всего: <b>{len(events)}</b>",
+        f"🟢 Предстоящие: <b>{len(upcoming_events)}</b> • ✅ Завершенные: <b>{len(finished_events)}</b>",
+        '',
+    ]
+
+    if not events:
+        if mode == 'upcoming':
+            lines.append('Пока предстоящих событий нет.')
+        else:
+            lines.append('Завершенных событий пока нет.')
+    else:
+        lines.append('Нажмите на событие ниже, чтобы открыть подробности.')
+
+    return '\n'.join(lines)
+
+
+def _build_events_list_keyboard(events: list[dict], page: int, total_pages: int, mode: str, finished_count: int):
+    """Строит клавиатуру списка событий."""
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    start = page * EVENTS_PAGE_SIZE
+    end = start + EVENTS_PAGE_SIZE
+
+    for event in events[start:end]:
+        keyboard.add(
+            types.InlineKeyboardButton(
+                text=_build_event_button_text(event),
+                callback_data=f"events_detail_{mode}_{event.get('id')}_{page}",
+            )
+        )
+
+    if total_pages > 1:
+        keyboard.row(
+            types.InlineKeyboardButton(
+                text='⬅️',
+                callback_data=f'events_page_{mode}_{page - 1}' if page > 0 else 'events_noop',
+            ),
+            types.InlineKeyboardButton(
+                text=f'📄 {page + 1}/{total_pages}',
+                callback_data='events_noop',
+            ),
+            types.InlineKeyboardButton(
+                text='➡️',
+                callback_data=f'events_page_{mode}_{page + 1}' if page < total_pages - 1 else 'events_noop',
+            ),
+        )
+
+    if mode == 'upcoming' and finished_count > 0:
+        keyboard.add(types.InlineKeyboardButton(text='✅ Завершенные события', callback_data='events_open_past'))
+    if mode == 'past':
+        keyboard.add(types.InlineKeyboardButton(text='🟢 Актуальные события', callback_data='events_open_upcoming'))
+
+    keyboard.add(types.InlineKeyboardButton(text='🏠 В меню', callback_data='main_menu'))
+    return keyboard
+
+
+def _build_event_detail_text(event: dict, event_index: int, total_events: int):
+    """Формирует подробный текст события."""
+    event_at = event.get('event_at')
+    is_finished = _event_is_finished(event)
+    status_line = '✅ Событие завершено' if is_finished else '🟢 Событие запланировано'
+    attachment_type = event.get('attachment_type')
+    created_at = event.get('created_at')
+    created_by_login = _normalize_cell_text(event.get('created_by_login'))
+
+    lines = [
+        '<b>🎉 Карточка события</b>',
+        '',
+        f"📌 Статус: <b>{status_line}</b>",
+        f"📝 Название: <b>{html.escape(_normalize_cell_text(event.get('title')) or 'Событие')}</b>",
+        f"🗓️ Когда: <b>{html.escape(_format_event_datetime(event_at))}</b>",
+    ]
+
+    if attachment_type:
+        lines.append(f"📎 Вложение: <b>{html.escape(_event_attachment_label(attachment_type))}</b>")
+
+    if created_by_login:
+        lines.append(f"👤 Создал: <b>{html.escape(created_by_login)}</b>")
+    if isinstance(created_at, datetime):
+        lines.append(f"➕ Добавлено: <b>{created_at.strftime('%d.%m.%Y %H:%M')}</b>")
+
+    description = _event_description_for_display(event.get('description') or '')
+    if description:
+        lines.extend(['', html.escape(description)])
+
+    lines.extend(['', f"<b>Событие {event_index + 1} из {total_events}</b>"])
+    return '\n'.join(lines)
+
+
+def _build_event_detail_keyboard(events: list[dict], event_index: int, page: int, mode: str):
+    """Строит клавиатуру карточки события."""
+    event = events[event_index]
+    keyboard = types.InlineKeyboardMarkup(row_width=2)
+
+    keyboard.row(
+        types.InlineKeyboardButton(
+            text='⬅️ Предыдущее',
+            callback_data=f"events_prev_{mode}_{event.get('id')}_{page}" if event_index > 0 else 'events_noop',
+        ),
+        types.InlineKeyboardButton(
+            text='Следующее ➡️',
+            callback_data=(
+                f"events_next_{mode}_{event.get('id')}_{page}"
+                if event_index < len(events) - 1
+                else 'events_noop'
+            ),
+        ),
+    )
+    keyboard.row(
+        types.InlineKeyboardButton(text='⬅️ К списку', callback_data=f'events_back_{mode}_{page}'),
+        types.InlineKeyboardButton(text='🏠 В меню', callback_data='main_menu'),
+    )
+    return keyboard
+
+
 async def _clear_admin_message_context(state: FSMContext):
     """Сбрасывает служебные данные экрана отправки админ-сообщения."""
     await state.reset_state(with_data=False)
@@ -576,6 +1097,36 @@ async def _clear_admin_message_context(state: FSMContext):
         admin_message_origin_view=None,
         admin_message_origin_chat_id=None,
         admin_message_origin_message_id=None,
+    )
+
+
+async def _clear_admin_event_context(state: FSMContext):
+    """Сбрасывает служебные данные экрана создания события."""
+    await state.reset_state(with_data=False)
+    await state.update_data(
+        admin_event_at_iso=None,
+        admin_event_description=None,
+        admin_event_origin_chat_id=None,
+        admin_event_origin_message_id=None,
+    )
+
+
+async def _restore_admin_event_origin(state: FSMContext, telegram_id: int):
+    """Возвращает админа к экрану панели после создания или отмены события."""
+    user_data = await state.get_data()
+    chat_id = user_data.get('admin_event_origin_chat_id')
+    message_id = user_data.get('admin_event_origin_message_id')
+    if not chat_id or not message_id:
+        return
+
+    stats = await db_commands.get_admin_dashboard_stats()
+    session_data = await db_commands.get_admin_session(telegram_id)
+    await _safe_edit_message_text_by_id(
+        int(chat_id),
+        int(message_id),
+        _build_admin_panel_text(stats, session_data),
+        reply_markup=_build_admin_panel_keyboard(),
+        parse_mode='HTML',
     )
 
 
@@ -1068,6 +1619,481 @@ async def admin_receive_message_text(message: types.Message, state: FSMContext):
     )
 
 
+def _admin_event_skip_requested(text_value: str) -> bool:
+    """Проверяет, что администратор хочет сохранить событие без вложения."""
+    return _search_normalize_text(text_value) in {'без вложения', 'без файла', 'skip'}
+
+
+def _get_admin_event_payload(user_data: dict):
+    """Достает из FSM дату и текст создаваемого события."""
+    event_at_iso = _normalize_cell_text(user_data.get('admin_event_at_iso'))
+    description = str(user_data.get('admin_event_description') or '').strip()
+
+    try:
+        event_at = datetime.fromisoformat(event_at_iso) if event_at_iso else None
+    except ValueError:
+        event_at = None
+
+    return event_at, description
+
+
+async def _finalize_admin_event_creation(
+    state: FSMContext,
+    telegram_id: int,
+    *,
+    attachment_type: str | None = None,
+    attachment_payload: dict | None = None,
+):
+    """Сохраняет событие в БД и рассылает его пользователям."""
+    user_data = await state.get_data()
+    event_at, description = _get_admin_event_payload(user_data)
+    if event_at is None or not description:
+        return None, 0, 0
+
+    admin_session = await db_commands.get_admin_session(telegram_id)
+    event = await db_commands.create_bot_event(
+        title=_event_title_from_description(description),
+        description=description,
+        event_at=event_at,
+        attachment_type=attachment_type,
+        attachment_payload=attachment_payload,
+        created_by_telegram_id=telegram_id,
+        created_by_login=(admin_session or {}).get('login'),
+    )
+
+    recipients = await db_commands.get_event_notification_recipients()
+    success_count = 0
+    failed_count = 0
+    for recipient in recipients:
+        try:
+            await _send_event_announcement(int(recipient['telegram_id']), event)
+            success_count += 1
+        except Exception:
+            failed_count += 1
+
+    return event, success_count, failed_count
+
+
+async def admin_event_create_start(callback_query: types.CallbackQuery, state: FSMContext):
+    """Запускает создание нового события из админ-панели."""
+    telegram_id = _telegram_id_from_callback(callback_query)
+    if not await db_commands.is_admin_authorized(telegram_id):
+        await callback_query.answer('⚠️ Сначала войдите в админ-панель через /admin', show_alert=True)
+        return
+
+    await state.update_data(
+        admin_event_at_iso=None,
+        admin_event_description=None,
+        admin_event_origin_chat_id=callback_query.message.chat.id,
+        admin_event_origin_message_id=callback_query.message.message_id,
+    )
+    await state.set_state(AdminEventDialog.waiting_datetime.state)
+    await _safe_edit_text(
+        callback_query.message,
+        _build_admin_event_datetime_text(),
+        reply_markup=_build_admin_event_step_keyboard(),
+        parse_mode='HTML',
+    )
+    await callback_query.answer()
+
+
+async def admin_event_cancel(callback_query: types.CallbackQuery, state: FSMContext):
+    """Отменяет создание события и возвращает администратора в панель."""
+    telegram_id = _telegram_id_from_callback(callback_query)
+    if not await db_commands.is_admin_authorized(telegram_id):
+        await _clear_admin_event_context(state)
+        await callback_query.answer('⚠️ Сначала войдите в админ-панель через /admin', show_alert=True)
+        return
+
+    await _restore_admin_event_origin(state, telegram_id)
+    await _clear_admin_event_context(state)
+    await callback_query.answer('Создание события отменено')
+
+
+async def admin_event_receive_datetime(message: types.Message, state: FSMContext):
+    """Принимает дату и время нового события."""
+    telegram_id = _telegram_id_from_message(message)
+    if not await db_commands.is_admin_authorized(telegram_id):
+        await _clear_admin_event_context(state)
+        await message.answer('⚠️ Сначала войдите в админ-панель через /admin')
+        return
+
+    text_value = _normalize_cell_text(message.text or message.caption)
+    if not text_value:
+        await message.answer('Введите дату и время события.')
+        return
+
+    if _admin_message_is_cancel(text_value):
+        await _restore_admin_event_origin(state, telegram_id)
+        await _clear_admin_event_context(state)
+        await message.answer('Создание события отменено.')
+        return
+
+    event_at = _parse_admin_event_datetime(text_value)
+    if event_at is None:
+        await message.answer(
+            '⚠️ Не удалось распознать дату и время.\n'
+            'Пример: 14.03.2026 18:30'
+        )
+        return
+
+    await state.update_data(admin_event_at_iso=event_at.isoformat())
+    await state.set_state(AdminEventDialog.waiting_text.state)
+    await message.answer(
+        _build_admin_event_text_prompt(event_at),
+        reply_markup=_build_admin_event_step_keyboard(),
+        parse_mode='HTML',
+    )
+
+
+async def admin_event_receive_text(message: types.Message, state: FSMContext):
+    """Принимает текст нового события."""
+    telegram_id = _telegram_id_from_message(message)
+    if not await db_commands.is_admin_authorized(telegram_id):
+        await _clear_admin_event_context(state)
+        await message.answer('⚠️ Сначала войдите в админ-панель через /admin')
+        return
+
+    text_value = _normalize_cell_text(message.text)
+    if not text_value:
+        await message.answer('Отправьте обычное текстовое сообщение с описанием события.')
+        return
+
+    if _admin_message_is_cancel(text_value):
+        await _restore_admin_event_origin(state, telegram_id)
+        await _clear_admin_event_context(state)
+        await message.answer('Создание события отменено.')
+        return
+
+    user_data = await state.get_data()
+    event_at, _ = _get_admin_event_payload(user_data)
+    if event_at is None:
+        await _clear_admin_event_context(state)
+        await message.answer('⚠️ Дата события потерялась. Начните создание заново.')
+        return
+
+    await state.update_data(admin_event_description=text_value)
+    await state.set_state(AdminEventDialog.waiting_attachment.state)
+    await message.answer(
+        _build_admin_event_attachment_prompt(event_at, text_value),
+        reply_markup=_build_admin_event_step_keyboard(allow_skip=True),
+        parse_mode='HTML',
+    )
+
+
+async def admin_event_skip_attachment(callback_query: types.CallbackQuery, state: FSMContext):
+    """Сохраняет событие без вложения."""
+    telegram_id = _telegram_id_from_callback(callback_query)
+    if not await db_commands.is_admin_authorized(telegram_id):
+        await _clear_admin_event_context(state)
+        await callback_query.answer('⚠️ Сначала войдите в админ-панель через /admin', show_alert=True)
+        return
+
+    event, success_count, failed_count = await _finalize_admin_event_creation(state, telegram_id)
+    if event is None:
+        await _clear_admin_event_context(state)
+        await callback_query.answer('⚠️ Не удалось сохранить событие. Начните заново.', show_alert=True)
+        return
+
+    await _restore_admin_event_origin(state, telegram_id)
+    await _clear_admin_event_context(state)
+    await callback_query.message.answer(
+        '✅ Событие сохранено.\n'
+        f'👤 Получили уведомление: {success_count}\n'
+        f'❌ Ошибок отправки: {failed_count}'
+    )
+    await callback_query.answer()
+
+
+async def admin_event_receive_attachment(message: types.Message, state: FSMContext):
+    """Принимает вложение события и завершает создание."""
+    telegram_id = _telegram_id_from_message(message)
+    if not await db_commands.is_admin_authorized(telegram_id):
+        await _clear_admin_event_context(state)
+        await message.answer('⚠️ Сначала войдите в админ-панель через /admin')
+        return
+
+    if message.text:
+        text_value = _normalize_cell_text(message.text)
+        if _admin_message_is_cancel(text_value):
+            await _restore_admin_event_origin(state, telegram_id)
+            await _clear_admin_event_context(state)
+            await message.answer('Создание события отменено.')
+            return
+        if _admin_event_skip_requested(text_value):
+            event, success_count, failed_count = await _finalize_admin_event_creation(state, telegram_id)
+            if event is None:
+                await _clear_admin_event_context(state)
+                await message.answer('⚠️ Не удалось сохранить событие. Начните заново.')
+                return
+
+            await _restore_admin_event_origin(state, telegram_id)
+            await _clear_admin_event_context(state)
+            await message.answer(
+                '✅ Событие сохранено.\n'
+                f'👤 Получили уведомление: {success_count}\n'
+                f'❌ Ошибок отправки: {failed_count}'
+            )
+            return
+
+    attachment_type, attachment_payload = _serialize_event_attachment(message)
+    if not attachment_type:
+        await message.answer(
+            'Поддерживаются только фото, видео, GIF, документ, аудио или локация.\n'
+            'Если вложение не нужно, нажмите кнопку «Без вложения».'
+        )
+        return
+
+    event, success_count, failed_count = await _finalize_admin_event_creation(
+        state,
+        telegram_id,
+        attachment_type=attachment_type,
+        attachment_payload=attachment_payload,
+    )
+    if event is None:
+        await _clear_admin_event_context(state)
+        await message.answer('⚠️ Не удалось сохранить событие. Начните заново.')
+        return
+
+    await _restore_admin_event_origin(state, telegram_id)
+    await _clear_admin_event_context(state)
+    await message.answer(
+        '✅ Событие сохранено.\n'
+        f'👤 Получили уведомление: {success_count}\n'
+        f'❌ Ошибок отправки: {failed_count}'
+    )
+
+
+async def _render_events_list_view(target, *, edit: bool, page: int | None = None, mode: str = 'upcoming'):
+    """Показывает список событий пользователю."""
+    all_events = await db_commands.get_bot_events()
+    events = _events_for_user_view(all_events, mode)
+    _, finished_events = _split_events_for_user_view(all_events)
+    total_pages = max(1, (len(events) + EVENTS_PAGE_SIZE - 1) // EVENTS_PAGE_SIZE)
+
+    if page is None:
+        page = _pick_events_initial_page(events, mode)
+    page = max(0, min(int(page), total_pages - 1))
+
+    text = _build_events_list_text(events, page, total_pages, mode, all_events)
+    keyboard = _build_events_list_keyboard(events, page, total_pages, mode, len(finished_events))
+
+    if edit:
+        await _safe_edit_text(target.message, text, reply_markup=keyboard, parse_mode='HTML')
+        await target.answer()
+    else:
+        if isinstance(target, types.CallbackQuery):
+            await target.message.answer(text, reply_markup=keyboard, parse_mode='HTML')
+            await target.answer()
+        else:
+            await target.answer(text, reply_markup=keyboard, parse_mode='HTML')
+
+
+async def _send_event_detail_view(chat_id: int, event_id: int, page: int | None = None, mode: str = 'upcoming'):
+    """Отправляет карточку выбранного события новым сообщением."""
+    events = _events_for_user_view(await db_commands.get_bot_events(), mode)
+    if not events:
+        return False
+
+    event_index = next((index for index, item in enumerate(events) if int(item.get('id', 0)) == int(event_id)), None)
+    if event_index is None:
+        return False
+
+    if page is None:
+        page = _event_page_for_id(events, event_id, mode)
+    total_pages = max(1, (len(events) + EVENTS_PAGE_SIZE - 1) // EVENTS_PAGE_SIZE)
+    page = max(0, min(int(page), total_pages - 1))
+
+    event = events[event_index]
+    text = _build_event_detail_text(event, event_index, len(events))
+    keyboard = _build_event_detail_keyboard(events, event_index, page, mode)
+    attachment_type = event.get('attachment_type')
+    attachment_payload = event.get('attachment_payload')
+
+    if attachment_type and attachment_payload:
+        try:
+            sent_as_single_message = await _send_event_attachment_with_caption(
+                chat_id,
+                attachment_type,
+                attachment_payload,
+                text,
+                keyboard,
+            )
+            if sent_as_single_message:
+                return True
+        except Exception:
+            pass
+
+        await _send_event_attachment(chat_id, attachment_type, attachment_payload)
+
+    await bot.send_message(
+        chat_id,
+        text,
+        parse_mode='HTML',
+        reply_markup=keyboard,
+    )
+    return True
+
+
+async def user_events(message: types.Message):
+    """Открывает список событий из главного меню."""
+    await _render_events_list_view(message, edit=False, mode='upcoming')
+
+
+async def user_events_change_page(callback_query: types.CallbackQuery):
+    """Переключает страницу списка событий."""
+    try:
+        parts = callback_query.data.split('_', 3)
+        if len(parts) == 4:
+            _, _, mode, page_text = parts
+            page = int(page_text)
+        else:
+            mode = 'upcoming'
+            page = int(callback_query.data.rsplit('_', 1)[1])
+    except (TypeError, ValueError, IndexError):
+        await callback_query.answer('⚠️ Некорректная страница', show_alert=True)
+        return
+
+    await _render_events_list_view(callback_query, edit=True, page=page, mode=mode)
+
+
+async def user_events_back_to_list(callback_query: types.CallbackQuery):
+    """Возвращает из карточки события к списку."""
+    try:
+        parts = callback_query.data.split('_', 3)
+        if len(parts) == 4:
+            _, _, mode, page_text = parts
+            page = int(page_text)
+        else:
+            mode = 'upcoming'
+            page = int(callback_query.data.rsplit('_', 1)[1])
+    except (TypeError, ValueError, IndexError):
+        mode = 'upcoming'
+        page = None
+
+    await _render_events_list_view(callback_query, edit=False, page=page, mode=mode)
+
+
+async def user_events_open_detail(callback_query: types.CallbackQuery):
+    """Открывает карточку события по кнопке из списка."""
+    payload = callback_query.data[len('events_detail_'):]
+    try:
+        parts = payload.split('_', 2)
+        if len(parts) == 3:
+            mode, event_id_text, page_text = parts
+            event_id = int(event_id_text)
+            page = int(page_text)
+        else:
+            mode = 'upcoming'
+            event_id_text, page_text = payload.rsplit('_', 1)
+            event_id = int(event_id_text)
+            page = int(page_text)
+    except (TypeError, ValueError, IndexError):
+        await callback_query.answer('⚠️ Некорректное событие', show_alert=True)
+        return
+
+    sent = await _send_event_detail_view(callback_query.message.chat.id, event_id, page, mode)
+    if not sent:
+        await callback_query.answer('⚠️ Событие не найдено', show_alert=True)
+        return
+    await callback_query.answer()
+
+
+async def user_events_jump(callback_query: types.CallbackQuery):
+    """Открывает список событий из уведомления."""
+    await _render_events_list_view(callback_query, edit=False, page=None, mode='upcoming')
+
+
+async def user_events_open_past(callback_query: types.CallbackQuery):
+    """Открывает список завершенных событий."""
+    await _render_events_list_view(callback_query, edit=False, page=None, mode='past')
+
+
+async def user_events_open_upcoming(callback_query: types.CallbackQuery):
+    """Открывает основной список актуальных событий."""
+    await _render_events_list_view(callback_query, edit=False, page=None, mode='upcoming')
+
+
+async def user_events_shift_detail(callback_query: types.CallbackQuery):
+    """Листает карточки событий вперед или назад."""
+    if callback_query.data.startswith('events_prev_'):
+        payload = callback_query.data[len('events_prev_'):]
+        delta = -1
+    else:
+        payload = callback_query.data[len('events_next_'):]
+        delta = 1
+
+    try:
+        parts = payload.split('_', 2)
+        if len(parts) == 3:
+            mode, event_id_text, page_text = parts
+            event_id = int(event_id_text)
+            page = int(page_text)
+        else:
+            mode = 'upcoming'
+            event_id_text, page_text = payload.rsplit('_', 1)
+            event_id = int(event_id_text)
+            page = int(page_text)
+    except (TypeError, ValueError, IndexError):
+        await callback_query.answer('⚠️ Некорректное событие', show_alert=True)
+        return
+
+    events = _events_for_user_view(await db_commands.get_bot_events(), mode)
+    event_index = next((index for index, item in enumerate(events) if int(item.get('id', 0)) == event_id), None)
+    if event_index is None:
+        await callback_query.answer('⚠️ Событие не найдено', show_alert=True)
+        return
+
+    target_index = event_index + delta
+    if target_index < 0 or target_index >= len(events):
+        await callback_query.answer('📭 Больше событий нет.', show_alert=True)
+        return
+
+    sent = await _send_event_detail_view(
+        callback_query.message.chat.id,
+        int(events[target_index]['id']),
+        page,
+        mode,
+    )
+    if not sent:
+        await callback_query.answer('⚠️ Событие не найдено', show_alert=True)
+        return
+    await callback_query.answer()
+
+
+async def user_events_open_attachment(callback_query: types.CallbackQuery):
+    """Отправляет пользователю вложение выбранного события."""
+    payload = callback_query.data[len('events_media_'):]
+    try:
+        event_id_text, _ = payload.rsplit('_', 1)
+        event_id = int(event_id_text)
+    except (TypeError, ValueError, IndexError):
+        await callback_query.answer('⚠️ Некорректное вложение', show_alert=True)
+        return
+
+    event = await db_commands.get_bot_event(event_id)
+    if not event or not event.get('attachment_type') or not event.get('attachment_payload'):
+        await callback_query.answer('📭 У этого события нет вложения.', show_alert=True)
+        return
+
+    try:
+        await _send_event_attachment(
+            callback_query.message.chat.id,
+            event.get('attachment_type'),
+            event.get('attachment_payload'),
+        )
+    except Exception:
+        await callback_query.answer('⚠️ Не удалось открыть вложение', show_alert=True)
+        return
+
+    await callback_query.answer('Вложение отправлено')
+
+
+async def user_events_noop(callback_query: types.CallbackQuery):
+    """Служебная кнопка списка событий."""
+    await callback_query.answer()
+
+
 async def admin_users_noop(callback_query: types.CallbackQuery):
     """Служебная кнопка пагинации в админ-панели."""
     await callback_query.answer()
@@ -1097,11 +2123,20 @@ def _digest_settings_from_user_data(user_data):
     return enabled, hour % 24, max(0, min(59, minute))
 
 
+def _event_notifications_enabled_from_user_data(user_data):
+    """Возвращает нормализованный флаг уведомлений о событиях."""
+    value = user_data.get('event_notifications_enabled')
+    if value is None:
+        return True
+    return bool(value)
+
+
 def _build_settings_text(user_data):
     """Формирует текст экрана настроек."""
     course = user_data.get('selected_course')
     group_code = user_data.get('selected_group')
     digest_enabled, digest_hour, digest_minute = _digest_settings_from_user_data(user_data)
+    event_notifications_enabled = _event_notifications_enabled_from_user_data(user_data)
 
     lines = ['<b>💼 Настройки</b>', '']
 
@@ -1116,6 +2151,9 @@ def _build_settings_text(user_data):
         f"🔔 Вечерняя рассылка: <b>{'включена ✅' if digest_enabled else 'выключена ❌'}</b>"
     )
     lines.append(f"🕒 Время рассылки: <b>{digest_hour:02d}:{digest_minute:02d} МСК</b>")
+    lines.append(
+        f"🎉 Уведомления о событиях: <b>{'включены ✅' if event_notifications_enabled else 'выключены ❌'}</b>"
+    )
 
     if not group_code:
         lines.append('')
@@ -1128,6 +2166,7 @@ def _build_settings_keyboard(user_data):
     """Строит клавиатуру экрана настроек."""
     group_code = user_data.get('selected_group')
     digest_enabled, digest_hour, digest_minute = _digest_settings_from_user_data(user_data)
+    event_notifications_enabled = _event_notifications_enabled_from_user_data(user_data)
 
     keyboard = types.InlineKeyboardMarkup(row_width=1)
     keyboard.add(
@@ -1149,6 +2188,12 @@ def _build_settings_keyboard(user_data):
             callback_data='settings_time_noop',
         ),
         types.InlineKeyboardButton(text='▶️', callback_data='settings_digest_time_1'),
+    )
+    keyboard.add(
+        types.InlineKeyboardButton(
+            text='🔕 Отключить события' if event_notifications_enabled else '🎉 Включить события',
+            callback_data='settings_events_toggle',
+        )
     )
     return keyboard
 
@@ -1182,6 +2227,15 @@ DAY_NAMES = {
     "суббота",
     "воскресенье",
 }
+EVENT_WEEKDAY_NAMES = [
+    "понедельник",
+    "вторник",
+    "среда",
+    "четверг",
+    "пятница",
+    "суббота",
+    "воскресенье",
+]
 
 GROUP_PREFIX = "ИД"
 WEEK_TOKEN = "НЕДЕЛЯ"
@@ -1214,6 +2268,7 @@ USER_SELECTION_KEYS = (
     'daily_digest_enabled',
     'daily_digest_hour',
     'daily_digest_minute',
+    'event_notifications_enabled',
 )
 SEARCH_CALLBACK_CACHE = {}
 SEARCH_CALLBACK_LIMIT = 3000
@@ -1247,6 +2302,7 @@ SEARCH_TYPES = {
 ROOM_PATTERN = re.compile(r'(?i)\b(?:ауд\.?|каб\.?|кабинет|лаб\.?|лаборатория|спортзал|зал)\s*[^,;|]*')
 ADMIN_USERS_PAGE_SIZE = 8
 ADMIN_FILTER_PAGE_SIZE = 8
+EVENTS_PAGE_SIZE = 8
 
 
 def _telegram_id_from_message(message: types.Message):
@@ -1290,6 +2346,7 @@ async def _get_user_data_with_db_fallback(state: FSMContext, telegram_id):
         'daily_digest_enabled',
         'daily_digest_hour',
         'daily_digest_minute',
+        'event_notifications_enabled',
     )
     if all(key in user_data and user_data.get(key) is not None for key in required_keys):
         return user_data
@@ -5223,6 +6280,21 @@ async def settings_shift_digest_time(callback_query: types.CallbackQuery, state:
     await callback_query.answer(f'Новое время: {digest_hour:02d}:{digest_minute:02d} МСК')
 
 
+async def settings_toggle_event_notifications(callback_query: types.CallbackQuery, state: FSMContext):
+    """Переключает уведомления пользователя о событиях."""
+    telegram_id = _telegram_id_from_callback(callback_query)
+    user_data = await _get_user_data_with_db_fallback(state, telegram_id)
+    current_value = _event_notifications_enabled_from_user_data(user_data)
+
+    await _update_user_selection(
+        state,
+        telegram_id,
+        event_notifications_enabled=not current_value,
+    )
+    await _render_settings_view(callback_query.message, state, telegram_id, edit=True)
+    await callback_query.answer('Настройки событий обновлены')
+
+
 async def settings_time_noop(callback_query: types.CallbackQuery):
     """Служебная кнопка времени на экране настроек."""
     await callback_query.answer()
@@ -5243,6 +6315,7 @@ def register_handlers_client(dp: Dispatcher):
     dp.register_message_handler(schedule_today, commands=['today'])
     dp.register_message_handler(schedule_tomorrow, commands=['tomorrow'])
     dp.register_message_handler(search_entrypoint, text='🔎 Поиск', state='*')
+    dp.register_message_handler(user_events, text='🎉 События', state='*')
     dp.register_message_handler(settings, text='💼 Настройки')
     dp.register_message_handler(my_schedule, text='📅 Мое расписание')
     dp.register_message_handler(schedule_today, lambda message: message.text and message.text.casefold() == 'на сегодня')
@@ -5250,6 +6323,13 @@ def register_handlers_client(dp: Dispatcher):
     dp.register_message_handler(admin_receive_login, state=AdminAuthDialog.waiting_login)
     dp.register_message_handler(admin_receive_password, state=AdminAuthDialog.waiting_password)
     dp.register_message_handler(admin_receive_message_text, state=AdminMessageDialog.waiting_text)
+    dp.register_message_handler(admin_event_receive_datetime, state=AdminEventDialog.waiting_datetime)
+    dp.register_message_handler(admin_event_receive_text, state=AdminEventDialog.waiting_text)
+    dp.register_message_handler(
+        admin_event_receive_attachment,
+        state=AdminEventDialog.waiting_attachment,
+        content_types=types.ContentTypes.ANY,
+    )
     dp.register_message_handler(search_receive_query, state=SearchDialog.waiting_query)
     
     # Регистрация колбеков
@@ -5294,10 +6374,14 @@ def register_handlers_client(dp: Dispatcher):
     dp.register_callback_query_handler(settings_open, Text(equals="settings_open"))
     dp.register_callback_query_handler(settings_toggle_digest, Text(equals="settings_digest_toggle"))
     dp.register_callback_query_handler(settings_shift_digest_time, Text(startswith="settings_digest_time_"))
+    dp.register_callback_query_handler(settings_toggle_event_notifications, Text(equals='settings_events_toggle'))
     dp.register_callback_query_handler(settings_time_noop, Text(equals="settings_time_noop"))
     dp.register_callback_query_handler(admin_open, Text(equals='admin_open'), state='*')
     dp.register_callback_query_handler(admin_refresh, Text(equals='admin_refresh'), state='*')
     dp.register_callback_query_handler(admin_logout, Text(equals='admin_logout'), state='*')
+    dp.register_callback_query_handler(admin_event_create_start, Text(equals='admin_event_create'), state='*')
+    dp.register_callback_query_handler(admin_event_cancel, Text(equals='admin_event_cancel'), state='*')
+    dp.register_callback_query_handler(admin_event_skip_attachment, Text(equals='admin_event_skip'), state='*')
     dp.register_callback_query_handler(admin_users_open, Text(equals='admin_users'), state='*')
     dp.register_callback_query_handler(admin_users_change_page, Text(startswith='admin_users_page_'), state='*')
     dp.register_callback_query_handler(admin_users_pick_course, Text(startswith='admin_users_coursepick_'), state='*')
@@ -5313,4 +6397,15 @@ def register_handlers_client(dp: Dispatcher):
     dp.register_callback_query_handler(admin_users_clear_group, Text(equals='admin_users_group_clear'), state='*')
     dp.register_callback_query_handler(admin_users_reset_filters, Text(equals='admin_users_reset'), state='*')
     dp.register_callback_query_handler(admin_users_noop, Text(equals='admin_users_noop'), state='*')
+    dp.register_callback_query_handler(user_events_change_page, Text(startswith='events_page_'), state='*')
+    dp.register_callback_query_handler(user_events_back_to_list, Text(startswith='events_back_'), state='*')
+    dp.register_callback_query_handler(user_events_open_detail, Text(startswith='events_detail_'), state='*')
+    dp.register_callback_query_handler(user_events_jump, Text(equals='events_open_all'), state='*')
+    dp.register_callback_query_handler(user_events_open_past, Text(equals='events_open_past'), state='*')
+    dp.register_callback_query_handler(user_events_open_upcoming, Text(equals='events_open_upcoming'), state='*')
+    dp.register_callback_query_handler(user_events_jump, Text(startswith='events_jump_'), state='*')
+    dp.register_callback_query_handler(user_events_shift_detail, Text(startswith='events_prev_'), state='*')
+    dp.register_callback_query_handler(user_events_shift_detail, Text(startswith='events_next_'), state='*')
+    dp.register_callback_query_handler(user_events_open_attachment, Text(startswith='events_media_'), state='*')
+    dp.register_callback_query_handler(user_events_noop, Text(equals='events_noop'), state='*')
     dp.register_callback_query_handler(change_group, Text(startswith="change_group"))

@@ -10,6 +10,7 @@ from db_api.database import get_session
 from db_api.tables import (
     BotAdminSession,
     BotCallbackPayload,
+    BotEvent,
     Users,
     UserScheduleState,
     UserDailyNotification,
@@ -44,6 +45,7 @@ USER_SCHEDULE_FIELDS = (
     'daily_digest_enabled',
     'daily_digest_hour',
     'daily_digest_minute',
+    'event_notifications_enabled',
 )
 
 
@@ -101,6 +103,12 @@ def _normalize_daily_digest_minute(value: Any) -> int:
     except (TypeError, ValueError):
         return DEFAULT_DAILY_DIGEST_MINUTE
     return max(0, min(59, minute))
+
+
+def _normalize_event_notifications_enabled(value: Any) -> bool:
+    if value is None:
+        return True
+    return bool(value)
 
 
 async def registration_check(telegram_id):
@@ -208,6 +216,7 @@ async def get_admin_dashboard_stats():
         weeks_count = await session.scalar(select(func.count(ScheduleWeek.id)))
         days_count = await session.scalar(select(func.count(ScheduleWeekDay.id)))
         lessons_count = await session.scalar(select(func.count(ScheduleLesson.id)))
+        events_count = await session.scalar(select(func.count(BotEvent.id)))
 
         return {
             'total_users': int(total_users or 0),
@@ -220,6 +229,7 @@ async def get_admin_dashboard_stats():
             'weeks_count': int(weeks_count or 0),
             'days_count': int(days_count or 0),
             'lessons_count': int(lessons_count or 0),
+            'events_count': int(events_count or 0),
         }
 
 
@@ -374,6 +384,7 @@ async def get_admin_user_details(telegram_id: int):
                 UserScheduleState.daily_digest_enabled,
                 UserScheduleState.daily_digest_hour,
                 UserScheduleState.daily_digest_minute,
+                UserScheduleState.event_notifications_enabled,
                 UserScheduleState.updated_at,
             )
             .select_from(Users)
@@ -400,6 +411,9 @@ async def get_admin_user_details(telegram_id: int):
         'daily_digest_enabled': _normalize_daily_digest_enabled(row.daily_digest_enabled),
         'daily_digest_hour': _normalize_daily_digest_hour(row.daily_digest_hour),
         'daily_digest_minute': _normalize_daily_digest_minute(row.daily_digest_minute),
+        'event_notifications_enabled': _normalize_event_notifications_enabled(
+            row.event_notifications_enabled
+        ),
         'updated_at': row.updated_at,
     }
 
@@ -453,6 +467,98 @@ async def get_admin_message_recipients(
 
     return recipients
 
+
+def _event_row_to_dict(event_row: BotEvent | None):
+    if event_row is None:
+        return None
+
+    try:
+        attachment_payload = json.loads(event_row.attachment_payload) if event_row.attachment_payload else None
+    except json.JSONDecodeError:
+        attachment_payload = None
+
+    return {
+        'id': event_row.id,
+        'title': event_row.title,
+        'description': event_row.description,
+        'event_at': event_row.event_at,
+        'attachment_type': event_row.attachment_type,
+        'attachment_payload': attachment_payload,
+        'created_by_telegram_id': event_row.created_by_telegram_id,
+        'created_by_login': event_row.created_by_login,
+        'created_at': event_row.created_at,
+    }
+
+
+async def create_bot_event(
+    *,
+    title: str,
+    description: str,
+    event_at: datetime,
+    attachment_type: str | None = None,
+    attachment_payload: dict | None = None,
+    created_by_telegram_id: int | None = None,
+    created_by_login: str | None = None,
+):
+    attachment_json = None
+    if attachment_payload:
+        attachment_json = json.dumps(attachment_payload, ensure_ascii=False, separators=(',', ':'))
+
+    async with get_session() as session:
+        row = BotEvent(
+            title=str(title).strip()[:255] or 'Событие',
+            description=str(description).strip(),
+            event_at=event_at,
+            attachment_type=str(attachment_type).strip()[:32] if attachment_type else None,
+            attachment_payload=attachment_json,
+            created_by_telegram_id=created_by_telegram_id,
+            created_by_login=str(created_by_login).strip()[:128] if created_by_login else None,
+        )
+        session.add(row)
+        await session.commit()
+        await session.refresh(row)
+        return _event_row_to_dict(row)
+
+
+async def get_bot_event(event_id: int):
+    async with get_session() as session:
+        result = await session.execute(select(BotEvent).where(BotEvent.id == int(event_id)))
+        row = result.scalar_one_or_none()
+    return _event_row_to_dict(row)
+
+
+async def get_bot_events():
+    async with get_session() as session:
+        result = await session.execute(select(BotEvent).order_by(BotEvent.event_at.desc(), BotEvent.id.desc()))
+        rows = result.scalars().all()
+    return [_event_row_to_dict(row) for row in rows]
+
+
+async def get_event_notification_recipients():
+    async with get_session() as session:
+        result = await session.execute(
+            select(
+                Users.telegram_id,
+                Users.username,
+            )
+            .select_from(Users)
+            .outerjoin(UserScheduleState, UserScheduleState.telegram_id == Users.telegram_id)
+            .where(
+                (UserScheduleState.id.is_(None))
+                | (UserScheduleState.event_notifications_enabled.is_(True))
+            )
+            .order_by(Users.id.desc())
+        )
+        rows = result.all()
+
+    return [
+        {
+            'telegram_id': row.telegram_id,
+            'username': str(row.username or '').strip() or None,
+        }
+        for row in rows
+    ]
+
 async def get_user_schedule_state(telegram_id: int):
     """Возвращает сохраненные настройки расписания пользователя."""
     async with get_session() as session:
@@ -472,6 +578,9 @@ async def get_user_schedule_state(telegram_id: int):
             'daily_digest_enabled': _normalize_daily_digest_enabled(state_row.daily_digest_enabled),
             'daily_digest_hour': _normalize_daily_digest_hour(state_row.daily_digest_hour),
             'daily_digest_minute': _normalize_daily_digest_minute(state_row.daily_digest_minute),
+            'event_notifications_enabled': _normalize_event_notifications_enabled(
+                state_row.event_notifications_enabled
+            ),
         }
 
 
@@ -487,6 +596,10 @@ async def upsert_user_schedule_state(telegram_id: int, **kwargs):
         payload['daily_digest_hour'] = _normalize_daily_digest_hour(payload.get('daily_digest_hour'))
     if 'daily_digest_minute' in payload:
         payload['daily_digest_minute'] = _normalize_daily_digest_minute(payload.get('daily_digest_minute'))
+    if 'event_notifications_enabled' in payload:
+        payload['event_notifications_enabled'] = _normalize_event_notifications_enabled(
+            payload.get('event_notifications_enabled')
+        )
 
     async with get_session() as session:
         result = await session.execute(
@@ -513,6 +626,9 @@ async def upsert_user_schedule_state(telegram_id: int, **kwargs):
             'daily_digest_enabled': _normalize_daily_digest_enabled(state_row.daily_digest_enabled),
             'daily_digest_hour': _normalize_daily_digest_hour(state_row.daily_digest_hour),
             'daily_digest_minute': _normalize_daily_digest_minute(state_row.daily_digest_minute),
+            'event_notifications_enabled': _normalize_event_notifications_enabled(
+                state_row.event_notifications_enabled
+            ),
         }
 
 

@@ -39,6 +39,11 @@ def _run_schema_migrations(sync_conn):
                 "ALTER TABLE user_schedule_states "
                 "ADD COLUMN daily_digest_minute INTEGER NOT NULL DEFAULT 0"
             )
+        if 'event_notifications_enabled' not in existing_columns:
+            alter_statements.append(
+                "ALTER TABLE user_schedule_states "
+                "ADD COLUMN event_notifications_enabled BOOLEAN NOT NULL DEFAULT TRUE"
+            )
 
         for statement in alter_statements:
             sync_conn.execute(text(statement))
