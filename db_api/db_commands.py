@@ -223,6 +223,142 @@ async def get_admin_dashboard_stats():
         }
 
 
+async def get_admin_user_course_filters():
+    """Извлекает исходное имя курса из технического ключа."""
+    async with get_session() as session:
+        result = await session.execute(
+            select(
+                UserScheduleState.selected_course,
+                UserScheduleState.selected_course_name,
+            ).where(UserScheduleState.selected_course.is_not(None))
+        )
+        rows = result.all()
+
+    courses: dict[str, str] = {}
+    for row in rows:
+        course_key = str(row.selected_course or '').strip()
+        if not course_key:
+            continue
+
+        course_label = str(row.selected_course_name or '').strip() or _course_name_from_key(course_key)
+        if course_key not in courses:
+            courses[course_key] = course_label
+
+    return [
+        {'value': course_key, 'label': courses[course_key]}
+        for course_key in sorted(courses.keys(), key=lambda item: courses[item].casefold())
+    ]
+
+
+async def get_admin_user_group_filters(course_key: str | None = None):
+    """Извлекает исходное имя курса из технического ключа."""
+    normalized_course = str(course_key or '').strip() or None
+
+    async with get_session() as session:
+        query = select(UserScheduleState.selected_group).where(UserScheduleState.selected_group.is_not(None))
+        if normalized_course:
+            query = query.where(UserScheduleState.selected_course == normalized_course)
+
+        result = await session.execute(query)
+        rows = result.all()
+
+    groups = sorted(
+        {
+            str(row.selected_group or '').strip()
+            for row in rows
+            if str(row.selected_group or '').strip()
+        },
+        key=str.casefold,
+    )
+    return groups
+
+
+async def get_admin_users_page(
+    course_key: str | None = None,
+    group_code: str | None = None,
+    page: int = 0,
+    page_size: int = 8,):
+   
+    normalized_course = str(course_key or '').strip() or None
+    normalized_group = str(group_code or '').strip() or None
+
+    try:
+        page = max(0, int(page))
+    except (TypeError, ValueError):
+        page = 0
+
+    try:
+        page_size = max(1, int(page_size))
+    except (TypeError, ValueError):
+        page_size = 8
+
+    async with get_session() as session:
+        count_query = (
+            select(func.count(Users.id))
+            .select_from(Users)
+            .outerjoin(UserScheduleState, UserScheduleState.telegram_id == Users.telegram_id)
+        )
+        data_query = (
+            select(
+                Users.telegram_id,
+                Users.username,
+                UserScheduleState.selected_course,
+                UserScheduleState.selected_course_name,
+                UserScheduleState.selected_group,
+                UserScheduleState.daily_digest_enabled,
+                UserScheduleState.daily_digest_hour,
+                UserScheduleState.daily_digest_minute,
+            )
+            .select_from(Users)
+            .outerjoin(UserScheduleState, UserScheduleState.telegram_id == Users.telegram_id)
+        )
+
+        if normalized_course:
+            count_query = count_query.where(UserScheduleState.selected_course == normalized_course)
+            data_query = data_query.where(UserScheduleState.selected_course == normalized_course)
+
+        if normalized_group:
+            count_query = count_query.where(UserScheduleState.selected_group == normalized_group)
+            data_query = data_query.where(UserScheduleState.selected_group == normalized_group)
+
+        total = int(await session.scalar(count_query) or 0)
+        total_pages = max(1, (total + page_size - 1) // page_size)
+        if page >= total_pages:
+            page = total_pages - 1
+
+        result = await session.execute(
+            data_query.order_by(Users.id.desc()).offset(page * page_size).limit(page_size)
+        )
+        rows = result.all()
+
+    items = []
+    for row in rows:
+        course_value = str(row.selected_course or '').strip() or None
+        course_label = str(row.selected_course_name or '').strip()
+        if course_value and not course_label:
+            course_label = _course_name_from_key(course_value)
+
+        items.append(
+            {
+                'telegram_id': row.telegram_id,
+                'username': str(row.username or '').strip(),
+                'selected_course': course_value,
+                'selected_course_name': course_label or None,
+                'selected_group': str(row.selected_group or '').strip() or None,
+                'daily_digest_enabled': _normalize_daily_digest_enabled(row.daily_digest_enabled),
+                'daily_digest_hour': _normalize_daily_digest_hour(row.daily_digest_hour),
+                'daily_digest_minute': _normalize_daily_digest_minute(row.daily_digest_minute),
+            }
+        )
+
+    return {
+        'total': total,
+        'page': page,
+        'page_size': page_size,
+        'total_pages': total_pages,
+        'items': items,
+    }
+
 async def get_user_schedule_state(telegram_id: int):
     """Возвращает сохраненные настройки расписания пользователя."""
     async with get_session() as session:
@@ -533,3 +669,4 @@ async def replace_schedule_snapshot(
         await session.commit()
 
     return stats
+

@@ -1,4 +1,4 @@
-﻿import asyncio
+import asyncio
 import secrets
 import os
 import re
@@ -177,6 +177,7 @@ def _is_admin_credentials_valid(login_text: str, password_text: str) -> bool:
 def _build_admin_panel_keyboard():
     """Строит клавиатуру админ-панели."""
     keyboard = types.InlineKeyboardMarkup(row_width=2)
+    keyboard.add(types.InlineKeyboardButton(text='👥 Пользователи', callback_data='admin_users'))
     keyboard.row(
         types.InlineKeyboardButton(text='🔄 Обновить', callback_data='admin_refresh'),
         types.InlineKeyboardButton(text='🚪 Выйти', callback_data='admin_logout'),
@@ -264,6 +265,402 @@ async def admin_logout(callback_query: types.CallbackQuery, state: FSMContext):
             types.InlineKeyboardButton(text='🏠 В главное меню', callback_data='main_menu')
         ),
     )
+    await callback_query.answer()
+
+
+def _get_admin_users_view_state(user_data):
+    """Возвращает сохраненные фильтры и страницу списка пользователей."""
+    course_filter = _normalize_cell_text(user_data.get('admin_users_course_filter')) or None
+    group_filter = _normalize_cell_text(user_data.get('admin_users_group_filter')) or None
+
+    try:
+        page = int(user_data.get('admin_users_page', 0))
+    except (TypeError, ValueError):
+        page = 0
+
+    return course_filter, group_filter, max(0, page)
+
+
+def _short_admin_button_text(prefix: str, value: str, fallback: str, limit: int = 24):
+    """Собирает короткую подпись для inline-кнопки админ-фильтра."""
+    label = _normalize_cell_text(value) or fallback
+    if len(label) > limit:
+        label = f'{label[: limit - 1].rstrip()}…'
+    return f'{prefix} {label}'
+
+
+def _build_admin_users_text(page_data: dict, course_label: str | None, group_label: str | None):
+    """Формирует текст экрана списка пользователей."""
+    lines = [
+        '<b>👥 Пользователи</b>',
+        '',
+        f"🎓 Курс: <b>{html.escape(course_label or 'Все курсы')}</b>",
+        f"👥 Группа: <b>{html.escape(group_label or 'Все группы')}</b>",
+        '',
+        (
+            f"📄 Страница: <b>{page_data.get('page', 0) + 1}/{page_data.get('total_pages', 1)}</b>"
+            f" • Найдено: <b>{page_data.get('total', 0)}</b>"
+        ),
+        '',
+    ]
+
+    items = page_data.get('items') or []
+    if not items:
+        lines.append('Пользователи по выбранным фильтрам не найдены.')
+        return '\n'.join(lines)
+
+    start_index = page_data.get('page', 0) * page_data.get('page_size', ADMIN_USERS_PAGE_SIZE)
+    for offset, item in enumerate(items, start=1):
+        number = start_index + offset
+        username = _normalize_cell_text(item.get('username'))
+        username_text = f"@{username}" if username else 'без username'
+        selected_course_name = item.get('selected_course_name') or 'не выбран'
+        selected_group = item.get('selected_group') or 'не выбрана'
+        digest_enabled = bool(item.get('daily_digest_enabled'))
+        digest_text = (
+            f"✅ {int(item.get('daily_digest_hour', 0)):02d}:{int(item.get('daily_digest_minute', 0)):02d}"
+            if digest_enabled
+            else '❌ выключена'
+        )
+
+        lines.extend(
+            [
+                f"<b>{number}. {html.escape(username_text)}</b>",
+                f"ID: <code>{item.get('telegram_id')}</code>",
+                f"🎓 {html.escape(selected_course_name)}",
+                f"👥 {html.escape(selected_group)}",
+                f"🔔 {digest_text}",
+                '',
+            ]
+        )
+
+    return '\n'.join(lines).rstrip()
+
+
+def _build_admin_users_keyboard(page_data: dict, course_label: str | None, group_label: str | None):
+    """Строит клавиатуру экрана списка пользователей."""
+    keyboard = types.InlineKeyboardMarkup(row_width=2)
+    keyboard.row(
+        types.InlineKeyboardButton(
+            text=_short_admin_button_text('🎓', course_label, 'Все курсы'),
+            callback_data='admin_users_coursepick_0',
+        ),
+        types.InlineKeyboardButton(
+            text=_short_admin_button_text('👥', group_label, 'Все группы'),
+            callback_data='admin_users_grouppick_0',
+        ),
+    )
+
+    if course_label or group_label:
+        keyboard.add(types.InlineKeyboardButton(text='🧹 Сбросить фильтры', callback_data='admin_users_reset'))
+
+    total_pages = max(1, int(page_data.get('total_pages', 1)))
+    current_page = max(0, int(page_data.get('page', 0)))
+    if total_pages > 1:
+        keyboard.row(
+            types.InlineKeyboardButton(
+                text='⬅️',
+                callback_data=f'admin_users_page_{-1}' if current_page > 0 else 'admin_users_noop',
+            ),
+            types.InlineKeyboardButton(
+                text=f'📄 {current_page + 1}/{total_pages}',
+                callback_data='admin_users_noop',
+            ),
+            types.InlineKeyboardButton(
+                text='➡️',
+                callback_data=f'admin_users_page_{1}' if current_page < total_pages - 1 else 'admin_users_noop',
+            ),
+        )
+
+    keyboard.row(
+        types.InlineKeyboardButton(text='🔄 Обновить список', callback_data='admin_users'),
+        types.InlineKeyboardButton(text='⬅️ В админку', callback_data='admin_open'),
+    )
+    return keyboard
+
+
+def _build_admin_filter_keyboard(options, selected_value, prefix: str, page: int, clear_callback: str, back_callback: str):
+    """Строит клавиатуру выбора фильтра админ-списка."""
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    total_items = len(options)
+    total_pages = max(1, (total_items + ADMIN_FILTER_PAGE_SIZE - 1) // ADMIN_FILTER_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    start = page * ADMIN_FILTER_PAGE_SIZE
+    end = start + ADMIN_FILTER_PAGE_SIZE
+
+    for absolute_index in range(start, min(end, total_items)):
+        option = options[absolute_index]
+        option_value = option['value'] if isinstance(option, dict) else option
+        option_label = option['label'] if isinstance(option, dict) else option
+        marker = '✅ ' if option_value == selected_value else ''
+        keyboard.add(
+            types.InlineKeyboardButton(
+                text=f'{marker}{option_label}',
+                callback_data=f'{prefix}_{absolute_index}',
+            )
+        )
+
+    keyboard.add(types.InlineKeyboardButton(text='♻️ Сбросить фильтр', callback_data=clear_callback))
+
+    if total_pages > 1:
+        keyboard.row(
+            types.InlineKeyboardButton(
+                text='⬅️',
+                callback_data=f'{back_callback}_{page - 1}' if page > 0 else 'admin_users_noop',
+            ),
+            types.InlineKeyboardButton(
+                text=f'📄 {page + 1}/{total_pages}',
+                callback_data='admin_users_noop',
+            ),
+            types.InlineKeyboardButton(
+                text='➡️',
+                callback_data=f'{back_callback}_{page + 1}' if page < total_pages - 1 else 'admin_users_noop',
+            ),
+        )
+
+    keyboard.add(types.InlineKeyboardButton(text='⬅️ К списку', callback_data='admin_users'))
+    return keyboard
+
+
+async def _render_admin_users_view(target, state: FSMContext, telegram_id, *, edit: bool):
+    """Показывает список пользователей с фильтрами по курсу и группе."""
+    if not await db_commands.is_admin_authorized(telegram_id):
+        if edit:
+            await target.answer('⚠️ Сначала войдите в админ-панель через /admin', show_alert=True)
+        else:
+            await target.answer('⚠️ Сначала войдите в админ-панель через /admin')
+        return False
+
+    user_data = await state.get_data()
+    course_filter, group_filter, page = _get_admin_users_view_state(user_data)
+    course_filters = await db_commands.get_admin_user_course_filters()
+    course_labels = {item['value']: item['label'] for item in course_filters}
+
+    if course_filter and course_filter not in course_labels:
+        course_filter = None
+        group_filter = None
+        page = 0
+
+    group_filters = await db_commands.get_admin_user_group_filters(course_filter)
+    if group_filter and group_filter not in group_filters:
+        group_filter = None
+        page = 0
+
+    page_data = await db_commands.get_admin_users_page(
+        course_key=course_filter,
+        group_code=group_filter,
+        page=page,
+        page_size=ADMIN_USERS_PAGE_SIZE,
+    )
+    if page_data.get('page', 0) != page:
+        page = page_data['page']
+
+    await state.update_data(
+        admin_users_course_filter=course_filter,
+        admin_users_group_filter=group_filter,
+        admin_users_page=page,
+    )
+
+    text = _build_admin_users_text(page_data, course_labels.get(course_filter), group_filter)
+    keyboard = _build_admin_users_keyboard(page_data, course_labels.get(course_filter), group_filter)
+
+    if edit:
+        await _safe_edit_text(target.message, text, reply_markup=keyboard, parse_mode='HTML')
+        await target.answer()
+    else:
+        await target.answer(text, reply_markup=keyboard, parse_mode='HTML')
+
+    return True
+
+
+async def _render_admin_course_filter_picker(callback_query: types.CallbackQuery, state: FSMContext, page: int):
+    """Показывает список доступных курсов для фильтрации пользователей."""
+    telegram_id = _telegram_id_from_callback(callback_query)
+    if not await db_commands.is_admin_authorized(telegram_id):
+        await callback_query.answer('⚠️ Сначала войдите в админ-панель через /admin', show_alert=True)
+        return
+
+    user_data = await state.get_data()
+    selected_course, _, _ = _get_admin_users_view_state(user_data)
+    courses = await db_commands.get_admin_user_course_filters()
+    if not courses:
+        await callback_query.answer('Список курсов пока пуст.', show_alert=True)
+        return
+
+    page_count = max(1, (len(courses) + ADMIN_FILTER_PAGE_SIZE - 1) // ADMIN_FILTER_PAGE_SIZE)
+    page = max(0, min(page, page_count - 1))
+    current_label = next((item['label'] for item in courses if item['value'] == selected_course), 'Все курсы')
+
+    text = (
+        '<b>🎓 Фильтр по курсу</b>\n\n'
+        f'Текущий курс: <b>{html.escape(current_label)}</b>\n'
+        'Выберите курс из списка ниже.'
+    )
+    keyboard = _build_admin_filter_keyboard(
+        courses,
+        selected_course,
+        'admin_users_course_set',
+        page,
+        'admin_users_course_clear',
+        'admin_users_coursepick',
+    )
+    await _safe_edit_text(callback_query.message, text, reply_markup=keyboard, parse_mode='HTML')
+    await callback_query.answer()
+
+
+async def _render_admin_group_filter_picker(callback_query: types.CallbackQuery, state: FSMContext, page: int):
+    """Показывает список групп для фильтрации пользователей."""
+    telegram_id = _telegram_id_from_callback(callback_query)
+    if not await db_commands.is_admin_authorized(telegram_id):
+        await callback_query.answer('⚠️ Сначала войдите в админ-панель через /admin', show_alert=True)
+        return
+
+    user_data = await state.get_data()
+    selected_course, selected_group, _ = _get_admin_users_view_state(user_data)
+    groups = await db_commands.get_admin_user_group_filters(selected_course)
+    if not groups:
+        await callback_query.answer('Для выбранного курса групп пока нет.', show_alert=True)
+        return
+
+    page_count = max(1, (len(groups) + ADMIN_FILTER_PAGE_SIZE - 1) // ADMIN_FILTER_PAGE_SIZE)
+    page = max(0, min(page, page_count - 1))
+    course_label = 'Все курсы'
+    if selected_course:
+        course_filters = await db_commands.get_admin_user_course_filters()
+        course_label = next(
+            (item['label'] for item in course_filters if item['value'] == selected_course),
+            selected_course,
+        )
+
+    text = (
+        '<b>👥 Фильтр по группе</b>\n\n'
+        f'Курс: <b>{html.escape(course_label)}</b>\n'
+        f"Текущая группа: <b>{html.escape(selected_group or 'Все группы')}</b>\n"
+        'Выберите группу из списка ниже.'
+    )
+    keyboard = _build_admin_filter_keyboard(
+        groups,
+        selected_group,
+        'admin_users_group_set',
+        page,
+        'admin_users_group_clear',
+        'admin_users_grouppick',
+    )
+    await _safe_edit_text(callback_query.message, text, reply_markup=keyboard, parse_mode='HTML')
+    await callback_query.answer()
+
+
+async def admin_users_open(callback_query: types.CallbackQuery, state: FSMContext):
+    """Открывает экран списка пользователей в админ-панели."""
+    await _render_admin_users_view(callback_query, state, _telegram_id_from_callback(callback_query), edit=True)
+
+
+async def admin_users_change_page(callback_query: types.CallbackQuery, state: FSMContext):
+    """Переключает страницу списка пользователей."""
+    try:
+        delta = int(callback_query.data.rsplit('_', 1)[1])
+    except (TypeError, ValueError, IndexError):
+        await callback_query.answer('⚠️ Некорректная страница', show_alert=True)
+        return
+
+    telegram_id = _telegram_id_from_callback(callback_query)
+    user_data = await state.get_data()
+    _, _, page = _get_admin_users_view_state(user_data)
+    await state.update_data(admin_users_page=max(0, page + delta))
+    await _render_admin_users_view(callback_query, state, telegram_id, edit=True)
+
+
+async def admin_users_pick_course(callback_query: types.CallbackQuery, state: FSMContext):
+    """Открывает выбор курса для фильтра списка пользователей."""
+    try:
+        page = int(callback_query.data.rsplit('_', 1)[1])
+    except (TypeError, ValueError, IndexError):
+        page = 0
+
+    await _render_admin_course_filter_picker(callback_query, state, page)
+
+
+async def admin_users_pick_group(callback_query: types.CallbackQuery, state: FSMContext):
+    """Открывает выбор группы для фильтра списка пользователей."""
+    try:
+        page = int(callback_query.data.rsplit('_', 1)[1])
+    except (TypeError, ValueError, IndexError):
+        page = 0
+
+    await _render_admin_group_filter_picker(callback_query, state, page)
+
+
+async def admin_users_set_course(callback_query: types.CallbackQuery, state: FSMContext):
+    """Применяет фильтр по курсу и сбрасывает страницу списка."""
+    try:
+        index = int(callback_query.data.rsplit('_', 1)[1])
+    except (TypeError, ValueError, IndexError):
+        await callback_query.answer('⚠️ Некорректный курс', show_alert=True)
+        return
+
+    courses = await db_commands.get_admin_user_course_filters()
+    if index < 0 or index >= len(courses):
+        await callback_query.answer('⚠️ Курс не найден', show_alert=True)
+        return
+
+    await state.update_data(
+        admin_users_course_filter=courses[index]['value'],
+        admin_users_group_filter=None,
+        admin_users_page=0,
+    )
+    await _render_admin_users_view(callback_query, state, _telegram_id_from_callback(callback_query), edit=True)
+
+
+async def admin_users_set_group(callback_query: types.CallbackQuery, state: FSMContext):
+    """Применяет фильтр по группе и сбрасывает страницу списка."""
+    try:
+        index = int(callback_query.data.rsplit('_', 1)[1])
+    except (TypeError, ValueError, IndexError):
+        await callback_query.answer('⚠️ Некорректная группа', show_alert=True)
+        return
+
+    user_data = await state.get_data()
+    course_filter, _, _ = _get_admin_users_view_state(user_data)
+    groups = await db_commands.get_admin_user_group_filters(course_filter)
+    if index < 0 or index >= len(groups):
+        await callback_query.answer('⚠️ Группа не найдена', show_alert=True)
+        return
+
+    await state.update_data(
+        admin_users_group_filter=groups[index],
+        admin_users_page=0,
+    )
+    await _render_admin_users_view(callback_query, state, _telegram_id_from_callback(callback_query), edit=True)
+
+
+async def admin_users_clear_course(callback_query: types.CallbackQuery, state: FSMContext):
+    """Сбрасывает фильтр по курсу и группе."""
+    await state.update_data(
+        admin_users_course_filter=None,
+        admin_users_group_filter=None,
+        admin_users_page=0,
+    )
+    await _render_admin_users_view(callback_query, state, _telegram_id_from_callback(callback_query), edit=True)
+
+
+async def admin_users_clear_group(callback_query: types.CallbackQuery, state: FSMContext):
+    """Сбрасывает фильтр по группе."""
+    await state.update_data(admin_users_group_filter=None, admin_users_page=0)
+    await _render_admin_users_view(callback_query, state, _telegram_id_from_callback(callback_query), edit=True)
+
+
+async def admin_users_reset_filters(callback_query: types.CallbackQuery, state: FSMContext):
+    """Полностью сбрасывает фильтры списка пользователей."""
+    await state.update_data(
+        admin_users_course_filter=None,
+        admin_users_group_filter=None,
+        admin_users_page=0,
+    )
+    await _render_admin_users_view(callback_query, state, _telegram_id_from_callback(callback_query), edit=True)
+
+
+async def admin_users_noop(callback_query: types.CallbackQuery):
+    """Служебная кнопка пагинации в админ-панели."""
     await callback_query.answer()
 
 
@@ -439,6 +836,8 @@ SEARCH_TYPES = {
     },
 }
 ROOM_PATTERN = re.compile(r'(?i)\b(?:ауд\.?|каб\.?|кабинет|лаб\.?|лаборатория|спортзал|зал)\s*[^,;|]*')
+ADMIN_USERS_PAGE_SIZE = 8
+ADMIN_FILTER_PAGE_SIZE = 8
 
 
 def _telegram_id_from_message(message: types.Message):
@@ -4489,4 +4888,14 @@ def register_handlers_client(dp: Dispatcher):
     dp.register_callback_query_handler(admin_open, Text(equals='admin_open'), state='*')
     dp.register_callback_query_handler(admin_refresh, Text(equals='admin_refresh'), state='*')
     dp.register_callback_query_handler(admin_logout, Text(equals='admin_logout'), state='*')
+    dp.register_callback_query_handler(admin_users_open, Text(equals='admin_users'), state='*')
+    dp.register_callback_query_handler(admin_users_change_page, Text(startswith='admin_users_page_'), state='*')
+    dp.register_callback_query_handler(admin_users_pick_course, Text(startswith='admin_users_coursepick_'), state='*')
+    dp.register_callback_query_handler(admin_users_pick_group, Text(startswith='admin_users_grouppick_'), state='*')
+    dp.register_callback_query_handler(admin_users_set_course, Text(startswith='admin_users_course_set_'), state='*')
+    dp.register_callback_query_handler(admin_users_set_group, Text(startswith='admin_users_group_set_'), state='*')
+    dp.register_callback_query_handler(admin_users_clear_course, Text(equals='admin_users_course_clear'), state='*')
+    dp.register_callback_query_handler(admin_users_clear_group, Text(equals='admin_users_group_clear'), state='*')
+    dp.register_callback_query_handler(admin_users_reset_filters, Text(equals='admin_users_reset'), state='*')
+    dp.register_callback_query_handler(admin_users_noop, Text(equals='admin_users_noop'), state='*')
     dp.register_callback_query_handler(change_group, Text(startswith="change_group"))
