@@ -46,6 +46,31 @@ async def cmd_start(message: types.Message):
     else:
         await message.reply("Вы уже зарегистрированы.", reply_markup=get_main_keyboard())
 
+
+def _commands_help_text():
+    """Возвращает справку по доступным командам бота."""
+    return (
+        "<b>📚 Команды бота</b>\n\n"
+        "• <code>/start</code> - открыть главное меню\n"
+        "• <code>/search</code> - открыть поиск по расписанию\n"
+        "• <code>/teacher Простомолотов</code> - найти расписание преподавателя\n"
+        "• <code>/room 505</code> - найти расписание аудитории\n"
+        "• <code>/subject Эконометрика</code> - найти расписание предмета\n"
+        "• <code>/today</code> - показать расписание на сегодня\n"
+        "• <code>/tomorrow</code> - показать расписание на завтра\n"
+        "• <code>/help</code> - показать эту справку\n\n"
+        "<b>Примеры</b>\n"
+        "• <code>/teacher Леденчук</code>\n"
+        "• <code>/room ауд. 125</code>\n"
+        "• <code>/subject Математические модели</code>"
+    )
+
+
+async def cmd_help(message: types.Message):
+    """Показывает пользователю список команд с примерами."""
+    await message.answer(_commands_help_text(), reply_markup=get_main_keyboard(), parse_mode='HTML')
+
+
 def _digest_settings_from_user_data(user_data):
     """Возвращает нормализованные настройки вечерней рассылки."""
     enabled = user_data.get('daily_digest_enabled')
@@ -3994,6 +4019,7 @@ async def settings_time_noop(callback_query: types.CallbackQuery):
 def register_handlers_client(dp: Dispatcher):
     """Регистрирует обработчики сообщений и callback-кнопок."""
     dp.register_message_handler(cmd_start, commands=['start'])
+    dp.register_message_handler(cmd_help, commands=['help'], state='*')
     dp.register_message_handler(search_entrypoint, commands=['search'], state='*')
     dp.register_message_handler(search_teacher_command, commands=['teacher'], state='*')
     dp.register_message_handler(search_room_command, commands=['room'], state='*')

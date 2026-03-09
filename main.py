@@ -59,6 +59,22 @@ def _load_moscow_timezone():
 MOSCOW_TZ = _load_moscow_timezone()
 
 
+async def configure_bot_commands():
+    """Настраивает видимый список команд Telegram с примерами."""
+    await bot.set_my_commands(
+        [
+            types.BotCommand('start', 'Главное меню'),
+            types.BotCommand('search', 'Поиск по расписанию'),
+            types.BotCommand('teacher', 'Пример: /teacher Простомолотов'),
+            types.BotCommand('room', 'Пример: /room 505'),
+            types.BotCommand('subject', 'Пример: /subject Эконометрика'),
+            types.BotCommand('today', 'Расписание на сегодня'),
+            types.BotCommand('tomorrow', 'Расписание на завтра'),
+            types.BotCommand('help', 'Все команды и примеры'),
+        ]
+    )
+
+
 def setup_handlers(dispatcher):
     """Регистрирует обработчики бота."""
     client.register_handlers_client(dispatcher)
@@ -866,6 +882,7 @@ async def on_startup(dispatcher):
 
     await create_base()
     setup_handlers(dispatcher)
+    await configure_bot_commands()
 
     print('Загрузка расписания из Excel...')
     client.init_schedule()
