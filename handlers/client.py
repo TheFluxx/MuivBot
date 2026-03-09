@@ -289,8 +289,71 @@ def _short_admin_button_text(prefix: str, value: str, fallback: str, limit: int 
     return f'{prefix} {label}'
 
 
+def _build_admin_user_button_text(item: dict):
+    """Собирает читаемую подпись кнопки пользователя."""
+    username = _normalize_cell_text(item.get('username'))
+    primary = f'@{username}' if username else f"ID {item.get('telegram_id')}"
+    group_code = _normalize_cell_text(item.get('selected_group')) or 'без группы'
+    label = f'👤 {primary} • {group_code}'
+    if len(label) > 46:
+        label = f'{label[:45].rstrip()}…'
+    return label
+
+
+def _build_admin_user_details_text(user_details: dict):
+    """Формирует текст карточки пользователя для админ-панели."""
+    username = _normalize_cell_text(user_details.get('username'))
+    username_text = f'@{username}' if username else 'не указан'
+    course_text = _normalize_cell_text(user_details.get('selected_course_name')) or 'не выбран'
+    group_text = _normalize_cell_text(user_details.get('selected_group')) or 'не выбрана'
+
+    digest_enabled = bool(user_details.get('daily_digest_enabled'))
+    if digest_enabled:
+        digest_text = (
+            f"включена ✅ {int(user_details.get('daily_digest_hour', 0)):02d}:"
+            f"{int(user_details.get('daily_digest_minute', 0)):02d}"
+        )
+    else:
+        digest_text = 'выключена ❌'
+
+    referrer_id = user_details.get('referrer_id')
+    if referrer_id in (None, 0):
+        referrer_text = 'нет'
+    else:
+        referrer_text = str(referrer_id)
+
+    updated_at = user_details.get('updated_at')
+    updated_text = updated_at.strftime('%d.%m.%Y %H:%M') if updated_at else 'нет данных'
+
+    lines = [
+        '<b>👤 Пользователь</b>',
+        '',
+        f"🆔 Telegram ID: <code>{user_details.get('telegram_id')}</code>",
+        f"👤 Username: <b>{html.escape(username_text)}</b>",
+        f"🎓 Курс: <b>{html.escape(course_text)}</b>",
+        f"👥 Группа: <b>{html.escape(group_text)}</b>",
+        f"🔔 Рассылка: <b>{html.escape(digest_text)}</b>",
+        f"🔗 Реферал: <b>{html.escape(referrer_text)}</b>",
+        f"🕒 Обновлено: <b>{html.escape(updated_text)}</b>",
+    ]
+    return '\n'.join(lines)
+
+
+def _build_admin_user_details_keyboard():
+    """Строит клавиатуру карточки пользователя."""
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    keyboard.add(types.InlineKeyboardButton(text='⬅️ К списку пользователей', callback_data='admin_users_back'))
+    keyboard.row(
+        types.InlineKeyboardButton(text='🔄 Обновить список', callback_data='admin_users'),
+        types.InlineKeyboardButton(text='⬅️ В админку', callback_data='admin_open'),
+    )
+    return keyboard
+
+
 def _build_admin_users_text(page_data: dict, course_label: str | None, group_label: str | None):
     """Формирует текст экрана списка пользователей."""
+    current_page = page_data.get('page', 0) + 1
+    total_pages = page_data.get('total_pages', 1)
     lines = [
         '<b>👥 Пользователи</b>',
         '',
@@ -298,9 +361,11 @@ def _build_admin_users_text(page_data: dict, course_label: str | None, group_lab
         f"👥 Группа: <b>{html.escape(group_label or 'Все группы')}</b>",
         '',
         (
-            f"📄 Страница: <b>{page_data.get('page', 0) + 1}/{page_data.get('total_pages', 1)}</b>"
+            f"📄 Страница: <b>{current_page}/{total_pages}</b>"
             f" • Найдено: <b>{page_data.get('total', 0)}</b>"
         ),
+        '',
+        'Нажмите на пользователя ниже, чтобы увидеть подробности.',
         '',
     ]
 
@@ -308,31 +373,6 @@ def _build_admin_users_text(page_data: dict, course_label: str | None, group_lab
     if not items:
         lines.append('Пользователи по выбранным фильтрам не найдены.')
         return '\n'.join(lines)
-
-    start_index = page_data.get('page', 0) * page_data.get('page_size', ADMIN_USERS_PAGE_SIZE)
-    for offset, item in enumerate(items, start=1):
-        number = start_index + offset
-        username = _normalize_cell_text(item.get('username'))
-        username_text = f"@{username}" if username else 'без username'
-        selected_course_name = item.get('selected_course_name') or 'не выбран'
-        selected_group = item.get('selected_group') or 'не выбрана'
-        digest_enabled = bool(item.get('daily_digest_enabled'))
-        digest_text = (
-            f"✅ {int(item.get('daily_digest_hour', 0)):02d}:{int(item.get('daily_digest_minute', 0)):02d}"
-            if digest_enabled
-            else '❌ выключена'
-        )
-
-        lines.extend(
-            [
-                f"<b>{number}. {html.escape(username_text)}</b>",
-                f"ID: <code>{item.get('telegram_id')}</code>",
-                f"🎓 {html.escape(selected_course_name)}",
-                f"👥 {html.escape(selected_group)}",
-                f"🔔 {digest_text}",
-                '',
-            ]
-        )
 
     return '\n'.join(lines).rstrip()
 
@@ -354,6 +394,14 @@ def _build_admin_users_keyboard(page_data: dict, course_label: str | None, group
     if course_label or group_label:
         keyboard.add(types.InlineKeyboardButton(text='🧹 Сбросить фильтры', callback_data='admin_users_reset'))
 
+    for item in page_data.get('items') or []:
+        keyboard.add(
+            types.InlineKeyboardButton(
+                text=_build_admin_user_button_text(item),
+                callback_data=f"admin_users_info_{item.get('telegram_id')}",
+            )
+        )
+
     total_pages = max(1, int(page_data.get('total_pages', 1)))
     current_page = max(0, int(page_data.get('page', 0)))
     if total_pages > 1:
@@ -363,7 +411,7 @@ def _build_admin_users_keyboard(page_data: dict, course_label: str | None, group
                 callback_data=f'admin_users_page_{-1}' if current_page > 0 else 'admin_users_noop',
             ),
             types.InlineKeyboardButton(
-                text=f'📄 {current_page + 1}/{total_pages}',
+                text=f'📄 Стр. {current_page + 1}/{total_pages}',
                 callback_data='admin_users_noop',
             ),
             types.InlineKeyboardButton(
@@ -657,6 +705,35 @@ async def admin_users_reset_filters(callback_query: types.CallbackQuery, state: 
         admin_users_page=0,
     )
     await _render_admin_users_view(callback_query, state, _telegram_id_from_callback(callback_query), edit=True)
+
+
+async def admin_users_back_to_list(callback_query: types.CallbackQuery, state: FSMContext):
+    """Возвращает из карточки пользователя к списку пользователей."""
+    await _render_admin_users_view(callback_query, state, _telegram_id_from_callback(callback_query), edit=True)
+
+
+async def admin_users_show_details(callback_query: types.CallbackQuery, state: FSMContext):
+    """Открывает карточку выбранного пользователя отдельным сообщением."""
+    telegram_id = _telegram_id_from_callback(callback_query)
+    if not await db_commands.is_admin_authorized(telegram_id):
+        await callback_query.answer('⚠️ Сначала войдите в админ-панель через /admin', show_alert=True)
+        return
+
+    try:
+        target_telegram_id = int(callback_query.data.rsplit('_', 1)[1])
+    except (TypeError, ValueError, IndexError):
+        await callback_query.answer('⚠️ Пользователь не найден', show_alert=True)
+        return
+
+    user_details = await db_commands.get_admin_user_details(target_telegram_id)
+    if not user_details:
+        await callback_query.answer('⚠️ Пользователь не найден', show_alert=True)
+        return
+
+    text = _build_admin_user_details_text(user_details)
+    keyboard = _build_admin_user_details_keyboard()
+    await _safe_edit_text(callback_query.message, text, reply_markup=keyboard, parse_mode='HTML')
+    await callback_query.answer()
 
 
 async def admin_users_noop(callback_query: types.CallbackQuery):
@@ -4894,6 +4971,8 @@ def register_handlers_client(dp: Dispatcher):
     dp.register_callback_query_handler(admin_users_pick_group, Text(startswith='admin_users_grouppick_'), state='*')
     dp.register_callback_query_handler(admin_users_set_course, Text(startswith='admin_users_course_set_'), state='*')
     dp.register_callback_query_handler(admin_users_set_group, Text(startswith='admin_users_group_set_'), state='*')
+    dp.register_callback_query_handler(admin_users_back_to_list, Text(equals='admin_users_back'), state='*')
+    dp.register_callback_query_handler(admin_users_show_details, Text(startswith='admin_users_info_'), state='*')
     dp.register_callback_query_handler(admin_users_clear_course, Text(equals='admin_users_course_clear'), state='*')
     dp.register_callback_query_handler(admin_users_clear_group, Text(equals='admin_users_group_clear'), state='*')
     dp.register_callback_query_handler(admin_users_reset_filters, Text(equals='admin_users_reset'), state='*')

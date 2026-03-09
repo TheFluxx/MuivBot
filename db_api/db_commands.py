@@ -359,6 +359,50 @@ async def get_admin_users_page(
         'items': items,
     }
 
+
+async def get_admin_user_details(telegram_id: int):
+    """Возвращает подробную информацию о пользователе для админ-панели."""
+    async with get_session() as session:
+        result = await session.execute(
+            select(
+                Users.telegram_id,
+                Users.username,
+                Users.referrer_id,
+                UserScheduleState.selected_course,
+                UserScheduleState.selected_course_name,
+                UserScheduleState.selected_group,
+                UserScheduleState.daily_digest_enabled,
+                UserScheduleState.daily_digest_hour,
+                UserScheduleState.daily_digest_minute,
+                UserScheduleState.updated_at,
+            )
+            .select_from(Users)
+            .outerjoin(UserScheduleState, UserScheduleState.telegram_id == Users.telegram_id)
+            .where(Users.telegram_id == telegram_id)
+        )
+        row = result.one_or_none()
+
+    if row is None:
+        return None
+
+    course_value = str(row.selected_course or '').strip() or None
+    course_label = str(row.selected_course_name or '').strip()
+    if course_value and not course_label:
+        course_label = _course_name_from_key(course_value)
+
+    return {
+        'telegram_id': row.telegram_id,
+        'username': str(row.username or '').strip() or None,
+        'referrer_id': row.referrer_id,
+        'selected_course': course_value,
+        'selected_course_name': course_label or None,
+        'selected_group': str(row.selected_group or '').strip() or None,
+        'daily_digest_enabled': _normalize_daily_digest_enabled(row.daily_digest_enabled),
+        'daily_digest_hour': _normalize_daily_digest_hour(row.daily_digest_hour),
+        'daily_digest_minute': _normalize_daily_digest_minute(row.daily_digest_minute),
+        'updated_at': row.updated_at,
+    }
+
 async def get_user_schedule_state(telegram_id: int):
     """Возвращает сохраненные настройки расписания пользователя."""
     async with get_session() as session:
