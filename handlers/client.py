@@ -53,6 +53,8 @@ def _commands_help_text():
         "<b>📚 Команды бота</b>\n\n"
         "• <code>/start</code> - открыть главное меню\n"
         "• <code>/search</code> - открыть поиск по расписанию\n"
+        "• <code>/group ИД 30.1/Б3-22</code> - выбрать группу\n"
+        "• <code>/date 14.03.26</code> - открыть расписание на дату\n"
         "• <code>/teacher Простомолотов</code> - найти расписание преподавателя\n"
         "• <code>/room 505</code> - найти расписание аудитории\n"
         "• <code>/subject Эконометрика</code> - найти расписание предмета\n"
@@ -60,6 +62,8 @@ def _commands_help_text():
         "• <code>/tomorrow</code> - показать расписание на завтра\n"
         "• <code>/help</code> - показать эту справку\n\n"
         "<b>Примеры</b>\n"
+        "• <code>/group ИД 30.1/Б3-22</code>\n"
+        "• <code>/date 14.03.26</code>\n"
         "• <code>/teacher Леденчук</code>\n"
         "• <code>/room ауд. 125</code>\n"
         "• <code>/subject Математические модели</code>"
@@ -449,6 +453,58 @@ def _group_info_for_course_name(course_name, group_code):
         if course_key in group_info_data and group_code in group_info_data[course_key]:
             return group_info_data[course_key][group_code]
     return [course_name, group_code, "Информация не найдена"]
+
+
+def _group_search_normalize_text(value):
+    """Нормализует текст для поиска группы по команде."""
+    return re.sub(r'\s+', '', _search_normalize_text(value))
+
+
+def _find_group_matches(query_text):
+    """Ищет подходящие группы по коду или направлению."""
+    normalized_query = _group_search_normalize_text(query_text)
+    if not normalized_query:
+        return []
+
+    matches = []
+    seen = set()
+
+    for course_key in sorted(schedule_data.keys(), key=lambda item: (_course_name(item), item)):
+        course_name = _course_name(course_key)
+
+        for group_code in sorted(schedule_data.get(course_key, {}).keys()):
+            dedupe_key = (course_name, group_code)
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+
+            group_normalized = _group_search_normalize_text(group_code)
+            group_info = _group_info_for_course_name(course_name, group_code)
+            direction = _normalize_cell_text(group_info[2]) if len(group_info) > 2 else ''
+            direction_normalized = _search_normalize_text(direction)
+
+            in_group = normalized_query in group_normalized
+            in_direction = normalized_query in direction_normalized
+            if not in_group and not in_direction:
+                continue
+
+            matches.append(
+                {
+                    'course_name': course_name,
+                    'group_code': group_code,
+                    'direction': direction,
+                    'sort_key': (
+                        0 if group_normalized == normalized_query else 1,
+                        0 if group_normalized.startswith(normalized_query) else 1,
+                        0 if in_group else 1,
+                        course_name,
+                        group_code,
+                    ),
+                }
+            )
+
+    matches.sort(key=lambda item: item['sort_key'])
+    return matches
 
 
 def _normalize_cell_text(value):
@@ -1623,6 +1679,123 @@ async def search_subject_command(message: types.Message, state: FSMContext):
     await _handle_search_command(message, state, 'subject')
 
 
+async def group_command(message: types.Message, state: FSMContext):
+    """Выбирает группу по команде /group."""
+    await state.finish()
+    query_text = _normalize_cell_text(message.get_args())
+    if not query_text:
+        await message.answer(
+            "⚠️ После команды укажите код группы.\nПример: <code>/group ИД 30.1/Б3-22</code>",
+            parse_mode='HTML',
+        )
+        return
+
+    matches = _find_group_matches(query_text)
+    if not matches:
+        await message.answer(
+            f"😕 По запросу <b>{html.escape(query_text)}</b> группы не найдены.",
+            parse_mode='HTML',
+        )
+        return
+
+    if len(matches) == 1:
+        match = matches[0]
+        selected_course, selected_week_index = _resolve_group_selection(match['course_name'], match['group_code'])
+        if not selected_course:
+            await message.answer('📭 Для выбранной группы нет расписания.')
+            return
+
+        week_payload = build_week_schedule_payload(selected_course, match['group_code'], selected_week_index)
+        if week_payload is None:
+            await message.answer('📭 Для выбранной группы нет расписания.')
+            return
+
+        await _update_user_selection(
+            state,
+            _telegram_id_from_message(message),
+            selected_course_name=match['course_name'],
+            selected_course=selected_course,
+            selected_group=match['group_code'],
+            selected_week_index=week_payload['selected_week_index'],
+            selected_day_index=None,
+        )
+        await message.answer(week_payload['text'], reply_markup=week_payload['keyboard'], parse_mode='HTML')
+        return
+
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    for match in matches[:10]:
+        button_text = f"👥 {match['group_code']} · {match['course_name']}"
+        keyboard.add(
+            types.InlineKeyboardButton(
+                text=button_text[:64],
+                callback_data=f"group_{match['course_name']}_{match['group_code']}",
+            )
+        )
+
+    lines = [
+        "<b>👥 Выбор группы</b>",
+        f"🔎 Запрос: <b>{html.escape(query_text)}</b>",
+        '',
+        f"Найдено вариантов: <b>{len(matches)}</b>",
+        '👇 Выберите нужную группу:',
+    ]
+    if len(matches) > 10:
+        lines.append('')
+        lines.append('Показываю первые 10 совпадений. Уточните запрос, если нужно.')
+
+    await message.answer('\n'.join(lines), reply_markup=keyboard, parse_mode='HTML')
+
+
+async def date_command(message: types.Message, state: FSMContext):
+    """Открывает расписание по конкретной дате для выбранной группы."""
+    await state.finish()
+    query_text = _normalize_cell_text(message.get_args())
+    if not query_text:
+        await message.answer(
+            "⚠️ После команды укажите дату.\nПример: <code>/date 14.03.26</code>",
+            parse_mode='HTML',
+        )
+        return
+
+    target_date = _parse_schedule_date(query_text)
+    if target_date is None:
+        await message.answer(
+            "⚠️ Не удалось распознать дату.\nПоддерживаются форматы: <code>14.03.26</code>, <code>14.03.2026</code>, <code>2026-03-14</code>.",
+            parse_mode='HTML',
+        )
+        return
+
+    user_data = await _get_user_data_with_db_fallback(state, _telegram_id_from_message(message))
+    course = user_data.get('selected_course')
+    group_code = user_data.get('selected_group')
+
+    if not course or not group_code:
+        await message.answer(
+            "ℹ️ Сначала выберите группу.\nПример: <code>/group ИД 30.1/Б3-22</code>",
+            parse_mode='HTML',
+        )
+        return
+
+    course_name = user_data.get('selected_course_name') or _course_name(course)
+    day_payload = build_day_schedule_payload_by_date(course_name, group_code, target_date)
+    if day_payload is None:
+        await message.answer(
+            f"📭 На {target_date.strftime('%d.%m.%y')} для группы {group_code} нет занятий или дата еще не опубликована."
+        )
+        return
+
+    await _update_user_selection(
+        state,
+        _telegram_id_from_message(message),
+        selected_course_name=course_name,
+        selected_course=day_payload['selected_course'],
+        selected_group=group_code,
+        selected_week_index=day_payload['selected_week_index'],
+        selected_day_index=day_payload['selected_day_index'],
+    )
+    await message.answer(day_payload['text'], reply_markup=day_payload['keyboard'], parse_mode='HTML')
+
+
 async def search_open_entity(callback_query: types.CallbackQuery, state: FSMContext):
     """Открывает расписание выбранной найденной сущности."""
     token = callback_query.data[len('search_entity_'):]
@@ -2758,6 +2931,34 @@ def _build_period_to_course(course_name, group_code):
 
     return period_items
 
+
+def _resolve_group_selection(course_name, group_code):
+    """Подбирает период и стартовую неделю для выбранной группы."""
+    period_to_course = _build_period_to_course(course_name, group_code)
+    if not period_to_course:
+        return None, None
+
+    selected_course = None
+    selected_week_index = 0
+
+    for _, course_key in period_to_course:
+        weeks = _get_available_weeks(course_key, group_code)
+        if not weeks:
+            continue
+        if _period_has_current_month(course_key, group_code, weeks):
+            selected_course = course_key
+            selected_week_index = _pick_initial_week_index(course_key, group_code, weeks)
+            break
+
+    if selected_course is None:
+        selected_course = period_to_course[0][1]
+        weeks = _get_available_weeks(selected_course, group_code)
+        if weeks:
+            selected_week_index = _pick_initial_week_index(selected_course, group_code, weeks)
+
+    return selected_course, selected_week_index
+
+
 def _get_available_weeks(course, group_code):
     """Возвращает отсортированные недели группы."""
     if course not in schedule_data:
@@ -2887,6 +3088,9 @@ def _build_group_week_timeline(course_name, group_code):
 
 def _find_day_by_date(course_name, group_code, target_date):
     """Ищет день расписания по конкретной дате среди всех периодов группы."""
+    if isinstance(target_date, datetime):
+        target_date = target_date.date()
+
     timeline = _build_group_week_timeline(course_name, group_code)
 
     for item in timeline:
@@ -3060,6 +3264,9 @@ def _build_day_view_text(course, group_code, week_label, week_days, day_index):
 
 def build_day_schedule_payload_by_date(course_name, group_code, target_date):
     """Возвращает данные страницы дня по конкретной дате."""
+    if isinstance(target_date, datetime):
+        target_date = target_date.date()
+
     target_day = _find_day_by_date(course_name, group_code, target_date)
     if target_day is None:
         return None
@@ -3080,6 +3287,30 @@ def build_day_schedule_payload_by_date(course_name, group_code, target_date):
         'week_days': target_day['week_days'],
         'text': text,
         'keyboard': _build_day_keyboard(target_day['week_days'], day_index),
+    }
+
+
+def build_week_schedule_payload(course, group_code, week_index=None):
+    """Возвращает данные страницы недели."""
+    weeks = _get_available_weeks(course, group_code)
+    if not weeks:
+        return None
+
+    if week_index is None:
+        week_index = 0
+
+    week_index = week_index % len(weeks)
+    week_label = weeks[week_index]
+    week_days = _build_week_day_items(course, group_code, week_label)
+
+    return {
+        'selected_course': course,
+        'selected_group': group_code,
+        'selected_week_index': week_index,
+        'week_label': week_label,
+        'week_days': week_days,
+        'text': _build_week_overview_text(course, group_code, week_label, week_days),
+        'keyboard': _build_week_keyboard(week_label, week_days),
     }
 
 def _build_week_keyboard(week_label, week_days):
@@ -3417,28 +3648,10 @@ async def process_group_choice(callback_query: types.CallbackQuery, state: FSMCo
         return
 
     course_name, group_code = payload.rsplit('_', 1)
-    period_to_course = _build_period_to_course(course_name, group_code)
-    if not period_to_course:
+    selected_course, selected_week_index = _resolve_group_selection(course_name, group_code)
+    if not selected_course:
         await callback_query.answer('📭 Для выбранной группы нет расписания', show_alert=True)
         return
-
-    selected_course = None
-    selected_week_index = 0
-
-    for _, course_key in period_to_course:
-        weeks = _get_available_weeks(course_key, group_code)
-        if not weeks:
-            continue
-        if _period_has_current_month(course_key, group_code, weeks):
-            selected_course = course_key
-            selected_week_index = _pick_initial_week_index(course_key, group_code, weeks)
-            break
-
-    if selected_course is None:
-        selected_course = period_to_course[0][1]
-        weeks = _get_available_weeks(selected_course, group_code)
-        if weeks:
-            selected_week_index = _pick_initial_week_index(selected_course, group_code, weeks)
 
     await _update_user_selection(
         state,
@@ -4021,6 +4234,8 @@ def register_handlers_client(dp: Dispatcher):
     dp.register_message_handler(cmd_start, commands=['start'])
     dp.register_message_handler(cmd_help, commands=['help'], state='*')
     dp.register_message_handler(search_entrypoint, commands=['search'], state='*')
+    dp.register_message_handler(group_command, commands=['group'], state='*')
+    dp.register_message_handler(date_command, commands=['date'], state='*')
     dp.register_message_handler(search_teacher_command, commands=['teacher'], state='*')
     dp.register_message_handler(search_room_command, commands=['room'], state='*')
     dp.register_message_handler(search_subject_command, commands=['subject'], state='*')

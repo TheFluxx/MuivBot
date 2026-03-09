@@ -65,6 +65,8 @@ async def configure_bot_commands():
         [
             types.BotCommand('start', 'Главное меню'),
             types.BotCommand('search', 'Поиск по расписанию'),
+            types.BotCommand('group', 'Пример: /group ИД 30.1/Б3-22'),
+            types.BotCommand('date', 'Пример: /date 14.03.26'),
             types.BotCommand('teacher', 'Пример: /teacher Простомолотов'),
             types.BotCommand('room', 'Пример: /room 505'),
             types.BotCommand('subject', 'Пример: /subject Эконометрика'),
