@@ -20,6 +20,7 @@ def get_main_keyboard():
     """Создает основную клавиатуру бота."""
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
     kb.add(types.KeyboardButton("📅 Мое расписание"))
+    kb.add(types.KeyboardButton("📊 Посещаемость"))
     kb.add(types.KeyboardButton("🔎 Поиск"))
     kb.add(types.KeyboardButton("🎉 События"))
     kb.add(types.KeyboardButton("💼 Настройки"))
@@ -352,6 +353,12 @@ def _build_starosta_users_keyboard(page_data: dict, current_group: str | None, c
 def _build_starosta_user_details_keyboard(target_telegram_id: int):
     """Строит клавиатуру карточки ученика в панели старосты."""
     keyboard = types.InlineKeyboardMarkup(row_width=1)
+    keyboard.add(
+        types.InlineKeyboardButton(
+            text='📊 Посещаемость',
+            callback_data=f'starosta_users_att_open_{target_telegram_id}',
+        )
+    )
     keyboard.add(
         types.InlineKeyboardButton(
             text='✉️ Написать ученику',
@@ -865,6 +872,333 @@ async def _render_starosta_attendance_marks(target, state: FSMContext, telegram_
     await target.answer()
     return True
 
+
+def _attendance_status_text(status: str | None):
+    """Возвращает подпись статуса посещаемости для экрана просмотра."""
+    return {
+        'present': '✅ Был',
+        'absent': '❌ Отсутствовал',
+    }.get(_normalize_cell_text(status), '⬜️ Без отметки')
+
+
+def _attendance_user_label(user_details: dict | None, telegram_id: int):
+    """Возвращает читаемое имя пользователя для экрана посещаемости."""
+    username = _normalize_cell_text((user_details or {}).get('username'))
+    if username:
+        return f'@{username}'
+    return f'ID {telegram_id}'
+
+
+def _nearest_attendance_day_index(day_groups):
+    """Возвращает индекс дня посещаемости, ближайшего к сегодняшней дате."""
+    if not day_groups:
+        return 0
+
+    today = datetime.now().date()
+    best_index = 0
+    best_key = None
+
+    for index, item in enumerate(day_groups):
+        date_obj = item.get('date_obj')
+        if date_obj is None:
+            key = (10**9, index)
+        else:
+            delta_days = (date_obj - today).days
+            key = (abs(delta_days), 0 if delta_days >= 0 else 1, index)
+
+        if best_key is None or key < best_key:
+            best_key = key
+            best_index = index
+
+    return best_index
+
+
+def _build_attendance_view_text(
+    title: str,
+    user_details: dict | None,
+    day_groups,
+    page: int,
+    *,
+    fallback_telegram_id: int,
+    empty_text: str,
+):
+    """Формирует экран просмотра посещаемости пользователя."""
+    total_present = sum(int(item.get('present_count', 0) or 0) for item in day_groups)
+    total_absent = sum(int(item.get('absent_count', 0) or 0) for item in day_groups)
+    total_marks = total_present + total_absent
+
+    current_group = _normalize_cell_text((user_details or {}).get('selected_group')) or None
+    lines = [
+        f'<b>{title}</b>',
+        '',
+        f"👤 Пользователь: <b>{html.escape(_attendance_user_label(user_details, fallback_telegram_id))}</b>",
+    ]
+
+    if current_group:
+        lines.append(f"👥 Текущая группа: <b>{html.escape(current_group)}</b>")
+
+    lines.extend(
+        [
+            f"📚 Отмечено пар: <b>{total_marks}</b>",
+            f"✅ Был: <b>{total_present}</b>",
+            f"❌ Отсутствовал: <b>{total_absent}</b>",
+        ]
+    )
+
+    if not day_groups:
+        lines.extend(['', empty_text])
+        return '\n'.join(lines)
+
+    total_pages = len(day_groups)
+    page = max(0, min(page, total_pages - 1))
+    day_group = day_groups[page]
+    groups = [
+        _normalize_cell_text(group)
+        for group in (day_group.get('groups') or [])
+        if _normalize_cell_text(group)
+    ]
+    updated_at = day_group.get('updated_at')
+
+    lines.extend(
+        [
+            '',
+            f"🗓️ Дата: <b>{html.escape(_format_search_date_caption(day_group.get('date_obj'), '', ''))}</b>",
+            f"📄 День: <b>{page + 1}/{total_pages}</b>",
+            f"👥 Группа: <b>{html.escape(', '.join(groups) if groups else 'не указана')}</b>",
+            (
+                "📊 За день: <b>"
+                f"{int(day_group.get('present_count', 0) or 0)} присутствовал(и)</b> • <b>"
+                f"{int(day_group.get('absent_count', 0) or 0)} отсутствовал(и)</b>"
+            ),
+        ]
+    )
+    if updated_at:
+        lines.append(f"🕒 Обновлено: <b>{html.escape(updated_at.strftime('%d.%m.%Y %H:%M'))}</b>")
+
+    lines.append('')
+
+    show_group_inline = len(groups) > 1
+    for index, item in enumerate(day_group.get('items') or [], 1):
+        lesson_index = int(item.get('lesson_index') or 0) or index
+        lesson_time = html.escape(_normalize_cell_text(item.get('lesson_time')) or 'Время не указано')
+        lesson_title = html.escape(_normalize_cell_text(item.get('lesson_title')) or 'Без названия')
+        line = f"{lesson_index}. {lesson_time} — {_attendance_status_text(item.get('status'))} | {lesson_title}"
+
+        group_code = _normalize_cell_text(item.get('group_code')) or None
+        if show_group_inline and group_code:
+            line += f" | {html.escape(group_code)}"
+
+        lines.append(line)
+
+    return '\n'.join(lines)
+
+
+def _build_attendance_view_keyboard(
+    *,
+    page: int,
+    total_pages: int,
+    prev_callback: str,
+    next_callback: str,
+    back_callback: str,
+    back_text: str,
+):
+    """Строит клавиатуру экрана просмотра посещаемости."""
+    keyboard = types.InlineKeyboardMarkup(row_width=3)
+
+    if total_pages > 1:
+        keyboard.row(
+            types.InlineKeyboardButton(
+                text='⬅️',
+                callback_data=prev_callback if page > 0 else 'attendance_noop',
+            ),
+            types.InlineKeyboardButton(
+                text=f'📄 {page + 1}/{total_pages}',
+                callback_data='attendance_noop',
+            ),
+            types.InlineKeyboardButton(
+                text='➡️',
+                callback_data=next_callback if page < total_pages - 1 else 'attendance_noop',
+            ),
+        )
+
+    keyboard.add(types.InlineKeyboardButton(text=back_text, callback_data=back_callback))
+    return keyboard
+
+
+def _parse_attendance_view_numbers(callback_data: str, prefix: str, expected_parts: int):
+    """Извлекает числовые параметры callback экрана просмотра посещаемости."""
+    payload = str(callback_data or '')
+    if not payload.startswith(prefix):
+        return None
+
+    parts = payload[len(prefix):].split('_')
+    if len(parts) != expected_parts:
+        return None
+
+    try:
+        return [int(part) for part in parts]
+    except (TypeError, ValueError):
+        return None
+
+
+async def _render_self_attendance_view(target, state: FSMContext, telegram_id: int, *, page: int | None, edit: bool):
+    """Показывает пользователю его собственную посещаемость."""
+    if telegram_id is None:
+        if edit:
+            await target.answer('⚠️ Пользователь не найден', show_alert=True)
+        else:
+            await target.answer('⚠️ Пользователь не найден')
+        return False
+
+    user_details = await db_commands.get_admin_user_details(telegram_id)
+    day_groups = await db_commands.get_student_attendance_days(telegram_id)
+    total_pages = max(1, len(day_groups))
+    if page is None:
+        page = _nearest_attendance_day_index(day_groups)
+    page = max(0, min(page, total_pages - 1))
+
+    text = _build_attendance_view_text(
+        '📊 Моя посещаемость',
+        user_details,
+        day_groups,
+        page,
+        fallback_telegram_id=telegram_id,
+        empty_text='Пока нет отметок посещаемости. Староста сможет отмечать пары после занятий.',
+    )
+    keyboard = _build_attendance_view_keyboard(
+        page=page,
+        total_pages=total_pages,
+        prev_callback=f'user_att_page_{page - 1}',
+        next_callback=f'user_att_page_{page + 1}',
+        back_callback='main_menu',
+        back_text='🏠 В главное меню',
+    )
+
+    if edit:
+        await _safe_edit_text(target.message, text, reply_markup=keyboard, parse_mode='HTML')
+        await target.answer()
+    else:
+        await target.answer(text, reply_markup=keyboard, parse_mode='HTML')
+    return True
+
+
+async def _render_admin_user_attendance_view(
+    target,
+    state: FSMContext,
+    viewer_telegram_id: int,
+    target_telegram_id: int,
+    *,
+    page: int | None,
+    edit: bool,
+):
+    """Показывает администратору посещаемость выбранного пользователя."""
+    if not await db_commands.is_admin_authorized(viewer_telegram_id):
+        if edit:
+            await target.answer('⚠️ Сначала войдите в админ-панель через /admin', show_alert=True)
+        else:
+            await target.answer('⚠️ Сначала войдите в админ-панель через /admin')
+        return False
+
+    user_details = await db_commands.get_admin_user_details(target_telegram_id)
+    if not user_details:
+        if edit:
+            await target.answer('⚠️ Пользователь не найден', show_alert=True)
+        else:
+            await target.answer('⚠️ Пользователь не найден')
+        return False
+
+    day_groups = await db_commands.get_student_attendance_days(target_telegram_id)
+    total_pages = max(1, len(day_groups))
+    if page is None:
+        page = _nearest_attendance_day_index(day_groups)
+    page = max(0, min(page, total_pages - 1))
+
+    text = _build_attendance_view_text(
+        '📊 Посещаемость пользователя',
+        user_details,
+        day_groups,
+        page,
+        fallback_telegram_id=target_telegram_id,
+        empty_text='У этого пользователя пока нет отметок посещаемости.',
+    )
+    keyboard = _build_attendance_view_keyboard(
+        page=page,
+        total_pages=total_pages,
+        prev_callback=f'admin_users_att_page_{target_telegram_id}_{page - 1}',
+        next_callback=f'admin_users_att_page_{target_telegram_id}_{page + 1}',
+        back_callback=f'admin_users_info_{target_telegram_id}',
+        back_text='⬅️ К карточке пользователя',
+    )
+
+    if edit:
+        await _safe_edit_text(target.message, text, reply_markup=keyboard, parse_mode='HTML')
+        await target.answer()
+    else:
+        await target.answer(text, reply_markup=keyboard, parse_mode='HTML')
+    return True
+
+
+async def _render_starosta_user_attendance_view(
+    target,
+    state: FSMContext,
+    viewer_telegram_id: int,
+    target_telegram_id: int,
+    *,
+    page: int | None,
+    edit: bool,
+):
+    """Показывает старосте посещаемость выбранного ученика."""
+    access = await db_commands.get_starosta_access(viewer_telegram_id)
+    if not access.get('has_access'):
+        if edit:
+            await target.answer('⚠️ У вас нет доступа к панели старосты', show_alert=True)
+        else:
+            await target.answer('⚠️ У вас нет доступа к панели старосты')
+        return False
+
+    user_details = await db_commands.get_admin_user_details(target_telegram_id)
+    if not user_details or not _starosta_can_view_user(access, user_details):
+        if edit:
+            await target.answer('⚠️ Ученик недоступен', show_alert=True)
+        else:
+            await target.answer('⚠️ Ученик недоступен')
+        return False
+
+    allowed_groups = None if access.get('is_super') else (access.get('groups') or [])
+    day_groups = await db_commands.get_student_attendance_days(
+        target_telegram_id,
+        allowed_group_codes=allowed_groups,
+    )
+    total_pages = max(1, len(day_groups))
+    if page is None:
+        page = _nearest_attendance_day_index(day_groups)
+    page = max(0, min(page, total_pages - 1))
+
+    text = _build_attendance_view_text(
+        '📊 Посещаемость ученика',
+        user_details,
+        day_groups,
+        page,
+        fallback_telegram_id=target_telegram_id,
+        empty_text='У этого ученика пока нет отметок посещаемости.',
+    )
+    keyboard = _build_attendance_view_keyboard(
+        page=page,
+        total_pages=total_pages,
+        prev_callback=f'starosta_users_att_page_{target_telegram_id}_{page - 1}',
+        next_callback=f'starosta_users_att_page_{target_telegram_id}_{page + 1}',
+        back_callback=f'starosta_users_info_{target_telegram_id}',
+        back_text='⬅️ К карточке ученика',
+    )
+
+    if edit:
+        await _safe_edit_text(target.message, text, reply_markup=keyboard, parse_mode='HTML')
+        await target.answer()
+    else:
+        await target.answer(text, reply_markup=keyboard, parse_mode='HTML')
+    return True
+
+
 def _build_admin_panel_keyboard():
     """Строит клавиатуру админ-панели."""
     keyboard = types.InlineKeyboardMarkup(row_width=2)
@@ -1360,6 +1694,12 @@ def _build_admin_user_details_text(user_details: dict):
 def _build_admin_user_details_keyboard(target_telegram_id: int, user_details: dict | None = None):
     """Строит клавиатуру карточки пользователя."""
     keyboard = types.InlineKeyboardMarkup(row_width=1)
+    keyboard.add(
+        types.InlineKeyboardButton(
+            text='📊 Посещаемость',
+            callback_data=f'admin_users_att_open_{target_telegram_id}',
+        )
+    )
     keyboard.add(
         types.InlineKeyboardButton(
             text='✉️ Написать пользователю',
@@ -2708,6 +3048,41 @@ async def admin_users_show_details(callback_query: types.CallbackQuery, state: F
     )
 
 
+async def admin_users_open_attendance(callback_query: types.CallbackQuery, state: FSMContext):
+    """Открывает посещаемость выбранного пользователя для администратора."""
+    parsed = _parse_attendance_view_numbers(callback_query.data, 'admin_users_att_open_', 1)
+    if parsed is None:
+        await callback_query.answer('⚠️ Пользователь не найден', show_alert=True)
+        return
+
+    await _render_admin_user_attendance_view(
+        callback_query,
+        state,
+        _telegram_id_from_callback(callback_query),
+        parsed[0],
+        page=None,
+        edit=True,
+    )
+
+
+async def admin_users_change_attendance_page(callback_query: types.CallbackQuery, state: FSMContext):
+    """Листает дни посещаемости выбранного пользователя для администратора."""
+    parsed = _parse_attendance_view_numbers(callback_query.data, 'admin_users_att_page_', 2)
+    if parsed is None:
+        await callback_query.answer('⚠️ Не удалось открыть страницу', show_alert=True)
+        return
+
+    target_telegram_id, page = parsed
+    await _render_admin_user_attendance_view(
+        callback_query,
+        state,
+        _telegram_id_from_callback(callback_query),
+        target_telegram_id,
+        page=page,
+        edit=True,
+    )
+
+
 async def admin_message_cancel(callback_query: types.CallbackQuery, state: FSMContext):
     """Отменяет ввод админ-сообщения и возвращает предыдущий экран."""
     telegram_id = _telegram_id_from_callback(callback_query)
@@ -2816,6 +3191,41 @@ async def starosta_users_show_details(callback_query: types.CallbackQuery, state
         callback_query,
         telegram_id,
         target_telegram_id,
+        edit=True,
+    )
+
+
+async def starosta_users_open_attendance(callback_query: types.CallbackQuery, state: FSMContext):
+    """Открывает посещаемость выбранного ученика для старосты."""
+    parsed = _parse_attendance_view_numbers(callback_query.data, 'starosta_users_att_open_', 1)
+    if parsed is None:
+        await callback_query.answer('⚠️ Ученик не найден', show_alert=True)
+        return
+
+    await _render_starosta_user_attendance_view(
+        callback_query,
+        state,
+        _telegram_id_from_callback(callback_query),
+        parsed[0],
+        page=None,
+        edit=True,
+    )
+
+
+async def starosta_users_change_attendance_page(callback_query: types.CallbackQuery, state: FSMContext):
+    """Листает дни посещаемости выбранного ученика для старосты."""
+    parsed = _parse_attendance_view_numbers(callback_query.data, 'starosta_users_att_page_', 2)
+    if parsed is None:
+        await callback_query.answer('⚠️ Не удалось открыть страницу', show_alert=True)
+        return
+
+    target_telegram_id, page = parsed
+    await _render_starosta_user_attendance_view(
+        callback_query,
+        state,
+        _telegram_id_from_callback(callback_query),
+        target_telegram_id,
+        page=page,
         edit=True,
     )
 
@@ -3599,6 +4009,27 @@ async def user_events_noop(callback_query: types.CallbackQuery):
     await callback_query.answer()
 
 
+async def user_attendance_change_page(callback_query: types.CallbackQuery, state: FSMContext):
+    """Листает дни на экране собственной посещаемости."""
+    parsed = _parse_attendance_view_numbers(callback_query.data, 'user_att_page_', 1)
+    if parsed is None:
+        await callback_query.answer('⚠️ Не удалось открыть страницу', show_alert=True)
+        return
+
+    await _render_self_attendance_view(
+        callback_query,
+        state,
+        _telegram_id_from_callback(callback_query),
+        page=parsed[0],
+        edit=True,
+    )
+
+
+async def attendance_noop(callback_query: types.CallbackQuery):
+    """Служебная кнопка экрана посещаемости."""
+    await callback_query.answer()
+
+
 async def admin_users_noop(callback_query: types.CallbackQuery):
     """Служебная кнопка пагинации в админ-панели."""
     await callback_query.answer()
@@ -3718,6 +4149,17 @@ async def _render_settings_view(target_message: types.Message, state: FSMContext
 async def settings(message: types.Message, state: FSMContext):
     """Показывает раздел настроек."""
     await _render_settings_view(message, state, _telegram_id_from_message(message), edit=False)
+
+
+async def user_attendance(message: types.Message, state: FSMContext):
+    """Показывает пользователю его посещаемость."""
+    await _render_self_attendance_view(
+        message,
+        state,
+        _telegram_id_from_message(message),
+        page=None,
+        edit=False,
+    )
 
 # Словари для хранения расписания
 schedule_data = {}
@@ -7826,6 +8268,7 @@ def register_handlers_client(dp: Dispatcher):
     dp.register_message_handler(user_events, text='🎉 События', state='*')
     dp.register_message_handler(settings, text='💼 Настройки')
     dp.register_message_handler(my_schedule, text='📅 Мое расписание')
+    dp.register_message_handler(user_attendance, text='📊 Посещаемость')
     dp.register_message_handler(schedule_today, lambda message: message.text and message.text.casefold() == 'на сегодня')
     dp.register_message_handler(schedule_tomorrow, lambda message: message.text and message.text.casefold() == 'на завтра')
     dp.register_message_handler(admin_receive_login, state=AdminAuthDialog.waiting_login)
@@ -7898,6 +8341,8 @@ def register_handlers_client(dp: Dispatcher):
     dp.register_callback_query_handler(starosta_users_change_page, Text(startswith='starosta_users_page_'), state='*')
     dp.register_callback_query_handler(starosta_users_back_to_list, Text(equals='starosta_users_back'), state='*')
     dp.register_callback_query_handler(starosta_users_show_details, Text(startswith='starosta_users_info_'), state='*')
+    dp.register_callback_query_handler(starosta_users_open_attendance, Text(startswith='starosta_users_att_open_'), state='*')
+    dp.register_callback_query_handler(starosta_users_change_attendance_page, Text(startswith='starosta_users_att_page_'), state='*')
     dp.register_callback_query_handler(starosta_start_single_message, Text(startswith='starosta_users_message_'), state='*')
     dp.register_callback_query_handler(starosta_start_group_message, Text(equals='starosta_group_message'), state='*')
     dp.register_callback_query_handler(starosta_start_group_message, Text(equals='starosta_users_broadcast'), state='*')
@@ -7921,6 +8366,8 @@ def register_handlers_client(dp: Dispatcher):
     dp.register_callback_query_handler(admin_users_back_to_list, Text(equals='admin_users_back'), state='*')
     dp.register_callback_query_handler(admin_users_start_filtered_message, Text(equals='admin_users_broadcast'), state='*')
     dp.register_callback_query_handler(admin_users_start_single_message, Text(startswith='admin_users_message_'), state='*')
+    dp.register_callback_query_handler(admin_users_open_attendance, Text(startswith='admin_users_att_open_'), state='*')
+    dp.register_callback_query_handler(admin_users_change_attendance_page, Text(startswith='admin_users_att_page_'), state='*')
     dp.register_callback_query_handler(admin_message_cancel, Text(equals='admin_message_cancel'), state='*')
     dp.register_callback_query_handler(admin_users_toggle_starosta_assignment, Text(startswith='admin_users_starosta_toggle_'), state='*')
     dp.register_callback_query_handler(admin_users_show_details, Text(startswith='admin_users_info_'), state='*')
@@ -7940,4 +8387,6 @@ def register_handlers_client(dp: Dispatcher):
     dp.register_callback_query_handler(user_events_shift_detail, Text(startswith='events_next_'), state='*')
     dp.register_callback_query_handler(user_events_open_attachment, Text(startswith='events_media_'), state='*')
     dp.register_callback_query_handler(user_events_noop, Text(equals='events_noop'), state='*')
+    dp.register_callback_query_handler(user_attendance_change_page, Text(startswith='user_att_page_'), state='*')
+    dp.register_callback_query_handler(attendance_noop, Text(equals='attendance_noop'), state='*')
     dp.register_callback_query_handler(change_group, Text(startswith="change_group"))

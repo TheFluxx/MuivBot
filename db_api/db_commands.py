@@ -862,6 +862,92 @@ async def upsert_group_attendance_mark(
         }
 
 
+async def get_student_attendance_days(telegram_id: int, allowed_group_codes: list[str] | None = None):
+    """Возвращает отметки посещаемости ученика, сгруппированные по датам."""
+    try:
+        normalized_telegram_id = int(telegram_id)
+    except (TypeError, ValueError):
+        return []
+
+    normalized_allowed_groups = sorted(
+        {
+            str(group).strip()
+            for group in (allowed_group_codes or [])
+            if str(group).strip()
+        },
+        key=str.casefold,
+    )
+
+    async with get_session() as session:
+        query = select(
+            GroupAttendanceMark.group_code,
+            GroupAttendanceMark.target_date,
+            GroupAttendanceMark.lesson_index,
+            GroupAttendanceMark.lesson_time,
+            GroupAttendanceMark.lesson_title,
+            GroupAttendanceMark.status,
+            GroupAttendanceMark.updated_at,
+        ).where(GroupAttendanceMark.student_telegram_id == normalized_telegram_id)
+
+        if normalized_allowed_groups:
+            query = query.where(GroupAttendanceMark.group_code.in_(normalized_allowed_groups))
+
+        result = await session.execute(
+            query.order_by(
+                GroupAttendanceMark.target_date.desc(),
+                GroupAttendanceMark.lesson_index.asc(),
+                GroupAttendanceMark.group_code.asc(),
+            )
+        )
+        rows = result.all()
+
+    days = []
+    current_day = None
+    current_date = None
+
+    for row in rows:
+        target_date = row.target_date
+        if target_date != current_date:
+            current_date = target_date
+            current_day = {
+                'date_obj': target_date,
+                'groups': [],
+                'items': [],
+                'present_count': 0,
+                'absent_count': 0,
+                'updated_at': row.updated_at,
+            }
+            days.append(current_day)
+
+        group_code = str(row.group_code or '').strip()
+        if group_code and group_code not in current_day['groups']:
+            current_day['groups'].append(group_code)
+
+        status = _normalize_attendance_status(row.status)
+        if status == 'present':
+            current_day['present_count'] += 1
+        elif status == 'absent':
+            current_day['absent_count'] += 1
+
+        if row.updated_at and (
+            current_day.get('updated_at') is None or row.updated_at > current_day['updated_at']
+        ):
+            current_day['updated_at'] = row.updated_at
+
+        current_day['items'].append(
+            {
+                'group_code': group_code or None,
+                'lesson_index': int(row.lesson_index or 0),
+                'lesson_time': str(row.lesson_time or '').strip() or None,
+                'lesson_title': str(row.lesson_title or '').strip() or None,
+                'status': status,
+                'updated_at': row.updated_at,
+            }
+        )
+
+    return days
+
+
 def _event_row_to_dict(event_row: BotEvent | None):
     if event_row is None:
         return None
