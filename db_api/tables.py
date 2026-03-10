@@ -39,6 +39,33 @@ class BotAdminSession(Base):
 
 
 
+class BotStarostaSession(Base):
+    """Авторизованная сессия главной старосты в Telegram-боте."""
+
+    __tablename__ = 'bot_starosta_sessions'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    telegram_id = Column(BigInteger, nullable=False, unique=True, index=True)
+    login = Column(String(128), nullable=False)
+    authorized_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+
+class GroupStarostaAssignment(Base):
+    """Назначение старосты на конкретную группу."""
+
+    __tablename__ = 'group_starosta_assignments'
+    __table_args__ = (
+        UniqueConstraint('group_code', name='uq_group_starosta_group_code'),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    group_code = Column(String(64), nullable=False, index=True)
+    telegram_id = Column(BigInteger, nullable=False, index=True)
+    assigned_by_telegram_id = Column(BigInteger, nullable=True, index=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 class UserScheduleState(Base):
     """Сохраненное состояние выбора расписания для пользователя."""
 

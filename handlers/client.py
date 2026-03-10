@@ -13,7 +13,7 @@ from aiogram.utils.exceptions import MessageNotModified
 import xlrd
 from db_api import db_commands
 from create_bot import bot
-from data.config import ADMIN_LOGIN, ADMIN_PASSWORD
+from data.config import ADMIN_LOGIN, ADMIN_PASSWORD, STAROSTA_LOGIN, STAROSTA_PASSWORD
 
 # Создаем клавиатуру
 def get_main_keyboard():
@@ -39,7 +39,18 @@ class AdminAuthDialog(StatesGroup):
     waiting_password = State()
 
 
+class StarostaAuthDialog(StatesGroup):
+    """Состояния входа в панель старосты."""
+
+    waiting_login = State()
+    waiting_password = State()
+
+
 class AdminMessageDialog(StatesGroup):
+    waiting_text = State()
+
+
+class StarostaMessageDialog(StatesGroup):
     waiting_text = State()
 
 
@@ -80,6 +91,7 @@ def _commands_help_text():
         "• <code>/today</code> - показать расписание на сегодня\n"
         "• <code>/tomorrow</code> - показать расписание на завтра\n"
         "• <code>/admin</code> - вход в админ-панель\n"
+        "• <code>/starosta</code> - вход в панель старосты\n"
         "• <code>/help</code> - показать эту справку\n\n"
         "<b>Примеры</b>\n"
         "• <code>/group ИД 30.1/Б3-22</code>\n"
@@ -87,7 +99,8 @@ def _commands_help_text():
         "• <code>/teacher Леденчук</code>\n"
         "• <code>/room ауд. 125</code>\n"
         "• <code>/subject Математические модели</code>\n"
-        "• <code>/admin</code>"
+        "• <code>/admin</code>\n"
+        "• <code>/starosta</code>"
     )
 
 
@@ -185,6 +198,214 @@ def _is_admin_credentials_valid(login_text: str, password_text: str) -> bool:
     )
 
 
+def _starosta_panel_enabled():
+    """Проверяет, настроен ли вход главной старосты через .env."""
+    return bool(_normalize_cell_text(STAROSTA_LOGIN) and _normalize_cell_text(STAROSTA_PASSWORD))
+
+
+def _is_starosta_credentials_valid(login_text: str, password_text: str) -> bool:
+    """Проверяет логин и пароль главной старосты."""
+    normalized_login = _normalize_cell_text(login_text)
+    normalized_password = _normalize_cell_text(password_text)
+    return (
+        secrets.compare_digest(normalized_login, _normalize_cell_text(STAROSTA_LOGIN))
+        and secrets.compare_digest(normalized_password, _normalize_cell_text(STAROSTA_PASSWORD))
+    )
+
+
+async def _resolve_starosta_context(state: FSMContext, telegram_id: int):
+    """Возвращает права старосты, доступные группы и текущую выбранную группу."""
+    access = await db_commands.get_starosta_access(telegram_id)
+    if access.get('is_super'):
+        available_groups = await db_commands.get_admin_user_group_filters()
+    else:
+        available_groups = sorted(
+            {
+                _normalize_cell_text(group)
+                for group in access.get('groups') or []
+                if _normalize_cell_text(group)
+            },
+            key=str.casefold,
+        )
+
+    user_data = await state.get_data()
+    current_group = _normalize_cell_text(user_data.get('starosta_group_filter')) or None
+    if current_group not in available_groups:
+        current_group = available_groups[0] if available_groups else None
+
+    try:
+        current_page = int(user_data.get('starosta_users_page', 0))
+    except (TypeError, ValueError):
+        current_page = 0
+
+    await state.update_data(
+        starosta_group_filter=current_group,
+        starosta_users_page=max(0, current_page),
+    )
+    return access, available_groups, current_group
+
+
+def _build_starosta_panel_text(access: dict, current_group: str | None, students_count: int):
+    """Формирует текст панели старосты."""
+    groups = access.get('groups') or []
+    role_text = 'Главная староста' if access.get('is_super') else 'Староста группы'
+    groups_text = 'Все группы' if access.get('is_super') else (', '.join(groups) if groups else 'нет доступа')
+
+    lines = [
+        '<b>⭐ Панель старосты</b>',
+        '',
+        f"👤 Роль: <b>{html.escape(role_text)}</b>",
+        f"👥 Текущая группа: <b>{html.escape(current_group or 'не выбрана')}</b>",
+        f"📚 Доступные группы: <b>{html.escape(groups_text)}</b>",
+        f"👨‍🎓 Пользователей в группе: <b>{students_count}</b>",
+    ]
+    return '\n'.join(lines)
+
+
+def _build_starosta_panel_keyboard(current_group: str | None, can_switch_groups: bool, has_group: bool):
+    """Строит клавиатуру панели старосты."""
+    keyboard = types.InlineKeyboardMarkup(row_width=2)
+    if has_group:
+        keyboard.add(
+            types.InlineKeyboardButton(
+                text=f"👥 {current_group}" if current_group else '👥 Выбрать группу',
+                callback_data='starosta_group_pick_0' if can_switch_groups else 'starosta_noop',
+            )
+        )
+        keyboard.row(
+            types.InlineKeyboardButton(text='👨‍🎓 Ученики', callback_data='starosta_users'),
+            types.InlineKeyboardButton(text='📣 Написать группе', callback_data='starosta_group_message'),
+        )
+    keyboard.row(
+        types.InlineKeyboardButton(text='🔄 Обновить', callback_data='starosta_open'),
+        types.InlineKeyboardButton(text='🚪 Выйти', callback_data='starosta_logout'),
+    )
+    keyboard.add(types.InlineKeyboardButton(text='🏠 В главное меню', callback_data='main_menu'))
+    return keyboard
+
+
+def _build_starosta_users_text(page_data: dict, group_label: str | None):
+    """Формирует текст списка учеников для панели старосты."""
+    current_page = page_data.get('page', 0) + 1
+    total_pages = page_data.get('total_pages', 1)
+    lines = [
+        '<b>👨‍🎓 Ученики группы</b>',
+        '',
+        f"👥 Группа: <b>{html.escape(group_label or 'не выбрана')}</b>",
+        f"📄 Страница: <b>{current_page}/{total_pages}</b> • Найдено: <b>{page_data.get('total', 0)}</b>",
+        '',
+    ]
+
+    if not (page_data.get('items') or []):
+        lines.append('По выбранной группе пользователи не найдены.')
+    else:
+        lines.append('Нажмите на ученика ниже, чтобы открыть карточку.')
+
+    return '\n'.join(lines)
+
+
+def _build_starosta_users_keyboard(page_data: dict, current_group: str | None, can_switch_groups: bool):
+    """Строит клавиатуру списка учеников для панели старосты."""
+    keyboard = types.InlineKeyboardMarkup(row_width=2)
+    if current_group:
+        keyboard.row(
+            types.InlineKeyboardButton(
+                text=f"👥 {current_group}",
+                callback_data='starosta_group_pick_0' if can_switch_groups else 'starosta_noop',
+            ),
+            types.InlineKeyboardButton(text='📣 Написать группе', callback_data='starosta_users_broadcast'),
+        )
+
+    for item in page_data.get('items') or []:
+        keyboard.add(
+            types.InlineKeyboardButton(
+                text=_build_admin_user_button_text(item),
+                callback_data=f"starosta_users_info_{item.get('telegram_id')}",
+            )
+        )
+
+    total_pages = max(1, int(page_data.get('total_pages', 1)))
+    current_page = max(0, int(page_data.get('page', 0)))
+    if total_pages > 1:
+        keyboard.row(
+            types.InlineKeyboardButton(
+                text='⬅️',
+                callback_data='starosta_users_page_-1' if current_page > 0 else 'starosta_noop',
+            ),
+            types.InlineKeyboardButton(
+                text=f'📄 Стр. {current_page + 1}/{total_pages}',
+                callback_data='starosta_noop',
+            ),
+            types.InlineKeyboardButton(
+                text='➡️',
+                callback_data='starosta_users_page_1' if current_page < total_pages - 1 else 'starosta_noop',
+            ),
+        )
+
+    keyboard.row(
+        types.InlineKeyboardButton(text='🔄 Обновить список', callback_data='starosta_users'),
+        types.InlineKeyboardButton(text='⬅️ В панель старосты', callback_data='starosta_open'),
+    )
+    return keyboard
+
+
+def _build_starosta_user_details_keyboard(target_telegram_id: int):
+    """Строит клавиатуру карточки ученика в панели старосты."""
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    keyboard.add(
+        types.InlineKeyboardButton(
+            text='✉️ Написать ученику',
+            callback_data=f'starosta_users_message_{target_telegram_id}',
+        )
+    )
+    keyboard.add(types.InlineKeyboardButton(text='⬅️ К списку учеников', callback_data='starosta_users_back'))
+    keyboard.row(
+        types.InlineKeyboardButton(text='🔄 Обновить список', callback_data='starosta_users'),
+        types.InlineKeyboardButton(text='⬅️ В панель старосты', callback_data='starosta_open'),
+    )
+    return keyboard
+
+
+def _build_starosta_message_compose_text(
+    mode: str,
+    *,
+    target_label: str | None = None,
+    recipients_count: int | None = None,
+    group_label: str | None = None,
+):
+    """Формирует экран ввода сообщения от старосты."""
+    if mode == 'single':
+        return '\n'.join(
+            [
+                '<b>✉️ Сообщение ученику</b>',
+                '',
+                f"Получатель: <b>{html.escape(target_label or 'неизвестно')}</b>",
+                '',
+                'Отправьте следующим сообщением текст.',
+                'Для отмены нажмите кнопку ниже или напишите «Отмена».',
+            ]
+        )
+
+    return '\n'.join(
+        [
+            '<b>📣 Сообщение группе</b>',
+            '',
+            f"👥 Группа: <b>{html.escape(group_label or 'не выбрана')}</b>",
+            f"👤 Получателей: <b>{int(recipients_count or 0)}</b>",
+            '',
+            'Отправьте следующим сообщением текст рассылки.',
+            'Для отмены нажмите кнопку ниже или напишите «Отмена».',
+        ]
+    )
+
+
+def _build_starosta_message_compose_keyboard():
+    """Строит клавиатуру экрана ввода сообщения от старосты."""
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    keyboard.add(types.InlineKeyboardButton(text='⬅️ Отмена', callback_data='starosta_message_cancel'))
+    return keyboard
+
+
 def _build_admin_panel_keyboard():
     """Строит клавиатуру админ-панели."""
     keyboard = types.InlineKeyboardMarkup(row_width=2)
@@ -256,6 +477,317 @@ async def _render_admin_panel(target, telegram_id, *, edit: bool):
     return True
 
 
+def _starosta_can_access_group(access: dict, group_code: str | None):
+    """Проверяет, доступна ли группа текущей старосте."""
+    normalized_group = _normalize_cell_text(group_code) or None
+    if access.get('is_super'):
+        return True
+    return bool(normalized_group and normalized_group in (access.get('groups') or []))
+
+
+async def _render_starosta_panel(target, state: FSMContext, telegram_id: int, *, edit: bool):
+    """Показывает панель старосты."""
+    access, available_groups, current_group = await _resolve_starosta_context(state, telegram_id)
+    if not access.get('has_access'):
+        if edit:
+            await target.answer('⚠️ У вас нет доступа к панели старосты', show_alert=True)
+        else:
+            await target.answer('⚠️ У вас нет доступа к панели старосты')
+        return False
+
+    recipients = []
+    if current_group:
+        recipients = await db_commands.get_admin_message_recipients(
+            group_code=current_group,
+            allowed_group_codes=None if access.get('is_super') else available_groups,
+        )
+
+    text = _build_starosta_panel_text(access, current_group, len(recipients))
+    keyboard = _build_starosta_panel_keyboard(
+        current_group,
+        can_switch_groups=bool(access.get('is_super') or len(available_groups) > 1),
+        has_group=bool(current_group),
+    )
+
+    if edit:
+        await _safe_edit_text(target.message, text, reply_markup=keyboard, parse_mode='HTML')
+        await target.answer()
+    else:
+        await target.answer(text, reply_markup=keyboard, parse_mode='HTML')
+    return True
+
+
+async def starosta_command(message: types.Message, state: FSMContext):
+    """Открывает панель старосты или запускает вход главной старосты."""
+    await state.finish()
+    telegram_id = _telegram_id_from_message(message)
+    access = await db_commands.get_starosta_access(telegram_id)
+    if access.get('has_access'):
+        await _render_starosta_panel(message, state, telegram_id, edit=False)
+        return
+
+    if not _starosta_panel_enabled():
+        await message.answer('⚠️ Вас не назначили старостой, а вход главной старосты не настроен.')
+        return
+
+    await state.set_state(StarostaAuthDialog.waiting_login.state)
+    await message.answer(
+        "⭐ Вход в панель старосты\n\nВведите логин.\nДля отмены напишите <b>Отмена</b>.",
+        parse_mode='HTML',
+    )
+
+
+async def starosta_receive_login(message: types.Message, state: FSMContext):
+    """Принимает логин главной старосты."""
+    text_value = _normalize_cell_text(message.text)
+    if not text_value:
+        await message.answer('Введите логин.')
+        return
+
+    if _search_normalize_text(text_value) in {'отмена', 'cancel'}:
+        await state.finish()
+        await message.answer('Вход в панель старосты отменен.', reply_markup=get_main_keyboard())
+        return
+
+    await state.update_data(starosta_login=text_value)
+    await state.set_state(StarostaAuthDialog.waiting_password.state)
+    await message.answer(
+        "🔒 Теперь введите пароль.\nДля отмены напишите <b>Отмена</b>.",
+        parse_mode='HTML',
+    )
+
+
+async def starosta_receive_password(message: types.Message, state: FSMContext):
+    """Принимает пароль и выполняет вход главной старосты."""
+    password_text = _normalize_cell_text(message.text)
+    if not password_text:
+        await message.answer('Введите пароль.')
+        return
+
+    if _search_normalize_text(password_text) in {'отмена', 'cancel'}:
+        await state.finish()
+        await message.answer('Вход в панель старосты отменен.', reply_markup=get_main_keyboard())
+        return
+
+    state_data = await state.get_data()
+    login_text = state_data.get('starosta_login', '')
+
+    if not _is_starosta_credentials_valid(login_text, password_text):
+        await state.set_state(StarostaAuthDialog.waiting_login.state)
+        await state.update_data(starosta_login=None)
+        await message.answer(
+            "⚠️ Неверный логин или пароль.\nВведите логин заново или напишите <b>Отмена</b>.",
+            parse_mode='HTML',
+        )
+        return
+
+    telegram_id = _telegram_id_from_message(message)
+    await db_commands.authorize_starosta(telegram_id, login_text)
+    await state.finish()
+    await message.answer('✅ Вход выполнен.')
+    await _render_starosta_panel(message, state, telegram_id, edit=False)
+
+
+async def starosta_open(callback_query: types.CallbackQuery, state: FSMContext):
+    """Открывает панель старосты по callback."""
+    await _render_starosta_panel(callback_query, state, _telegram_id_from_callback(callback_query), edit=True)
+
+
+async def starosta_logout(callback_query: types.CallbackQuery, state: FSMContext):
+    """Выходит из панели старосты."""
+    telegram_id = _telegram_id_from_callback(callback_query)
+    if telegram_id is not None:
+        await db_commands.revoke_starosta(telegram_id)
+
+    await state.finish()
+    await _safe_edit_text(
+        callback_query.message,
+        "🔒 Вы вышли из панели старосты.",
+        reply_markup=types.InlineKeyboardMarkup().add(
+            types.InlineKeyboardButton(text='🏠 В главное меню', callback_data='main_menu')
+        ),
+    )
+    await callback_query.answer()
+
+
+def _build_starosta_group_picker_keyboard(groups: list[str], current_group: str | None, page: int):
+    """Строит клавиатуру выбора группы в панели старосты."""
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    total_pages = max(1, (len(groups) + ADMIN_FILTER_PAGE_SIZE - 1) // ADMIN_FILTER_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    start = page * ADMIN_FILTER_PAGE_SIZE
+    end = start + ADMIN_FILTER_PAGE_SIZE
+
+    for absolute_index in range(start, min(end, len(groups))):
+        group_code = groups[absolute_index]
+        marker = '✅ ' if group_code == current_group else ''
+        keyboard.add(
+            types.InlineKeyboardButton(
+                text=f'{marker}{group_code}',
+                callback_data=f'starosta_group_set_{absolute_index}',
+            )
+        )
+
+    if total_pages > 1:
+        keyboard.row(
+            types.InlineKeyboardButton(
+                text='⬅️',
+                callback_data=f'starosta_group_pick_{page - 1}' if page > 0 else 'starosta_noop',
+            ),
+            types.InlineKeyboardButton(text=f'📄 {page + 1}/{total_pages}', callback_data='starosta_noop'),
+            types.InlineKeyboardButton(
+                text='➡️',
+                callback_data=f'starosta_group_pick_{page + 1}' if page < total_pages - 1 else 'starosta_noop',
+            ),
+        )
+
+    keyboard.add(types.InlineKeyboardButton(text='⬅️ В панель старосты', callback_data='starosta_open'))
+    return keyboard
+
+
+async def starosta_pick_group(callback_query: types.CallbackQuery, state: FSMContext):
+    """Показывает выбор группы для панели старосты."""
+    telegram_id = _telegram_id_from_callback(callback_query)
+    access, available_groups, current_group = await _resolve_starosta_context(state, telegram_id)
+    if not access.get('has_access'):
+        await callback_query.answer('⚠️ У вас нет доступа к панели старосты', show_alert=True)
+        return
+
+    try:
+        page = int(callback_query.data.rsplit('_', 1)[1])
+    except (TypeError, ValueError, IndexError):
+        page = 0
+
+    if not available_groups:
+        await callback_query.answer('Для вас пока не назначены группы.', show_alert=True)
+        return
+
+    text = (
+        '<b>👥 Выбор группы</b>\n\n'
+        f"Текущая группа: <b>{html.escape(current_group or 'не выбрана')}</b>\n"
+        'Выберите группу из списка ниже.'
+    )
+    keyboard = _build_starosta_group_picker_keyboard(available_groups, current_group, page)
+    await _safe_edit_text(callback_query.message, text, reply_markup=keyboard, parse_mode='HTML')
+    await callback_query.answer()
+
+
+async def starosta_set_group(callback_query: types.CallbackQuery, state: FSMContext):
+    """Сохраняет выбранную группу в панели старосты."""
+    telegram_id = _telegram_id_from_callback(callback_query)
+    access, available_groups, _ = await _resolve_starosta_context(state, telegram_id)
+    if not access.get('has_access'):
+        await callback_query.answer('⚠️ У вас нет доступа к панели старосты', show_alert=True)
+        return
+
+    try:
+        index = int(callback_query.data.rsplit('_', 1)[1])
+    except (TypeError, ValueError, IndexError):
+        await callback_query.answer('⚠️ Некорректная группа', show_alert=True)
+        return
+
+    if index < 0 or index >= len(available_groups):
+        await callback_query.answer('⚠️ Группа не найдена', show_alert=True)
+        return
+
+    await state.update_data(
+        starosta_group_filter=available_groups[index],
+        starosta_users_page=0,
+    )
+    await _render_starosta_panel(callback_query, state, telegram_id, edit=True)
+
+
+async def _build_starosta_users_view_payload(state: FSMContext, telegram_id: int):
+    """Собирает экран списка учеников для панели старосты."""
+    access, available_groups, current_group = await _resolve_starosta_context(state, telegram_id)
+    if not access.get('has_access'):
+        return None, None
+
+    user_data = await state.get_data()
+    try:
+        page = int(user_data.get('starosta_users_page', 0))
+    except (TypeError, ValueError):
+        page = 0
+
+    page_data = await db_commands.get_admin_users_page(
+        group_code=current_group,
+        page=page,
+        page_size=ADMIN_USERS_PAGE_SIZE,
+        allowed_group_codes=None if access.get('is_super') else available_groups,
+    )
+    if page_data.get('page', 0) != page:
+        page = page_data['page']
+        await state.update_data(starosta_users_page=page)
+
+    text = _build_starosta_users_text(page_data, current_group)
+    keyboard = _build_starosta_users_keyboard(
+        page_data,
+        current_group,
+        can_switch_groups=bool(access.get('is_super') or len(available_groups) > 1),
+    )
+    return text, keyboard
+
+
+async def _render_starosta_users_view(target, state: FSMContext, telegram_id: int, *, edit: bool):
+    """Показывает список учеников в панели старосты."""
+    access = await db_commands.get_starosta_access(telegram_id)
+    if not access.get('has_access'):
+        if edit:
+            await target.answer('⚠️ У вас нет доступа к панели старосты', show_alert=True)
+        else:
+            await target.answer('⚠️ У вас нет доступа к панели старосты')
+        return False
+
+    text, keyboard = await _build_starosta_users_view_payload(state, telegram_id)
+    if text is None:
+        await target.answer('⚠️ Нет доступных групп', show_alert=True)
+        return False
+
+    if edit:
+        await _safe_edit_text(target.message, text, reply_markup=keyboard, parse_mode='HTML')
+        await target.answer()
+    else:
+        await target.answer(text, reply_markup=keyboard, parse_mode='HTML')
+    return True
+
+
+def _starosta_can_view_user(access: dict, user_details: dict):
+    """Проверяет, доступен ли пользователь старосте."""
+    if access.get('is_super'):
+        return True
+    group_code = _normalize_cell_text(user_details.get('selected_group')) or None
+    return bool(group_code and group_code in (access.get('groups') or []))
+
+
+async def _render_starosta_user_details_view(target, telegram_id: int, target_telegram_id: int, *, edit: bool):
+    """Показывает карточку ученика в панели старосты."""
+    access = await db_commands.get_starosta_access(telegram_id)
+    if not access.get('has_access'):
+        if edit:
+            await target.answer('⚠️ У вас нет доступа к панели старосты', show_alert=True)
+        else:
+            await target.answer('⚠️ У вас нет доступа к панели старосты')
+        return False
+
+    user_details = await db_commands.get_admin_user_details(target_telegram_id)
+    if not user_details or not _starosta_can_view_user(access, user_details):
+        if edit:
+            await target.answer('⚠️ Ученик недоступен', show_alert=True)
+        else:
+            await target.answer('⚠️ Ученик недоступен')
+        return False
+
+    text = _build_admin_user_details_text(user_details)
+    keyboard = _build_starosta_user_details_keyboard(target_telegram_id)
+
+    if edit:
+        await _safe_edit_text(target.message, text, reply_markup=keyboard, parse_mode='HTML')
+        await target.answer()
+    else:
+        await target.answer(text, reply_markup=keyboard, parse_mode='HTML')
+    return True
+
+
 async def admin_open(callback_query: types.CallbackQuery, state: FSMContext):
     """Открывает админ-панель по callback-кнопке."""
     await _render_admin_panel(callback_query, _telegram_id_from_callback(callback_query), edit=True)
@@ -287,13 +819,14 @@ def _get_admin_users_view_state(user_data):
     """Возвращает сохраненные фильтры и страницу списка пользователей."""
     course_filter = _normalize_cell_text(user_data.get('admin_users_course_filter')) or None
     group_filter = _normalize_cell_text(user_data.get('admin_users_group_filter')) or None
+    starosta_only = bool(user_data.get('admin_users_starosta_only'))
 
     try:
         page = int(user_data.get('admin_users_page', 0))
     except (TypeError, ValueError):
         page = 0
 
-    return course_filter, group_filter, max(0, page)
+    return course_filter, group_filter, max(0, page), starosta_only
 
 
 def _short_admin_button_text(prefix: str, value: str, fallback: str, limit: int = 24):
@@ -342,6 +875,12 @@ def _build_admin_user_details_text(user_details: dict):
 
     updated_at = user_details.get('updated_at')
     updated_text = updated_at.strftime('%d.%m.%Y %H:%M') if updated_at else 'нет данных'
+    starosta_groups = [
+        _normalize_cell_text(group)
+        for group in (user_details.get('starosta_groups') or [])
+        if _normalize_cell_text(group)
+    ]
+    starosta_text = ', '.join(starosta_groups) if starosta_groups else 'не назначен'
 
     lines = [
         '<b>👤 Пользователь</b>',
@@ -352,13 +891,14 @@ def _build_admin_user_details_text(user_details: dict):
         f"👥 Группа: <b>{html.escape(group_text)}</b>",
         f"🔔 Рассылка: <b>{html.escape(digest_text)}</b>",
         f"🎉 События: <b>{html.escape(event_notifications_text)}</b>",
+        f"⭐ Староста групп: <b>{html.escape(starosta_text)}</b>",
         f"🔗 Реферал: <b>{html.escape(referrer_text)}</b>",
         f"🕒 Обновлено: <b>{html.escape(updated_text)}</b>",
     ]
     return '\n'.join(lines)
 
 
-def _build_admin_user_details_keyboard(target_telegram_id: int):
+def _build_admin_user_details_keyboard(target_telegram_id: int, user_details: dict | None = None):
     """Строит клавиатуру карточки пользователя."""
     keyboard = types.InlineKeyboardMarkup(row_width=1)
     keyboard.add(
@@ -367,6 +907,21 @@ def _build_admin_user_details_keyboard(target_telegram_id: int):
             callback_data=f'admin_users_message_{target_telegram_id}',
         )
     )
+    if user_details is not None:
+        selected_group = _normalize_cell_text(user_details.get('selected_group')) or None
+        starosta_groups = {
+            _normalize_cell_text(group)
+            for group in (user_details.get('starosta_groups') or [])
+            if _normalize_cell_text(group)
+        }
+        if selected_group:
+            is_group_starosta = selected_group in starosta_groups
+            keyboard.add(
+                types.InlineKeyboardButton(
+                    text='❌ Снять старосту группы' if is_group_starosta else '⭐ Назначить старостой группы',
+                    callback_data=f'admin_users_starosta_toggle_{target_telegram_id}',
+                )
+            )
     keyboard.add(types.InlineKeyboardButton(text='⬅️ К списку пользователей', callback_data='admin_users_back'))
     keyboard.row(
         types.InlineKeyboardButton(text='🔄 Обновить список', callback_data='admin_users'),
@@ -477,7 +1032,7 @@ def _build_admin_event_step_keyboard(*, allow_skip: bool = False):
     return keyboard
 
 
-def _build_admin_users_text(page_data: dict, course_label: str | None, group_label: str | None):
+def _build_admin_users_text(page_data: dict, course_label: str | None, group_label: str | None, starosta_only: bool):
     """Формирует текст экрана списка пользователей."""
     current_page = page_data.get('page', 0) + 1
     total_pages = page_data.get('total_pages', 1)
@@ -486,6 +1041,7 @@ def _build_admin_users_text(page_data: dict, course_label: str | None, group_lab
         '',
         f"🎓 Курс: <b>{html.escape(course_label or 'Все курсы')}</b>",
         f"👥 Группа: <b>{html.escape(group_label or 'Все группы')}</b>",
+        f"⭐ Режим: <b>{'Только старосты' if starosta_only else 'Все пользователи'}</b>",
         '',
         (
             f"📄 Страница: <b>{current_page}/{total_pages}</b>"
@@ -504,7 +1060,7 @@ def _build_admin_users_text(page_data: dict, course_label: str | None, group_lab
     return '\n'.join(lines).rstrip()
 
 
-def _build_admin_users_keyboard(page_data: dict, course_label: str | None, group_label: str | None):
+def _build_admin_users_keyboard(page_data: dict, course_label: str | None, group_label: str | None, starosta_only: bool):
     """Строит клавиатуру экрана списка пользователей."""
     keyboard = types.InlineKeyboardMarkup(row_width=2)
     keyboard.row(
@@ -516,6 +1072,12 @@ def _build_admin_users_keyboard(page_data: dict, course_label: str | None, group
             text=_short_admin_button_text('👥', group_label, 'Все группы'),
             callback_data='admin_users_grouppick_0',
         ),
+    )
+    keyboard.add(
+        types.InlineKeyboardButton(
+            text='⭐ Только старосты' if not starosta_only else '👥 Все пользователи',
+            callback_data='admin_users_starosta_toggle',
+        )
     )
 
     if course_label or group_label:
@@ -1133,7 +1695,7 @@ async def _restore_admin_event_origin(state: FSMContext, telegram_id: int):
 async def _build_admin_users_view_payload(state: FSMContext):
     """Собирает текст и клавиатуру списка пользователей с учетом фильтров."""
     user_data = await state.get_data()
-    course_filter, group_filter, page = _get_admin_users_view_state(user_data)
+    course_filter, group_filter, page, starosta_only = _get_admin_users_view_state(user_data)
     course_filters = await db_commands.get_admin_user_course_filters()
     course_labels = {item['value']: item['label'] for item in course_filters}
 
@@ -1152,6 +1714,7 @@ async def _build_admin_users_view_payload(state: FSMContext):
         group_code=group_filter,
         page=page,
         page_size=ADMIN_USERS_PAGE_SIZE,
+        starosta_only=starosta_only,
     )
     if page_data.get('page', 0) != page:
         page = page_data['page']
@@ -1160,10 +1723,11 @@ async def _build_admin_users_view_payload(state: FSMContext):
         admin_users_course_filter=course_filter,
         admin_users_group_filter=group_filter,
         admin_users_page=page,
+        admin_users_starosta_only=starosta_only,
     )
 
-    text = _build_admin_users_text(page_data, course_labels.get(course_filter), group_filter)
-    keyboard = _build_admin_users_keyboard(page_data, course_labels.get(course_filter), group_filter)
+    text = _build_admin_users_text(page_data, course_labels.get(course_filter), group_filter, starosta_only)
+    keyboard = _build_admin_users_keyboard(page_data, course_labels.get(course_filter), group_filter, starosta_only)
     return text, keyboard
 
 
@@ -1185,7 +1749,7 @@ async def _render_admin_user_details_view(target, telegram_id: int, target_teleg
         return False
 
     text = _build_admin_user_details_text(user_details)
-    keyboard = _build_admin_user_details_keyboard(target_telegram_id)
+    keyboard = _build_admin_user_details_keyboard(target_telegram_id, user_details)
 
     if edit:
         await _safe_edit_text(target.message, text, reply_markup=keyboard, parse_mode='HTML')
@@ -1217,7 +1781,7 @@ async def _restore_admin_message_origin(state: FSMContext):
                 int(chat_id),
                 int(message_id),
                 _build_admin_user_details_text(user_details),
-                reply_markup=_build_admin_user_details_keyboard(int(target_telegram_id)),
+                reply_markup=_build_admin_user_details_keyboard(int(target_telegram_id), user_details),
                 parse_mode='HTML',
             )
             return
@@ -1228,6 +1792,83 @@ async def _restore_admin_message_origin(state: FSMContext):
         int(message_id),
         text,
         reply_markup=keyboard,
+        parse_mode='HTML',
+    )
+
+
+async def _clear_starosta_message_context(state: FSMContext):
+    """Сбрасывает служебные данные экрана сообщений старосты."""
+    await state.reset_state(with_data=False)
+    await state.update_data(
+        starosta_message_mode=None,
+        starosta_message_actor_telegram_id=None,
+        starosta_message_target_telegram_id=None,
+        starosta_message_target_label=None,
+        starosta_message_group_filter=None,
+        starosta_message_recipients_count=None,
+        starosta_message_origin_view=None,
+        starosta_message_origin_chat_id=None,
+        starosta_message_origin_message_id=None,
+    )
+
+
+async def _restore_starosta_message_origin(state: FSMContext):
+    """Возвращает старосту к исходному экрану после отправки или отмены."""
+    user_data = await state.get_data()
+    chat_id = user_data.get('starosta_message_origin_chat_id')
+    message_id = user_data.get('starosta_message_origin_message_id')
+    origin_view = user_data.get('starosta_message_origin_view')
+    actor_telegram_id = user_data.get('starosta_message_actor_telegram_id')
+
+    if not chat_id or not message_id or not actor_telegram_id:
+        return
+
+    if origin_view == 'user_details':
+        target_telegram_id = user_data.get('starosta_message_target_telegram_id')
+        if target_telegram_id:
+            user_details = await db_commands.get_admin_user_details(int(target_telegram_id))
+            access = await db_commands.get_starosta_access(int(actor_telegram_id))
+        else:
+            user_details = None
+            access = None
+        if user_details and access and _starosta_can_view_user(access, user_details):
+            await _safe_edit_message_text_by_id(
+                int(chat_id),
+                int(message_id),
+                _build_admin_user_details_text(user_details),
+                reply_markup=_build_starosta_user_details_keyboard(int(target_telegram_id)),
+                parse_mode='HTML',
+            )
+            return
+
+    if origin_view == 'users':
+        text, keyboard = await _build_starosta_users_view_payload(state, int(actor_telegram_id))
+        if text and keyboard:
+            await _safe_edit_message_text_by_id(
+                int(chat_id),
+                int(message_id),
+                text,
+                reply_markup=keyboard,
+                parse_mode='HTML',
+            )
+            return
+
+    access, available_groups, current_group = await _resolve_starosta_context(state, int(actor_telegram_id))
+    recipients = []
+    if current_group:
+        recipients = await db_commands.get_admin_message_recipients(
+            group_code=current_group,
+            allowed_group_codes=None if access.get('is_super') else available_groups,
+        )
+    await _safe_edit_message_text_by_id(
+        int(chat_id),
+        int(message_id),
+        _build_starosta_panel_text(access, current_group, len(recipients)),
+        reply_markup=_build_starosta_panel_keyboard(
+            current_group,
+            can_switch_groups=bool(access.get('is_super') or len(available_groups) > 1),
+            has_group=bool(current_group),
+        ),
         parse_mode='HTML',
     )
 
@@ -1260,7 +1901,7 @@ async def _render_admin_course_filter_picker(callback_query: types.CallbackQuery
         return
 
     user_data = await state.get_data()
-    selected_course, _, _ = _get_admin_users_view_state(user_data)
+    selected_course, _, _, _ = _get_admin_users_view_state(user_data)
     courses = await db_commands.get_admin_user_course_filters()
     if not courses:
         await callback_query.answer('Список курсов пока пуст.', show_alert=True)
@@ -1295,7 +1936,7 @@ async def _render_admin_group_filter_picker(callback_query: types.CallbackQuery,
         return
 
     user_data = await state.get_data()
-    selected_course, selected_group, _ = _get_admin_users_view_state(user_data)
+    selected_course, selected_group, _, _ = _get_admin_users_view_state(user_data)
     groups = await db_commands.get_admin_user_group_filters(selected_course)
     if not groups:
         await callback_query.answer('Для выбранного курса групп пока нет.', show_alert=True)
@@ -1344,7 +1985,7 @@ async def admin_users_change_page(callback_query: types.CallbackQuery, state: FS
 
     telegram_id = _telegram_id_from_callback(callback_query)
     user_data = await state.get_data()
-    _, _, page = _get_admin_users_view_state(user_data)
+    _, _, page, _ = _get_admin_users_view_state(user_data)
     await state.update_data(admin_users_page=max(0, page + delta))
     await _render_admin_users_view(callback_query, state, telegram_id, edit=True)
 
@@ -1399,7 +2040,7 @@ async def admin_users_set_group(callback_query: types.CallbackQuery, state: FSMC
         return
 
     user_data = await state.get_data()
-    course_filter, _, _ = _get_admin_users_view_state(user_data)
+    course_filter, _, _, _ = _get_admin_users_view_state(user_data)
     groups = await db_commands.get_admin_user_group_filters(course_filter)
     if index < 0 or index >= len(groups):
         await callback_query.answer('⚠️ Группа не найдена', show_alert=True)
@@ -1434,6 +2075,18 @@ async def admin_users_reset_filters(callback_query: types.CallbackQuery, state: 
         admin_users_course_filter=None,
         admin_users_group_filter=None,
         admin_users_page=0,
+        admin_users_starosta_only=False,
+    )
+    await _render_admin_users_view(callback_query, state, _telegram_id_from_callback(callback_query), edit=True)
+
+
+async def admin_users_toggle_starosta_filter(callback_query: types.CallbackQuery, state: FSMContext):
+    """Переключает фильтр списка пользователей только по старостам."""
+    user_data = await state.get_data()
+    _, _, _, starosta_only = _get_admin_users_view_state(user_data)
+    await state.update_data(
+        admin_users_starosta_only=not starosta_only,
+        admin_users_page=0,
     )
     await _render_admin_users_view(callback_query, state, _telegram_id_from_callback(callback_query), edit=True)
 
@@ -1441,6 +2094,50 @@ async def admin_users_reset_filters(callback_query: types.CallbackQuery, state: 
 async def admin_users_back_to_list(callback_query: types.CallbackQuery, state: FSMContext):
     """Возвращает из карточки пользователя к списку пользователей."""
     await _render_admin_users_view(callback_query, state, _telegram_id_from_callback(callback_query), edit=True)
+
+
+async def admin_users_toggle_starosta_assignment(callback_query: types.CallbackQuery, state: FSMContext):
+    """Назначает или снимает старосту для группы пользователя."""
+    telegram_id = _telegram_id_from_callback(callback_query)
+    if not await db_commands.is_admin_authorized(telegram_id):
+        await callback_query.answer('⚠️ Сначала войдите в админ-панель через /admin', show_alert=True)
+        return
+
+    try:
+        target_telegram_id = int(callback_query.data.rsplit('_', 1)[1])
+    except (TypeError, ValueError, IndexError):
+        await callback_query.answer('⚠️ Пользователь не найден', show_alert=True)
+        return
+
+    user_details = await db_commands.get_admin_user_details(target_telegram_id)
+    if not user_details:
+        await callback_query.answer('⚠️ Пользователь не найден', show_alert=True)
+        return
+
+    selected_group = _normalize_cell_text(user_details.get('selected_group')) or None
+    if not selected_group:
+        await callback_query.answer('⚠️ У пользователя не выбрана группа', show_alert=True)
+        return
+
+    starosta_groups = {
+        _normalize_cell_text(group)
+        for group in (user_details.get('starosta_groups') or [])
+        if _normalize_cell_text(group)
+    }
+    if selected_group in starosta_groups:
+        await db_commands.clear_group_starosta(selected_group)
+        notice = f'Староста для группы {selected_group} снят'
+    else:
+        await db_commands.assign_group_starosta(selected_group, target_telegram_id, telegram_id)
+        notice = f'Пользователь назначен старостой группы {selected_group}'
+
+    await _render_admin_user_details_view(
+        callback_query,
+        telegram_id,
+        target_telegram_id,
+        edit=True,
+    )
+    await callback_query.answer(notice)
 
 
 async def admin_users_start_single_message(callback_query: types.CallbackQuery, state: FSMContext):
@@ -1494,7 +2191,7 @@ async def admin_users_start_filtered_message(callback_query: types.CallbackQuery
         return
 
     user_data = await state.get_data()
-    course_filter, group_filter, _ = _get_admin_users_view_state(user_data)
+    course_filter, group_filter, _, _ = _get_admin_users_view_state(user_data)
     recipients = await db_commands.get_admin_message_recipients(course_filter, group_filter)
     if not recipients:
         await callback_query.answer('⚠️ По выбранным фильтрам получателей нет', show_alert=True)
@@ -1617,6 +2314,212 @@ async def admin_receive_message_text(message: types.Message, state: FSMContext):
         f'✅ Отправлено: {success_count}\n'
         f'❌ Ошибок: {failed_count}'
     )
+
+
+async def starosta_users_open(callback_query: types.CallbackQuery, state: FSMContext):
+    """Открывает список учеников в панели старосты."""
+    await _render_starosta_users_view(callback_query, state, _telegram_id_from_callback(callback_query), edit=True)
+
+
+async def starosta_users_change_page(callback_query: types.CallbackQuery, state: FSMContext):
+    """Листает список учеников в панели старосты."""
+    try:
+        delta = int(callback_query.data.rsplit('_', 1)[1])
+    except (TypeError, ValueError, IndexError):
+        await callback_query.answer('⚠️ Некорректная страница', show_alert=True)
+        return
+
+    user_data = await state.get_data()
+    try:
+        page = int(user_data.get('starosta_users_page', 0))
+    except (TypeError, ValueError):
+        page = 0
+
+    await state.update_data(starosta_users_page=max(0, page + delta))
+    await _render_starosta_users_view(callback_query, state, _telegram_id_from_callback(callback_query), edit=True)
+
+
+async def starosta_users_back_to_list(callback_query: types.CallbackQuery, state: FSMContext):
+    """Возвращает из карточки ученика к списку группы."""
+    await _render_starosta_users_view(callback_query, state, _telegram_id_from_callback(callback_query), edit=True)
+
+
+async def starosta_users_show_details(callback_query: types.CallbackQuery, state: FSMContext):
+    """Открывает карточку ученика для старосты."""
+    telegram_id = _telegram_id_from_callback(callback_query)
+    try:
+        target_telegram_id = int(callback_query.data.rsplit('_', 1)[1])
+    except (TypeError, ValueError, IndexError):
+        await callback_query.answer('⚠️ Ученик не найден', show_alert=True)
+        return
+
+    await _render_starosta_user_details_view(
+        callback_query,
+        telegram_id,
+        target_telegram_id,
+        edit=True,
+    )
+
+
+async def starosta_start_single_message(callback_query: types.CallbackQuery, state: FSMContext):
+    """Открывает ввод сообщения одному ученику от старосты."""
+    telegram_id = _telegram_id_from_callback(callback_query)
+    access = await db_commands.get_starosta_access(telegram_id)
+    if not access.get('has_access'):
+        await callback_query.answer('⚠️ У вас нет доступа к панели старосты', show_alert=True)
+        return
+
+    try:
+        target_telegram_id = int(callback_query.data.rsplit('_', 1)[1])
+    except (TypeError, ValueError, IndexError):
+        await callback_query.answer('⚠️ Ученик не найден', show_alert=True)
+        return
+
+    user_details = await db_commands.get_admin_user_details(target_telegram_id)
+    if not user_details or not _starosta_can_view_user(access, user_details):
+        await callback_query.answer('⚠️ Ученик недоступен', show_alert=True)
+        return
+
+    await state.update_data(
+        starosta_message_mode='single',
+        starosta_message_actor_telegram_id=telegram_id,
+        starosta_message_target_telegram_id=target_telegram_id,
+        starosta_message_target_label=_build_admin_message_target_label(user_details),
+        starosta_message_group_filter=None,
+        starosta_message_recipients_count=1,
+        starosta_message_origin_view='user_details',
+        starosta_message_origin_chat_id=callback_query.message.chat.id,
+        starosta_message_origin_message_id=callback_query.message.message_id,
+    )
+    await state.set_state(StarostaMessageDialog.waiting_text.state)
+    await _safe_edit_text(
+        callback_query.message,
+        _build_starosta_message_compose_text(
+            'single',
+            target_label=_build_admin_message_target_label(user_details),
+        ),
+        reply_markup=_build_starosta_message_compose_keyboard(),
+        parse_mode='HTML',
+    )
+    await callback_query.answer()
+
+
+async def starosta_start_group_message(callback_query: types.CallbackQuery, state: FSMContext):
+    """Открывает ввод сообщения всей группе от старосты."""
+    telegram_id = _telegram_id_from_callback(callback_query)
+    access, available_groups, current_group = await _resolve_starosta_context(state, telegram_id)
+    if not access.get('has_access'):
+        await callback_query.answer('⚠️ У вас нет доступа к панели старосты', show_alert=True)
+        return
+
+    if not current_group:
+        await callback_query.answer('⚠️ Сначала выберите группу', show_alert=True)
+        return
+
+    recipients = await db_commands.get_admin_message_recipients(
+        group_code=current_group,
+        allowed_group_codes=None if access.get('is_super') else available_groups,
+    )
+    if not recipients:
+        await callback_query.answer('⚠️ В этой группе пока нет получателей', show_alert=True)
+        return
+
+    origin_view = 'panel' if callback_query.data == 'starosta_group_message' else 'users'
+    await state.update_data(
+        starosta_message_mode='group',
+        starosta_message_actor_telegram_id=telegram_id,
+        starosta_message_target_telegram_id=None,
+        starosta_message_target_label=None,
+        starosta_message_group_filter=current_group,
+        starosta_message_recipients_count=len(recipients),
+        starosta_message_origin_view=origin_view,
+        starosta_message_origin_chat_id=callback_query.message.chat.id,
+        starosta_message_origin_message_id=callback_query.message.message_id,
+    )
+    await state.set_state(StarostaMessageDialog.waiting_text.state)
+    await _safe_edit_text(
+        callback_query.message,
+        _build_starosta_message_compose_text(
+            'group',
+            recipients_count=len(recipients),
+            group_label=current_group,
+        ),
+        reply_markup=_build_starosta_message_compose_keyboard(),
+        parse_mode='HTML',
+    )
+    await callback_query.answer()
+
+
+async def starosta_message_cancel(callback_query: types.CallbackQuery, state: FSMContext):
+    """Отменяет ввод сообщения от старосты."""
+    telegram_id = _telegram_id_from_callback(callback_query)
+    access = await db_commands.get_starosta_access(telegram_id)
+    if not access.get('has_access'):
+        await callback_query.answer('⚠️ У вас нет доступа к панели старосты', show_alert=True)
+        return
+
+    await _restore_starosta_message_origin(state)
+    await _clear_starosta_message_context(state)
+    await callback_query.answer('Отправка отменена')
+
+
+async def starosta_receive_message_text(message: types.Message, state: FSMContext):
+    """Получает текст сообщения от старосты и отправляет его адресатам."""
+    telegram_id = _telegram_id_from_message(message)
+    access = await db_commands.get_starosta_access(telegram_id)
+    if not access.get('has_access'):
+        await _clear_starosta_message_context(state)
+        await message.answer('⚠️ У вас нет доступа к панели старосты')
+        return
+
+    text_value = (message.text or message.caption or '').strip()
+    if not text_value:
+        await message.answer('Отправьте текстовое сообщение или нажмите «Отмена».')
+        return
+
+    if _admin_message_is_cancel(text_value):
+        await _restore_starosta_message_origin(state)
+        await _clear_starosta_message_context(state)
+        await message.answer('Отправка отменена.')
+        return
+
+    user_data = await state.get_data()
+    mode = user_data.get('starosta_message_mode')
+    if mode == 'single':
+        target_telegram_id = user_data.get('starosta_message_target_telegram_id')
+        recipients = [{'telegram_id': int(target_telegram_id)}] if target_telegram_id else []
+    else:
+        recipients = await db_commands.get_admin_message_recipients(
+            group_code=user_data.get('starosta_message_group_filter'),
+            allowed_group_codes=None if access.get('is_super') else access.get('groups'),
+        )
+
+    if not recipients:
+        await _restore_starosta_message_origin(state)
+        await _clear_starosta_message_context(state)
+        await message.answer('⚠️ Получатели не найдены.')
+        return
+
+    success_count = 0
+    failed_count = 0
+    for recipient in recipients:
+        try:
+            await bot.send_message(int(recipient['telegram_id']), text_value)
+            success_count += 1
+        except Exception:
+            failed_count += 1
+
+    await _restore_starosta_message_origin(state)
+    await _clear_starosta_message_context(state)
+    await message.answer(
+        f'✅ Отправлено: {success_count}\n'
+        f'❌ Ошибок: {failed_count}'
+    )
+
+
+async def starosta_noop(callback_query: types.CallbackQuery):
+    """Служебная кнопка панели старосты."""
+    await callback_query.answer()
 
 
 def _admin_event_skip_requested(text_value: str) -> bool:
@@ -6306,6 +7209,7 @@ def register_handlers_client(dp: Dispatcher):
     dp.register_message_handler(cmd_start, commands=['start'])
     dp.register_message_handler(cmd_help, commands=['help'], state='*')
     dp.register_message_handler(admin_command, commands=['admin'], state='*')
+    dp.register_message_handler(starosta_command, commands=['starosta'], state='*')
     dp.register_message_handler(search_entrypoint, commands=['search'], state='*')
     dp.register_message_handler(group_command, commands=['group'], state='*')
     dp.register_message_handler(date_command, commands=['date'], state='*')
@@ -6323,6 +7227,9 @@ def register_handlers_client(dp: Dispatcher):
     dp.register_message_handler(admin_receive_login, state=AdminAuthDialog.waiting_login)
     dp.register_message_handler(admin_receive_password, state=AdminAuthDialog.waiting_password)
     dp.register_message_handler(admin_receive_message_text, state=AdminMessageDialog.waiting_text)
+    dp.register_message_handler(starosta_receive_login, state=StarostaAuthDialog.waiting_login)
+    dp.register_message_handler(starosta_receive_password, state=StarostaAuthDialog.waiting_password)
+    dp.register_message_handler(starosta_receive_message_text, state=StarostaMessageDialog.waiting_text)
     dp.register_message_handler(admin_event_receive_datetime, state=AdminEventDialog.waiting_datetime)
     dp.register_message_handler(admin_event_receive_text, state=AdminEventDialog.waiting_text)
     dp.register_message_handler(
@@ -6379,6 +7286,19 @@ def register_handlers_client(dp: Dispatcher):
     dp.register_callback_query_handler(admin_open, Text(equals='admin_open'), state='*')
     dp.register_callback_query_handler(admin_refresh, Text(equals='admin_refresh'), state='*')
     dp.register_callback_query_handler(admin_logout, Text(equals='admin_logout'), state='*')
+    dp.register_callback_query_handler(starosta_open, Text(equals='starosta_open'), state='*')
+    dp.register_callback_query_handler(starosta_logout, Text(equals='starosta_logout'), state='*')
+    dp.register_callback_query_handler(starosta_pick_group, Text(startswith='starosta_group_pick_'), state='*')
+    dp.register_callback_query_handler(starosta_set_group, Text(startswith='starosta_group_set_'), state='*')
+    dp.register_callback_query_handler(starosta_users_open, Text(equals='starosta_users'), state='*')
+    dp.register_callback_query_handler(starosta_users_change_page, Text(startswith='starosta_users_page_'), state='*')
+    dp.register_callback_query_handler(starosta_users_back_to_list, Text(equals='starosta_users_back'), state='*')
+    dp.register_callback_query_handler(starosta_users_show_details, Text(startswith='starosta_users_info_'), state='*')
+    dp.register_callback_query_handler(starosta_start_single_message, Text(startswith='starosta_users_message_'), state='*')
+    dp.register_callback_query_handler(starosta_start_group_message, Text(equals='starosta_group_message'), state='*')
+    dp.register_callback_query_handler(starosta_start_group_message, Text(equals='starosta_users_broadcast'), state='*')
+    dp.register_callback_query_handler(starosta_message_cancel, Text(equals='starosta_message_cancel'), state='*')
+    dp.register_callback_query_handler(starosta_noop, Text(equals='starosta_noop'), state='*')
     dp.register_callback_query_handler(admin_event_create_start, Text(equals='admin_event_create'), state='*')
     dp.register_callback_query_handler(admin_event_cancel, Text(equals='admin_event_cancel'), state='*')
     dp.register_callback_query_handler(admin_event_skip_attachment, Text(equals='admin_event_skip'), state='*')
@@ -6392,7 +7312,9 @@ def register_handlers_client(dp: Dispatcher):
     dp.register_callback_query_handler(admin_users_start_filtered_message, Text(equals='admin_users_broadcast'), state='*')
     dp.register_callback_query_handler(admin_users_start_single_message, Text(startswith='admin_users_message_'), state='*')
     dp.register_callback_query_handler(admin_message_cancel, Text(equals='admin_message_cancel'), state='*')
+    dp.register_callback_query_handler(admin_users_toggle_starosta_assignment, Text(startswith='admin_users_starosta_toggle_'), state='*')
     dp.register_callback_query_handler(admin_users_show_details, Text(startswith='admin_users_info_'), state='*')
+    dp.register_callback_query_handler(admin_users_toggle_starosta_filter, Text(equals='admin_users_starosta_toggle'), state='*')
     dp.register_callback_query_handler(admin_users_clear_course, Text(equals='admin_users_course_clear'), state='*')
     dp.register_callback_query_handler(admin_users_clear_group, Text(equals='admin_users_group_clear'), state='*')
     dp.register_callback_query_handler(admin_users_reset_filters, Text(equals='admin_users_reset'), state='*')

@@ -11,6 +11,8 @@ from db_api.tables import (
     BotAdminSession,
     BotCallbackPayload,
     BotEvent,
+    BotStarostaSession,
+    GroupStarostaAssignment,
     Users,
     UserScheduleState,
     UserDailyNotification,
@@ -199,6 +201,176 @@ async def revoke_admin(telegram_id: int) -> bool:
         return True
 
 
+async def get_starosta_session(telegram_id: int):
+    """Возвращает активную сессию главной старосты."""
+    async with get_session() as session:
+        result = await session.execute(
+            select(BotStarostaSession).where(BotStarostaSession.telegram_id == telegram_id)
+        )
+        session_row = result.scalar_one_or_none()
+        if session_row is None:
+            return None
+
+        return {
+            'telegram_id': session_row.telegram_id,
+            'login': session_row.login,
+            'authorized_at': session_row.authorized_at,
+        }
+
+
+async def is_super_starosta_authorized(telegram_id: int) -> bool:
+    """Проверяет, вошел ли пользователь как главная староста."""
+    return await get_starosta_session(telegram_id) is not None
+
+
+async def authorize_starosta(telegram_id: int, login: str):
+    """Создает или обновляет сессию главной старосты."""
+    normalized_login = str(login).strip()
+
+    async with get_session() as session:
+        result = await session.execute(
+            select(BotStarostaSession).where(BotStarostaSession.telegram_id == telegram_id)
+        )
+        session_row = result.scalar_one_or_none()
+
+        if session_row is None:
+            session_row = BotStarostaSession(
+                telegram_id=telegram_id,
+                login=normalized_login,
+                authorized_at=datetime.utcnow(),
+            )
+            session.add(session_row)
+        else:
+            session_row.login = normalized_login
+            session_row.authorized_at = datetime.utcnow()
+
+        await session.commit()
+
+        return {
+            'telegram_id': session_row.telegram_id,
+            'login': session_row.login,
+            'authorized_at': session_row.authorized_at,
+        }
+
+
+async def revoke_starosta(telegram_id: int) -> bool:
+    """Завершает сессию главной старосты."""
+    async with get_session() as session:
+        result = await session.execute(
+            select(BotStarostaSession).where(BotStarostaSession.telegram_id == telegram_id)
+        )
+        session_row = result.scalar_one_or_none()
+        if session_row is None:
+            return False
+
+        await session.delete(session_row)
+        await session.commit()
+        return True
+
+
+async def get_user_starosta_groups(telegram_id: int):
+    """Возвращает группы, для которых пользователь назначен старостой."""
+    async with get_session() as session:
+        result = await session.execute(
+            select(GroupStarostaAssignment.group_code)
+            .where(GroupStarostaAssignment.telegram_id == telegram_id)
+            .order_by(GroupStarostaAssignment.group_code.asc())
+        )
+        rows = result.all()
+
+    return [str(row.group_code).strip() for row in rows if str(row.group_code).strip()]
+
+
+async def get_group_starosta(group_code: str):
+    """Возвращает назначенного старосту конкретной группы."""
+    normalized_group = str(group_code or '').strip()
+    if not normalized_group:
+        return None
+
+    async with get_session() as session:
+        result = await session.execute(
+            select(
+                GroupStarostaAssignment.group_code,
+                GroupStarostaAssignment.telegram_id,
+                Users.username,
+            )
+            .select_from(GroupStarostaAssignment)
+            .outerjoin(Users, Users.telegram_id == GroupStarostaAssignment.telegram_id)
+            .where(GroupStarostaAssignment.group_code == normalized_group)
+        )
+        row = result.one_or_none()
+
+    if row is None:
+        return None
+
+    return {
+        'group_code': str(row.group_code).strip(),
+        'telegram_id': row.telegram_id,
+        'username': str(row.username or '').strip() or None,
+    }
+
+
+async def assign_group_starosta(group_code: str, telegram_id: int, assigned_by_telegram_id: int | None = None):
+    """Назначает пользователя старостой выбранной группы."""
+    normalized_group = str(group_code or '').strip()
+    if not normalized_group:
+        return None
+
+    async with get_session() as session:
+        result = await session.execute(
+            select(GroupStarostaAssignment).where(GroupStarostaAssignment.group_code == normalized_group)
+        )
+        row = result.scalar_one_or_none()
+
+        if row is None:
+            row = GroupStarostaAssignment(
+                group_code=normalized_group,
+                telegram_id=telegram_id,
+                assigned_by_telegram_id=assigned_by_telegram_id,
+                created_at=datetime.utcnow(),
+                updated_at=datetime.utcnow(),
+            )
+            session.add(row)
+        else:
+            row.telegram_id = telegram_id
+            row.assigned_by_telegram_id = assigned_by_telegram_id
+            row.updated_at = datetime.utcnow()
+
+        await session.commit()
+
+    return await get_group_starosta(normalized_group)
+
+
+async def clear_group_starosta(group_code: str) -> bool:
+    """Снимает назначенного старосту с группы."""
+    normalized_group = str(group_code or '').strip()
+    if not normalized_group:
+        return False
+
+    async with get_session() as session:
+        result = await session.execute(
+            select(GroupStarostaAssignment).where(GroupStarostaAssignment.group_code == normalized_group)
+        )
+        row = result.scalar_one_or_none()
+        if row is None:
+            return False
+
+        await session.delete(row)
+        await session.commit()
+        return True
+
+
+async def get_starosta_access(telegram_id: int):
+    """Возвращает права пользователя в панели старосты."""
+    is_super = await is_super_starosta_authorized(telegram_id)
+    groups = await get_user_starosta_groups(telegram_id)
+    return {
+        'is_super': is_super,
+        'groups': groups,
+        'has_access': is_super or bool(groups),
+    }
+
+
 async def get_admin_dashboard_stats():
     """Возвращает сводную статистику для админ-панели."""
     async with get_session() as session:
@@ -287,10 +459,20 @@ async def get_admin_users_page(
     course_key: str | None = None,
     group_code: str | None = None,
     page: int = 0,
-    page_size: int = 8,):
-   
+    page_size: int = 8,
+    allowed_group_codes: list[str] | None = None,
+    starosta_only: bool = False,
+):
     normalized_course = str(course_key or '').strip() or None
     normalized_group = str(group_code or '').strip() or None
+    normalized_allowed_groups = sorted(
+        {
+            str(group).strip()
+            for group in (allowed_group_codes or [])
+            if str(group).strip()
+        },
+        key=str.casefold,
+    )
 
     try:
         page = max(0, int(page))
@@ -303,6 +485,7 @@ async def get_admin_users_page(
         page_size = 8
 
     async with get_session() as session:
+        starosta_subquery = select(GroupStarostaAssignment.telegram_id)
         count_query = (
             select(func.count(Users.id))
             .select_from(Users)
@@ -318,6 +501,7 @@ async def get_admin_users_page(
                 UserScheduleState.daily_digest_enabled,
                 UserScheduleState.daily_digest_hour,
                 UserScheduleState.daily_digest_minute,
+                UserScheduleState.event_notifications_enabled,
             )
             .select_from(Users)
             .outerjoin(UserScheduleState, UserScheduleState.telegram_id == Users.telegram_id)
@@ -331,6 +515,14 @@ async def get_admin_users_page(
             count_query = count_query.where(UserScheduleState.selected_group == normalized_group)
             data_query = data_query.where(UserScheduleState.selected_group == normalized_group)
 
+        if normalized_allowed_groups:
+            count_query = count_query.where(UserScheduleState.selected_group.in_(normalized_allowed_groups))
+            data_query = data_query.where(UserScheduleState.selected_group.in_(normalized_allowed_groups))
+
+        if starosta_only:
+            count_query = count_query.where(Users.telegram_id.in_(starosta_subquery))
+            data_query = data_query.where(Users.telegram_id.in_(starosta_subquery))
+
         total = int(await session.scalar(count_query) or 0)
         total_pages = max(1, (total + page_size - 1) // page_size)
         if page >= total_pages:
@@ -340,6 +532,21 @@ async def get_admin_users_page(
             data_query.order_by(Users.id.desc()).offset(page * page_size).limit(page_size)
         )
         rows = result.all()
+
+        telegram_ids = [row.telegram_id for row in rows]
+        assignment_map: dict[int, list[str]] = {}
+        if telegram_ids:
+            assignment_rows = (
+                await session.execute(
+                    select(GroupStarostaAssignment.telegram_id, GroupStarostaAssignment.group_code).where(
+                        GroupStarostaAssignment.telegram_id.in_(telegram_ids)
+                    )
+                )
+            ).all()
+            for assignment_row in assignment_rows:
+                assignment_map.setdefault(int(assignment_row.telegram_id), []).append(
+                    str(assignment_row.group_code).strip()
+                )
 
     items = []
     for row in rows:
@@ -358,6 +565,10 @@ async def get_admin_users_page(
                 'daily_digest_enabled': _normalize_daily_digest_enabled(row.daily_digest_enabled),
                 'daily_digest_hour': _normalize_daily_digest_hour(row.daily_digest_hour),
                 'daily_digest_minute': _normalize_daily_digest_minute(row.daily_digest_minute),
+                'event_notifications_enabled': _normalize_event_notifications_enabled(
+                    row.event_notifications_enabled
+                ),
+                'starosta_groups': sorted(assignment_map.get(int(row.telegram_id), []), key=str.casefold),
             }
         )
 
@@ -393,6 +604,14 @@ async def get_admin_user_details(telegram_id: int):
         )
         row = result.one_or_none()
 
+        assignment_rows = (
+            await session.execute(
+                select(GroupStarostaAssignment.group_code)
+                .where(GroupStarostaAssignment.telegram_id == telegram_id)
+                .order_by(GroupStarostaAssignment.group_code.asc())
+            )
+        ).all()
+
     if row is None:
         return None
 
@@ -414,6 +633,7 @@ async def get_admin_user_details(telegram_id: int):
         'event_notifications_enabled': _normalize_event_notifications_enabled(
             row.event_notifications_enabled
         ),
+        'starosta_groups': [str(item.group_code).strip() for item in assignment_rows if str(item.group_code).strip()],
         'updated_at': row.updated_at,
     }
 
@@ -421,10 +641,19 @@ async def get_admin_user_details(telegram_id: int):
 async def get_admin_message_recipients(
     course_key: str | None = None,
     group_code: str | None = None,
+    allowed_group_codes: list[str] | None = None,
 ):
     """Возвращает получателей для админ-сообщения с учетом фильтров курса и группы."""
     normalized_course = str(course_key or '').strip() or None
     normalized_group = str(group_code or '').strip() or None
+    normalized_allowed_groups = sorted(
+        {
+            str(group).strip()
+            for group in (allowed_group_codes or [])
+            if str(group).strip()
+        },
+        key=str.casefold,
+    )
 
     async with get_session() as session:
         query = (
@@ -444,6 +673,9 @@ async def get_admin_message_recipients(
 
         if normalized_group:
             query = query.where(UserScheduleState.selected_group == normalized_group)
+
+        if normalized_allowed_groups:
+            query = query.where(UserScheduleState.selected_group.in_(normalized_allowed_groups))
 
         result = await session.execute(query.order_by(Users.id.desc()))
         rows = result.all()
