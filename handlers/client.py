@@ -276,13 +276,13 @@ def _build_starosta_panel_keyboard(current_group: str | None, can_switch_groups:
             types.InlineKeyboardButton(text='👨‍🎓 Ученики', callback_data='starosta_users'),
             types.InlineKeyboardButton(text='📣 Написать группе', callback_data='starosta_group_message'),
         )
+        keyboard.add(types.InlineKeyboardButton(text='✅ Посещаемость', callback_data='starosta_att'))
     keyboard.row(
         types.InlineKeyboardButton(text='🔄 Обновить', callback_data='starosta_open'),
         types.InlineKeyboardButton(text='🚪 Выйти', callback_data='starosta_logout'),
     )
     keyboard.add(types.InlineKeyboardButton(text='🏠 В главное меню', callback_data='main_menu'))
     return keyboard
-
 
 def _build_starosta_users_text(page_data: dict, group_label: str | None):
     """Формирует текст списка учеников для панели старосты."""
@@ -405,6 +405,465 @@ def _build_starosta_message_compose_keyboard():
     keyboard.add(types.InlineKeyboardButton(text='⬅️ Отмена', callback_data='starosta_message_cancel'))
     return keyboard
 
+
+def _starosta_attendance_status_icon(status: str | None):
+    """Возвращает иконку статуса посещаемости."""
+    return {
+        'present': '✅',
+        'absent': '❌',
+    }.get(_normalize_cell_text(status), '⬜️')
+
+
+def _starosta_cycle_attendance_status(status: str | None):
+    """Переключает статус посещаемости по кругу."""
+    normalized = _normalize_cell_text(status)
+    if normalized == 'present':
+        return 'absent'
+    if normalized == 'absent':
+        return None
+    return 'present'
+
+
+def _build_starosta_student_label(student: dict):
+    """Возвращает короткую подпись ученика для кнопки."""
+    username = _normalize_cell_text(student.get('username'))
+    if username:
+        return f"@{username}"
+    return f"ID {student.get('telegram_id')}"
+
+
+def _starosta_group_course_keys(group_code: str):
+    """Возвращает курсы, в которых встречается выбранная группа."""
+    normalized_group = _normalize_cell_text(group_code)
+    if not normalized_group:
+        return []
+
+    course_keys = [
+        course_key
+        for course_key, groups in schedule_data.items()
+        if normalized_group in groups
+    ]
+    return sorted(
+        course_keys,
+        key=lambda item: (
+            _course_start_date(item, normalized_group) is None,
+            _course_start_date(item, normalized_group) or datetime.max.date(),
+            _period_label_for_course(item),
+            _course_name(item),
+        ),
+    )
+
+
+def _build_starosta_attendance_day_refs(group_code: str):
+    """Собирает даты с занятиями для отметки посещаемости."""
+    normalized_group = _normalize_cell_text(group_code)
+    if not normalized_group:
+        return []
+
+    refs_by_date = {}
+    for course in _starosta_group_course_keys(normalized_group):
+        weeks = _get_available_weeks(course, normalized_group)
+        for week_index, week_label in enumerate(weeks):
+            week_days = _build_week_day_items(course, normalized_group, week_label)
+            week_schedule = schedule_data.get(course, {}).get(normalized_group, {}).get(week_label, [])
+            for day_index, day_item in enumerate(week_days):
+                day_date = day_item.get('date_obj')
+                if day_date is None:
+                    continue
+
+                lessons = _get_day_lessons(week_schedule, day_item['day_name'])
+                if not lessons:
+                    continue
+
+                ref = {
+                    'course': course,
+                    'course_name': _course_name(course),
+                    'period_label': _period_label_for_course(course),
+                    'week_index': week_index,
+                    'week_label': week_label,
+                    'day_index': day_index,
+                    'day_name': day_item['day_name'],
+                    'day_title': day_item['day_title'],
+                    'date_obj': day_date,
+                    'date_short': day_item['date_short'],
+                    'is_today': day_item.get('is_today', False),
+                    'lessons': lessons,
+                }
+
+                existing = refs_by_date.get(day_date)
+                if existing is None or len(ref['lessons']) >= len(existing['lessons']):
+                    refs_by_date[day_date] = ref
+
+    return sorted(refs_by_date.values(), key=lambda item: item['date_obj'])
+
+
+def _nearest_starosta_attendance_day_page(day_refs):
+    """Выбирает страницу с ближайшим днем занятий."""
+    if not day_refs:
+        return 0
+
+    today = datetime.now().date()
+    for index, item in enumerate(day_refs):
+        if item['date_obj'] >= today:
+            return index // STAROSTA_ATTENDANCE_DAYS_PAGE_SIZE
+
+    return max(0, (len(day_refs) - 1) // STAROSTA_ATTENDANCE_DAYS_PAGE_SIZE)
+
+
+def _starosta_attendance_day_caption(day_ref: dict):
+    """Возвращает читаемую подпись даты для посещаемости."""
+    return _format_search_date_caption(
+        day_ref.get('date_obj'),
+        day_ref.get('date_short'),
+        day_ref.get('day_title') or day_ref.get('day_name'),
+    )
+
+
+def _starosta_attendance_lesson_title(lesson_index: int, lesson: dict):
+    """Возвращает короткую подпись пары для кнопки и заголовка."""
+    time_text = _normalize_cell_text(lesson.get('time')) or 'Время не указано'
+    lesson_text = (
+        _normalize_cell_text(lesson.get('subject'))
+        or _normalize_cell_text(lesson.get('lesson'))
+        or 'Без названия'
+    )
+    return f"{lesson_index + 1}. {time_text} • {lesson_text}"
+
+
+def _build_starosta_attendance_days_text(group_code: str, day_refs, page: int):
+    """Формирует экран выбора дня для посещаемости."""
+    total_pages = max(1, (len(day_refs) + STAROSTA_ATTENDANCE_DAYS_PAGE_SIZE - 1) // STAROSTA_ATTENDANCE_DAYS_PAGE_SIZE)
+    lines = [
+        '<b>✅ Посещаемость</b>',
+        '',
+        f"👥 Группа: <b>{html.escape(group_code or 'не выбрана')}</b>",
+    ]
+
+    if not day_refs:
+        lines.extend([
+            '',
+            'В расписании этой группы пока нет дней с занятиями.',
+        ])
+        return '\n'.join(lines)
+
+    lines.extend([
+        f"📄 Страница: <b>{page + 1}/{total_pages}</b>",
+        f"📅 Дней с занятиями: <b>{len(day_refs)}</b>",
+        '',
+        'Выберите день, чтобы открыть пары и отметить учеников.',
+    ])
+    return '\n'.join(lines)
+
+
+def _build_starosta_attendance_days_keyboard(day_refs, page: int):
+    """Строит клавиатуру выбора дня для посещаемости."""
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    total_pages = max(1, (len(day_refs) + STAROSTA_ATTENDANCE_DAYS_PAGE_SIZE - 1) // STAROSTA_ATTENDANCE_DAYS_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    start = page * STAROSTA_ATTENDANCE_DAYS_PAGE_SIZE
+    end = start + STAROSTA_ATTENDANCE_DAYS_PAGE_SIZE
+
+    for day_ref_index in range(start, min(end, len(day_refs))):
+        day_ref = day_refs[day_ref_index]
+        marker = '⭐ ' if day_ref.get('is_today') else ''
+        button_text = _truncate_button_text(
+            f"{marker}{_starosta_attendance_day_caption(day_ref)} • {len(day_ref.get('lessons') or [])} пар",
+            62,
+        )
+        keyboard.add(
+            types.InlineKeyboardButton(
+                text=button_text,
+                callback_data=f'starosta_att_day_{day_ref_index}_{page}',
+            )
+        )
+
+    if total_pages > 1:
+        keyboard.row(
+            types.InlineKeyboardButton(
+                text='⬅️',
+                callback_data=f'starosta_att_days_{page - 1}' if page > 0 else 'starosta_noop',
+            ),
+            types.InlineKeyboardButton(text=f'📄 {page + 1}/{total_pages}', callback_data='starosta_noop'),
+            types.InlineKeyboardButton(
+                text='➡️',
+                callback_data=f'starosta_att_days_{page + 1}' if page < total_pages - 1 else 'starosta_noop',
+            ),
+        )
+
+    keyboard.row(
+        types.InlineKeyboardButton(text='🔄 Обновить', callback_data='starosta_att'),
+        types.InlineKeyboardButton(text='⬅️ В панель старосты', callback_data='starosta_open'),
+    )
+    return keyboard
+
+
+def _build_starosta_attendance_lessons_text(group_code: str, day_ref: dict):
+    """Формирует экран выбора пары для посещаемости."""
+    lines = [
+        '<b>✅ Посещаемость</b>',
+        '',
+        f"👥 Группа: <b>{html.escape(group_code or 'не выбрана')}</b>",
+        f"📅 День: <b>{html.escape(_starosta_attendance_day_caption(day_ref))}</b>",
+        f"🗂 Период: <b>{html.escape(day_ref.get('period_label') or '-')}</b>",
+        '',
+        'Выберите пару, чтобы отметить учеников.',
+    ]
+    return '\n'.join(lines)
+
+
+def _build_starosta_attendance_lessons_keyboard(day_ref_index: int, day_ref: dict, origin_page: int):
+    """Строит клавиатуру выбора пары для посещаемости."""
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    for lesson_index, lesson in enumerate(day_ref.get('lessons') or []):
+        keyboard.add(
+            types.InlineKeyboardButton(
+                text=_truncate_button_text(_starosta_attendance_lesson_title(lesson_index, lesson), 62),
+                callback_data=f'starosta_att_lesson_{day_ref_index}_{lesson_index}_{origin_page}',
+            )
+        )
+
+    keyboard.row(
+        types.InlineKeyboardButton(text='⬅️ К дням', callback_data=f'starosta_att_days_{origin_page}'),
+        types.InlineKeyboardButton(text='⬅️ В панель старосты', callback_data='starosta_open'),
+    )
+    return keyboard
+
+
+def _build_starosta_attendance_marks_text(
+    group_code: str,
+    day_ref: dict,
+    lesson_index: int,
+    lesson: dict,
+    students,
+    marks: dict,
+    page: int,
+):
+    """Формирует экран отметок учеников на выбранной паре."""
+    total_pages = max(1, (len(students) + STAROSTA_ATTENDANCE_STUDENTS_PAGE_SIZE - 1) // STAROSTA_ATTENDANCE_STUDENTS_PAGE_SIZE)
+    present_count = sum(1 for student in students if marks.get(int(student['telegram_id'])) == 'present')
+    absent_count = sum(1 for student in students if marks.get(int(student['telegram_id'])) == 'absent')
+    unmarked_count = max(0, len(students) - present_count - absent_count)
+
+    lesson_caption = _starosta_attendance_lesson_title(lesson_index, lesson)
+    lines = [
+        '<b>✅ Посещаемость</b>',
+        '',
+        f"👥 Группа: <b>{html.escape(group_code or 'не выбрана')}</b>",
+        f"📅 День: <b>{html.escape(_starosta_attendance_day_caption(day_ref))}</b>",
+        f"📚 Пара: <b>{html.escape(lesson_caption)}</b>",
+        '',
+        f"✅ Были: <b>{present_count}</b>",
+        f"❌ Отсутствуют: <b>{absent_count}</b>",
+        f"⬜️ Без отметки: <b>{unmarked_count}</b>",
+        f"📄 Страница: <b>{page + 1}/{total_pages}</b>",
+        '',
+    ]
+
+    if students:
+        lines.append('Нажмите на ученика: без отметки → был → отсутствовал → без отметки.')
+    else:
+        lines.append('В этой группе пока нет пользователей для отметки посещаемости.')
+
+    return '\n'.join(lines)
+
+
+def _build_starosta_attendance_marks_keyboard(
+    day_ref_index: int,
+    lesson_index: int,
+    day_page: int,
+    students,
+    marks: dict,
+    page: int,
+):
+    """Строит клавиатуру отметок посещаемости по ученикам."""
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    total_pages = max(1, (len(students) + STAROSTA_ATTENDANCE_STUDENTS_PAGE_SIZE - 1) // STAROSTA_ATTENDANCE_STUDENTS_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    start = page * STAROSTA_ATTENDANCE_STUDENTS_PAGE_SIZE
+    end = start + STAROSTA_ATTENDANCE_STUDENTS_PAGE_SIZE
+
+    for student in students[start:min(end, len(students))]:
+        student_id = int(student['telegram_id'])
+        status = marks.get(student_id)
+        keyboard.add(
+            types.InlineKeyboardButton(
+                text=_truncate_button_text(
+                    f"{_starosta_attendance_status_icon(status)} {_build_starosta_student_label(student)}",
+                    62,
+                ),
+                callback_data=f'starosta_att_mark_{day_ref_index}_{lesson_index}_{student_id}_{day_page}_{page}',
+            )
+        )
+
+    if total_pages > 1:
+        keyboard.row(
+            types.InlineKeyboardButton(
+                text='⬅️',
+                callback_data=f'starosta_att_students_{day_ref_index}_{lesson_index}_{day_page}_{page - 1}' if page > 0 else 'starosta_noop',
+            ),
+            types.InlineKeyboardButton(text=f'📄 {page + 1}/{total_pages}', callback_data='starosta_noop'),
+            types.InlineKeyboardButton(
+                text='➡️',
+                callback_data=f'starosta_att_students_{day_ref_index}_{lesson_index}_{day_page}_{page + 1}' if page < total_pages - 1 else 'starosta_noop',
+            ),
+        )
+
+    keyboard.row(
+        types.InlineKeyboardButton(text='⬅️ К парам', callback_data=f'starosta_att_day_{day_ref_index}_{day_page}'),
+        types.InlineKeyboardButton(text='📅 К дням', callback_data=f'starosta_att_days_{day_page}'),
+    )
+    keyboard.add(types.InlineKeyboardButton(text='⬅️ В панель старосты', callback_data='starosta_open'))
+    return keyboard
+
+
+def _parse_starosta_attendance_numbers(callback_data: str, prefix: str, expected_parts: int):
+    """Извлекает числовые параметры attendance-callback."""
+    payload = str(callback_data or '')
+    if not payload.startswith(prefix):
+        return None
+
+    parts = payload[len(prefix):].split('_')
+    if len(parts) != expected_parts:
+        return None
+
+    try:
+        return [int(part) for part in parts]
+    except (TypeError, ValueError):
+        return None
+
+
+def _resolve_starosta_attendance_day(day_refs, day_ref_index: int):
+    """Возвращает выбранный день посещаемости по индексу."""
+    if day_ref_index < 0 or day_ref_index >= len(day_refs):
+        return None
+    return day_refs[day_ref_index]
+
+
+def _resolve_starosta_attendance_lesson(day_ref: dict, lesson_index: int):
+    """Возвращает выбранную пару по индексу."""
+    lessons = day_ref.get('lessons') or []
+    if lesson_index < 0 or lesson_index >= len(lessons):
+        return None
+    return lessons[lesson_index]
+
+
+def _build_starosta_attendance_access_denied_text():
+    """Возвращает стандартный текст отказа в доступе."""
+    return '⚠️ У вас нет доступа к панели старосты'
+
+
+async def _render_starosta_attendance_days(target, state: FSMContext, telegram_id: int, *, page: int | None = None, edit: bool):
+    """Показывает список дней для отметки посещаемости."""
+    access, available_groups, current_group = await _resolve_starosta_context(state, telegram_id)
+    if not access.get('has_access'):
+        if edit:
+            await target.answer(_build_starosta_attendance_access_denied_text(), show_alert=True)
+        else:
+            await target.answer(_build_starosta_attendance_access_denied_text())
+        return False
+
+    if not current_group or not _starosta_can_access_group(access, current_group):
+        if edit:
+            await target.answer('⚠️ Сначала выберите доступную группу', show_alert=True)
+        else:
+            await target.answer('⚠️ Сначала выберите доступную группу')
+        return False
+
+    day_refs = _build_starosta_attendance_day_refs(current_group)
+    if page is None:
+        page = _nearest_starosta_attendance_day_page(day_refs)
+
+    total_pages = max(1, (len(day_refs) + STAROSTA_ATTENDANCE_DAYS_PAGE_SIZE - 1) // STAROSTA_ATTENDANCE_DAYS_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    text = _build_starosta_attendance_days_text(current_group, day_refs, page)
+    keyboard = _build_starosta_attendance_days_keyboard(day_refs, page)
+
+    if edit:
+        await _safe_edit_text(target.message, text, reply_markup=keyboard, parse_mode='HTML')
+        await target.answer()
+    else:
+        await target.answer(text, reply_markup=keyboard, parse_mode='HTML')
+    return True
+
+
+async def _render_starosta_attendance_lessons(target, state: FSMContext, telegram_id: int, *, day_ref_index: int, origin_page: int):
+    """Показывает список пар выбранного дня."""
+    access, _, current_group = await _resolve_starosta_context(state, telegram_id)
+    if not access.get('has_access'):
+        await target.answer(_build_starosta_attendance_access_denied_text(), show_alert=True)
+        return False
+
+    if not current_group or not _starosta_can_access_group(access, current_group):
+        await target.answer('⚠️ Сначала выберите доступную группу', show_alert=True)
+        return False
+
+    day_refs = _build_starosta_attendance_day_refs(current_group)
+    day_ref = _resolve_starosta_attendance_day(day_refs, day_ref_index)
+    if day_ref is None:
+        await target.answer('⚠️ День для посещаемости не найден', show_alert=True)
+        return False
+
+    text = _build_starosta_attendance_lessons_text(current_group, day_ref)
+    keyboard = _build_starosta_attendance_lessons_keyboard(day_ref_index, day_ref, origin_page)
+    await _safe_edit_text(target.message, text, reply_markup=keyboard, parse_mode='HTML')
+    await target.answer()
+    return True
+
+
+async def _render_starosta_attendance_marks(target, state: FSMContext, telegram_id: int, *, day_ref_index: int, lesson_index: int, day_page: int, students_page: int):
+    """Показывает экран отметок по ученикам для выбранной пары."""
+    access, available_groups, current_group = await _resolve_starosta_context(state, telegram_id)
+    if not access.get('has_access'):
+        await target.answer(_build_starosta_attendance_access_denied_text(), show_alert=True)
+        return False
+
+    if not current_group or not _starosta_can_access_group(access, current_group):
+        await target.answer('⚠️ Сначала выберите доступную группу', show_alert=True)
+        return False
+
+    day_refs = _build_starosta_attendance_day_refs(current_group)
+    day_ref = _resolve_starosta_attendance_day(day_refs, day_ref_index)
+    if day_ref is None:
+        await target.answer('⚠️ День для посещаемости не найден', show_alert=True)
+        return False
+
+    lesson = _resolve_starosta_attendance_lesson(day_ref, lesson_index)
+    if lesson is None:
+        await target.answer('⚠️ Пара не найдена', show_alert=True)
+        return False
+
+    students = await db_commands.get_group_students(
+        current_group,
+        allowed_group_codes=None if access.get('is_super') else available_groups,
+    )
+    marks = await db_commands.get_group_attendance_marks(
+        current_group,
+        day_ref['date_obj'],
+        lesson_index + 1,
+    )
+
+    total_pages = max(1, (len(students) + STAROSTA_ATTENDANCE_STUDENTS_PAGE_SIZE - 1) // STAROSTA_ATTENDANCE_STUDENTS_PAGE_SIZE)
+    students_page = max(0, min(students_page, total_pages - 1))
+    text = _build_starosta_attendance_marks_text(
+        current_group,
+        day_ref,
+        lesson_index,
+        lesson,
+        students,
+        marks,
+        students_page,
+    )
+    keyboard = _build_starosta_attendance_marks_keyboard(
+        day_ref_index,
+        lesson_index,
+        day_page,
+        students,
+        marks,
+        students_page,
+    )
+    await _safe_edit_text(target.message, text, reply_markup=keyboard, parse_mode='HTML')
+    await target.answer()
+    return True
 
 def _build_admin_panel_keyboard():
     """Строит клавиатуру админ-панели."""
@@ -2450,6 +2909,149 @@ async def starosta_start_group_message(callback_query: types.CallbackQuery, stat
     await callback_query.answer()
 
 
+async def starosta_attendance_open(callback_query: types.CallbackQuery, state: FSMContext):
+    """Открывает раздел посещаемости в панели старосты."""
+    await _render_starosta_attendance_days(
+        callback_query,
+        state,
+        _telegram_id_from_callback(callback_query),
+        page=None,
+        edit=True,
+    )
+
+
+async def starosta_attendance_days(callback_query: types.CallbackQuery, state: FSMContext):
+    """Листает страницы дней в разделе посещаемости."""
+    parsed = _parse_starosta_attendance_numbers(callback_query.data, 'starosta_att_days_', 1)
+    page = parsed[0] if parsed else 0
+    await _render_starosta_attendance_days(
+        callback_query,
+        state,
+        _telegram_id_from_callback(callback_query),
+        page=page,
+        edit=True,
+    )
+
+
+async def starosta_attendance_open_day(callback_query: types.CallbackQuery, state: FSMContext):
+    """Открывает пары выбранного дня в разделе посещаемости."""
+    parsed = _parse_starosta_attendance_numbers(callback_query.data, 'starosta_att_day_', 2)
+    if parsed is None:
+        await callback_query.answer('⚠️ Не удалось открыть день', show_alert=True)
+        return
+
+    day_ref_index, origin_page = parsed
+    await _render_starosta_attendance_lessons(
+        callback_query,
+        state,
+        _telegram_id_from_callback(callback_query),
+        day_ref_index=day_ref_index,
+        origin_page=origin_page,
+    )
+
+
+async def starosta_attendance_open_lesson(callback_query: types.CallbackQuery, state: FSMContext):
+    """Открывает отметки учеников на выбранной паре."""
+    parsed = _parse_starosta_attendance_numbers(callback_query.data, 'starosta_att_lesson_', 3)
+    if parsed is None:
+        await callback_query.answer('⚠️ Не удалось открыть пару', show_alert=True)
+        return
+
+    day_ref_index, lesson_index, day_page = parsed
+    await _render_starosta_attendance_marks(
+        callback_query,
+        state,
+        _telegram_id_from_callback(callback_query),
+        day_ref_index=day_ref_index,
+        lesson_index=lesson_index,
+        day_page=day_page,
+        students_page=0,
+    )
+
+
+async def starosta_attendance_change_students_page(callback_query: types.CallbackQuery, state: FSMContext):
+    """Листает страницы учеников на выбранной паре."""
+    parsed = _parse_starosta_attendance_numbers(callback_query.data, 'starosta_att_students_', 4)
+    if parsed is None:
+        await callback_query.answer('⚠️ Не удалось открыть страницу', show_alert=True)
+        return
+
+    day_ref_index, lesson_index, day_page, students_page = parsed
+    await _render_starosta_attendance_marks(
+        callback_query,
+        state,
+        _telegram_id_from_callback(callback_query),
+        day_ref_index=day_ref_index,
+        lesson_index=lesson_index,
+        day_page=day_page,
+        students_page=students_page,
+    )
+
+
+async def starosta_attendance_toggle_mark(callback_query: types.CallbackQuery, state: FSMContext):
+    """Переключает отметку посещаемости ученика."""
+    parsed = _parse_starosta_attendance_numbers(callback_query.data, 'starosta_att_mark_', 5)
+    if parsed is None:
+        await callback_query.answer('⚠️ Не удалось изменить отметку', show_alert=True)
+        return
+
+    day_ref_index, lesson_index, student_telegram_id, day_page, students_page = parsed
+    telegram_id = _telegram_id_from_callback(callback_query)
+    access, available_groups, current_group = await _resolve_starosta_context(state, telegram_id)
+    if not access.get('has_access'):
+        await callback_query.answer(_build_starosta_attendance_access_denied_text(), show_alert=True)
+        return
+
+    if not current_group or not _starosta_can_access_group(access, current_group):
+        await callback_query.answer('⚠️ Сначала выберите доступную группу', show_alert=True)
+        return
+
+    day_refs = _build_starosta_attendance_day_refs(current_group)
+    day_ref = _resolve_starosta_attendance_day(day_refs, day_ref_index)
+    if day_ref is None:
+        await callback_query.answer('⚠️ День для посещаемости не найден', show_alert=True)
+        return
+
+    lesson = _resolve_starosta_attendance_lesson(day_ref, lesson_index)
+    if lesson is None:
+        await callback_query.answer('⚠️ Пара не найдена', show_alert=True)
+        return
+
+    students = await db_commands.get_group_students(
+        current_group,
+        allowed_group_codes=None if access.get('is_super') else available_groups,
+    )
+    if not any(int(student['telegram_id']) == student_telegram_id for student in students):
+        await callback_query.answer('⚠️ Ученик не найден в выбранной группе', show_alert=True)
+        return
+
+    marks = await db_commands.get_group_attendance_marks(
+        current_group,
+        day_ref['date_obj'],
+        lesson_index + 1,
+    )
+    next_status = _starosta_cycle_attendance_status(marks.get(student_telegram_id))
+    await db_commands.upsert_group_attendance_mark(
+        group_code=current_group,
+        target_date=day_ref['date_obj'],
+        lesson_index=lesson_index + 1,
+        lesson_time=_normalize_cell_text(lesson.get('time')) or 'Время не указано',
+        lesson_title=_normalize_cell_text(lesson.get('lesson')) or _normalize_cell_text(lesson.get('subject')),
+        student_telegram_id=student_telegram_id,
+        status=next_status,
+        marked_by_telegram_id=telegram_id,
+    )
+
+    await _render_starosta_attendance_marks(
+        callback_query,
+        state,
+        telegram_id,
+        day_ref_index=day_ref_index,
+        lesson_index=lesson_index,
+        day_page=day_page,
+        students_page=students_page,
+    )
+
 async def starosta_message_cancel(callback_query: types.CallbackQuery, state: FSMContext):
     """Отменяет ввод сообщения от старосты."""
     telegram_id = _telegram_id_from_callback(callback_query)
@@ -3206,6 +3808,8 @@ ROOM_PATTERN = re.compile(r'(?i)\b(?:ауд\.?|каб\.?|кабинет|лаб\.
 ADMIN_USERS_PAGE_SIZE = 8
 ADMIN_FILTER_PAGE_SIZE = 8
 EVENTS_PAGE_SIZE = 8
+STAROSTA_ATTENDANCE_DAYS_PAGE_SIZE = 7
+STAROSTA_ATTENDANCE_STUDENTS_PAGE_SIZE = 8
 
 
 def _telegram_id_from_message(message: types.Message):
@@ -7297,6 +7901,12 @@ def register_handlers_client(dp: Dispatcher):
     dp.register_callback_query_handler(starosta_start_single_message, Text(startswith='starosta_users_message_'), state='*')
     dp.register_callback_query_handler(starosta_start_group_message, Text(equals='starosta_group_message'), state='*')
     dp.register_callback_query_handler(starosta_start_group_message, Text(equals='starosta_users_broadcast'), state='*')
+    dp.register_callback_query_handler(starosta_attendance_open, Text(equals='starosta_att'), state='*')
+    dp.register_callback_query_handler(starosta_attendance_days, Text(startswith='starosta_att_days_'), state='*')
+    dp.register_callback_query_handler(starosta_attendance_open_day, Text(startswith='starosta_att_day_'), state='*')
+    dp.register_callback_query_handler(starosta_attendance_open_lesson, Text(startswith='starosta_att_lesson_'), state='*')
+    dp.register_callback_query_handler(starosta_attendance_change_students_page, Text(startswith='starosta_att_students_'), state='*')
+    dp.register_callback_query_handler(starosta_attendance_toggle_mark, Text(startswith='starosta_att_mark_'), state='*')
     dp.register_callback_query_handler(starosta_message_cancel, Text(equals='starosta_message_cancel'), state='*')
     dp.register_callback_query_handler(starosta_noop, Text(equals='starosta_noop'), state='*')
     dp.register_callback_query_handler(admin_event_create_start, Text(equals='admin_event_create'), state='*')

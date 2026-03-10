@@ -66,6 +66,33 @@ class GroupStarostaAssignment(Base):
     updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
+class GroupAttendanceMark(Base):
+    """Отметка посещаемости ученика на конкретной паре группы."""
+
+    __tablename__ = 'group_attendance_marks'
+    __table_args__ = (
+        UniqueConstraint(
+            'group_code',
+            'target_date',
+            'lesson_index',
+            'student_telegram_id',
+            name='uq_group_attendance_mark',
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    group_code = Column(String(64), nullable=False, index=True)
+    target_date = Column(Date, nullable=False, index=True)
+    lesson_index = Column(Integer, nullable=False)
+    lesson_time = Column(String(64), nullable=False)
+    lesson_title = Column(Text, nullable=True)
+    student_telegram_id = Column(BigInteger, nullable=False, index=True)
+    status = Column(String(16), nullable=False, index=True)
+    marked_by_telegram_id = Column(BigInteger, nullable=True, index=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 class UserScheduleState(Base):
     """Сохраненное состояние выбора расписания для пользователя."""
 

@@ -12,6 +12,7 @@ from db_api.tables import (
     BotCallbackPayload,
     BotEvent,
     BotStarostaSession,
+    GroupAttendanceMark,
     GroupStarostaAssignment,
     Users,
     UserScheduleState,
@@ -111,6 +112,13 @@ def _normalize_event_notifications_enabled(value: Any) -> bool:
     if value is None:
         return True
     return bool(value)
+
+
+def _normalize_attendance_status(value: Any) -> str | None:
+    normalized = str(value or '').strip().lower()
+    if normalized in {'present', 'absent'}:
+        return normalized
+    return None
 
 
 async def registration_check(telegram_id):
@@ -698,6 +706,160 @@ async def get_admin_message_recipients(
         )
 
     return recipients
+
+
+async def get_group_students(group_code: str, allowed_group_codes: list[str] | None = None):
+    """Возвращает пользователей выбранной группы для панели старосты."""
+    normalized_group = str(group_code or '').strip() or None
+    normalized_allowed_groups = {
+        str(group).strip()
+        for group in (allowed_group_codes or [])
+        if str(group).strip()
+    }
+
+    if not normalized_group:
+        return []
+
+    if normalized_allowed_groups and normalized_group not in normalized_allowed_groups:
+        return []
+
+    async with get_session() as session:
+        result = await session.execute(
+            select(
+                Users.telegram_id,
+                Users.username,
+            )
+            .select_from(Users)
+            .join(UserScheduleState, UserScheduleState.telegram_id == Users.telegram_id)
+            .where(UserScheduleState.selected_group == normalized_group)
+        )
+        rows = result.all()
+
+    students = [
+        {
+            'telegram_id': row.telegram_id,
+            'username': str(row.username or '').strip() or None,
+            'selected_group': normalized_group,
+        }
+        for row in rows
+    ]
+    students.sort(
+        key=lambda item: (
+            (item.get('username') or '').casefold() if item.get('username') else '~~~',
+            int(item.get('telegram_id') or 0),
+        )
+    )
+    return students
+
+
+async def get_group_attendance_marks(group_code: str, target_date, lesson_index: int):
+    """Возвращает отметки посещаемости по ученикам для конкретной пары."""
+    normalized_group = str(group_code or '').strip() or None
+    if not normalized_group or target_date is None:
+        return {}
+
+    try:
+        normalized_lesson_index = int(lesson_index)
+    except (TypeError, ValueError):
+        return {}
+
+    async with get_session() as session:
+        result = await session.execute(
+            select(
+                GroupAttendanceMark.student_telegram_id,
+                GroupAttendanceMark.status,
+            ).where(
+                GroupAttendanceMark.group_code == normalized_group,
+                GroupAttendanceMark.target_date == target_date,
+                GroupAttendanceMark.lesson_index == normalized_lesson_index,
+            )
+        )
+        rows = result.all()
+
+    return {
+        int(row.student_telegram_id): str(row.status).strip()
+        for row in rows
+        if row.student_telegram_id is not None and str(row.status).strip()
+    }
+
+
+async def upsert_group_attendance_mark(
+    *,
+    group_code: str,
+    target_date,
+    lesson_index: int,
+    lesson_time: str,
+    lesson_title: str | None,
+    student_telegram_id: int,
+    status: str | None,
+    marked_by_telegram_id: int | None = None,
+):
+    """Создает, обновляет или удаляет отметку посещаемости ученика."""
+    normalized_group = str(group_code or '').strip() or None
+    normalized_status = _normalize_attendance_status(status)
+    normalized_time = str(lesson_time or '').strip()
+    normalized_title = str(lesson_title or '').strip() or None
+
+    if not normalized_group or target_date is None or not normalized_time:
+        return None
+
+    try:
+        normalized_lesson_index = int(lesson_index)
+        normalized_student_id = int(student_telegram_id)
+    except (TypeError, ValueError):
+        return None
+
+    async with get_session() as session:
+        result = await session.execute(
+            select(GroupAttendanceMark).where(
+                GroupAttendanceMark.group_code == normalized_group,
+                GroupAttendanceMark.target_date == target_date,
+                GroupAttendanceMark.lesson_index == normalized_lesson_index,
+                GroupAttendanceMark.student_telegram_id == normalized_student_id,
+            )
+        )
+        row = result.scalar_one_or_none()
+
+        if normalized_status is None:
+            if row is not None:
+                await session.delete(row)
+                await session.commit()
+            return None
+
+        if row is None:
+            row = GroupAttendanceMark(
+                group_code=normalized_group,
+                target_date=target_date,
+                lesson_index=normalized_lesson_index,
+                lesson_time=normalized_time[:64],
+                lesson_title=normalized_title,
+                student_telegram_id=normalized_student_id,
+                status=normalized_status,
+                marked_by_telegram_id=marked_by_telegram_id,
+                created_at=datetime.utcnow(),
+                updated_at=datetime.utcnow(),
+            )
+            session.add(row)
+        else:
+            row.lesson_time = normalized_time[:64]
+            row.lesson_title = normalized_title
+            row.status = normalized_status
+            row.marked_by_telegram_id = marked_by_telegram_id
+            row.updated_at = datetime.utcnow()
+
+        await session.commit()
+
+        return {
+            'group_code': row.group_code,
+            'target_date': row.target_date,
+            'lesson_index': row.lesson_index,
+            'lesson_time': row.lesson_time,
+            'lesson_title': row.lesson_title,
+            'student_telegram_id': row.student_telegram_id,
+            'status': row.status,
+            'marked_by_telegram_id': row.marked_by_telegram_id,
+            'updated_at': row.updated_at,
+        }
 
 
 def _event_row_to_dict(event_row: BotEvent | None):
