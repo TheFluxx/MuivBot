@@ -28,10 +28,8 @@ def get_main_keyboard():
     """Создает основную клавиатуру бота."""
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
     kb.add(types.KeyboardButton("📅 Мое расписание"))
-    kb.add(types.KeyboardButton("📊 Посещаемость"))
-    kb.add(types.KeyboardButton("🔎 Поиск"))
-    kb.add(types.KeyboardButton("🎉 События"))
-    kb.add(types.KeyboardButton("💼 Настройки"))
+    kb.row(types.KeyboardButton("📊 Посещаемость"), types.KeyboardButton("🔎 Поиск"))
+    kb.row(types.KeyboardButton("🎉 События"), types.KeyboardButton("💼 Настройки"))
     return kb
 
 
@@ -440,11 +438,13 @@ async def _resolve_teacher_context(state: FSMContext, telegram_id: int):
         key=str.casefold,
     )
 
-    current_teacher = _normalize_teacher_name(user_data.get('teacher_selected_name')) or None
+    current_teacher = _normalize_teacher_name(
+        user_data.get('teacher_selected_name') or user_data.get('selected_teacher_name')
+    ) or None
     if current_teacher not in available_teachers:
         current_teacher = available_teachers[0] if available_teachers else None
 
-    await state.update_data(teacher_selected_name=current_teacher)
+    await state.update_data(teacher_selected_name=current_teacher, selected_teacher_name=current_teacher)
     return access, available_teachers, current_teacher
 
 
@@ -467,11 +467,12 @@ def _build_teacher_panel_text(access: dict, current_teacher: str | None, teacher
             f"👨‍🏫 Текущий преподаватель: <b>{html.escape(current_teacher or 'не выбран')}</b>",
             f"📚 Доступные преподаватели: <b>{html.escape(available_text)}</b>",
             f"🧾 В списке преподавателей: <b>{teachers_count}</b>",
+            f"⏰ Напоминания о парах: <b>{html.escape(_lesson_reminder_label(access.get('teacher_lesson_reminder_minutes')))}</b>",
         ]
     )
 
 
-def _build_teacher_panel_keyboard(current_teacher: str | None, can_switch_teachers: bool):
+def _build_teacher_panel_keyboard(current_teacher: str | None, can_switch_teachers: bool, teacher_reminder_minutes: int | None):
     """Строит клавиатуру панели учителя."""
     keyboard = types.InlineKeyboardMarkup(row_width=1)
     if can_switch_teachers or not current_teacher:
@@ -494,6 +495,12 @@ def _build_teacher_panel_keyboard(current_teacher: str | None, can_switch_teache
                 callback_data='teacher_hw',
             )
         )
+    keyboard.add(
+        types.InlineKeyboardButton(
+            text=f"⏰ Напоминания: {_lesson_reminder_label(teacher_reminder_minutes)}",
+            callback_data='teacher_reminder_toggle',
+        )
+    )
     keyboard.row(
         types.InlineKeyboardButton(text='🔄 Обновить', callback_data='teacher_open'),
         types.InlineKeyboardButton(text='🚪 Выйти', callback_data='teacher_logout'),
@@ -1567,10 +1574,14 @@ async def _render_teacher_panel(target, state: FSMContext, telegram_id: int, *, 
             await target.answer('⚠️ У вас нет доступа к панели учителя')
         return False
 
+    user_data = await _get_user_data_with_db_fallback(state, telegram_id)
+    teacher_reminder_minutes = _lesson_reminder_minutes_from_user_data(user_data, 'teacher_lesson_reminder_minutes')
+    access = {**access, 'teacher_lesson_reminder_minutes': teacher_reminder_minutes}
     text = _build_teacher_panel_text(access, current_teacher, len(available_teachers))
     keyboard = _build_teacher_panel_keyboard(
         current_teacher,
         can_switch_teachers=bool(access.get('is_super') or len(available_teachers) > 1 or not current_teacher),
+        teacher_reminder_minutes=teacher_reminder_minutes,
     )
 
     if edit:
@@ -1753,6 +1764,11 @@ async def teacher_set(callback_query: types.CallbackQuery, state: FSMContext):
         await callback_query.answer('⚠️ Преподаватель не найден', show_alert=True)
         return
 
+    await _update_user_selection(
+        state,
+        telegram_id,
+        selected_teacher_name=available_teachers[selected_index],
+    )
     await state.update_data(teacher_selected_name=available_teachers[selected_index])
     await _render_teacher_panel(callback_query, state, telegram_id, edit=True)
     await callback_query.answer('Преподаватель выбран')
@@ -5414,9 +5430,47 @@ def _digest_settings_from_user_data(user_data):
     return enabled, hour % 24, max(0, min(59, minute))
 
 
+def _lesson_reminder_minutes_from_user_data(user_data, key: str):
+    """Возвращает нормализованную настройку напоминаний о парах."""
+    value = user_data.get(key)
+    if value in (None, '', 0, '0', 'off', 'none', 'null'):
+        return None
+    try:
+        minutes = int(value)
+    except (TypeError, ValueError):
+        return None
+    if minutes in LESSON_REMINDER_OPTIONS[1:]:
+        return minutes
+    return None
+
+
+def _lesson_reminder_label(minutes: int | None):
+    """Возвращает читаемую подпись настройки напоминаний."""
+    if minutes is None:
+        return 'отключены ❌'
+    return f'за {int(minutes)} мин ✅'
+
+
+def _next_lesson_reminder_value(current_value: int | None):
+    """Переключает напоминания по циклу: выкл -> 10 -> 30 -> 60 -> 120 -> выкл."""
+    try:
+        index = LESSON_REMINDER_OPTIONS.index(current_value)
+    except ValueError:
+        index = 0
+    return LESSON_REMINDER_OPTIONS[(index + 1) % len(LESSON_REMINDER_OPTIONS)]
+
+
 def _event_notifications_enabled_from_user_data(user_data):
     """Возвращает нормализованный флаг уведомлений о событиях."""
     value = user_data.get('event_notifications_enabled')
+    if value is None:
+        return True
+    return bool(value)
+
+
+def _schedule_change_notifications_enabled_from_user_data(user_data):
+    """Возвращает нормализованный флаг уведомлений об изменениях расписания."""
+    value = user_data.get('schedule_change_notifications_enabled')
     if value is None:
         return True
     return bool(value)
@@ -5428,6 +5482,8 @@ def _build_settings_text(user_data):
     group_code = user_data.get('selected_group')
     digest_enabled, digest_hour, digest_minute = _digest_settings_from_user_data(user_data)
     event_notifications_enabled = _event_notifications_enabled_from_user_data(user_data)
+    schedule_change_notifications_enabled = _schedule_change_notifications_enabled_from_user_data(user_data)
+    student_reminder_minutes = _lesson_reminder_minutes_from_user_data(user_data, 'student_lesson_reminder_minutes')
 
     lines = ['<b>💼 Настройки</b>', '']
 
@@ -5439,16 +5495,21 @@ def _build_settings_text(user_data):
 
     lines.append('')
     lines.append(
-        f"🔔 Вечерняя рассылка: <b>{'включена ✅' if digest_enabled else 'выключена ❌'}</b>"
+        f"🔔 Вечерняя рассылка расписания: <b>{'✅' if digest_enabled else '❌'}</b>"
     )
     lines.append(f"🕒 Время рассылки: <b>{digest_hour:02d}:{digest_minute:02d} МСК</b>")
     lines.append(
         f"🎉 Уведомления о событиях: <b>{'включены ✅' if event_notifications_enabled else 'выключены ❌'}</b>"
     )
+    lines.append(
+        "🔁 Уведомления об изменениях расписания: "
+        f"<b>{'включены ✅' if schedule_change_notifications_enabled else 'выключены ❌'}</b>"
+    )
+    lines.append(f"⏰ Напоминания о парах: <b>{_lesson_reminder_label(student_reminder_minutes)}</b>")
 
     if not group_code:
         lines.append('')
-        lines.append('ℹ️ Рассылка начнет работать после выбора группы.')
+        lines.append('ℹ️ Рассылка и напоминания начнут работать после выбора группы.')
 
     return '\n'.join(lines)
 
@@ -5458,6 +5519,8 @@ def _build_settings_keyboard(user_data):
     group_code = user_data.get('selected_group')
     digest_enabled, digest_hour, digest_minute = _digest_settings_from_user_data(user_data)
     event_notifications_enabled = _event_notifications_enabled_from_user_data(user_data)
+    schedule_change_notifications_enabled = _schedule_change_notifications_enabled_from_user_data(user_data)
+    student_reminder_minutes = _lesson_reminder_minutes_from_user_data(user_data, 'student_lesson_reminder_minutes')
 
     keyboard = types.InlineKeyboardMarkup(row_width=1)
     keyboard.add(
@@ -5468,7 +5531,13 @@ def _build_settings_keyboard(user_data):
     )
     keyboard.add(
         types.InlineKeyboardButton(
-            text="🔕 Выключить рассылку" if digest_enabled else "🔔 Включить рассылку",
+            text='🔕 Отключить события' if event_notifications_enabled else '🎉 Включить события',
+            callback_data='settings_events_toggle',
+        )
+    )
+    keyboard.add(
+        types.InlineKeyboardButton(
+            text="🔕 Выключить рассылку расписания" if digest_enabled else "🔔 Включить рассылку расписания",
             callback_data="settings_digest_toggle",
         )
     )
@@ -5482,8 +5551,18 @@ def _build_settings_keyboard(user_data):
     )
     keyboard.add(
         types.InlineKeyboardButton(
-            text='🔕 Отключить события' if event_notifications_enabled else '🎉 Включить события',
-            callback_data='settings_events_toggle',
+            text=f"⏰ Напоминания о парах: {_lesson_reminder_label(student_reminder_minutes)}",
+            callback_data='settings_student_reminder_toggle',
+        )
+    )
+    keyboard.add(
+        types.InlineKeyboardButton(
+            text=(
+                '🔕 Отключить изменения расписания'
+                if schedule_change_notifications_enabled
+                else '🔁 Включить изменения расписания'
+            ),
+            callback_data='settings_schedule_changes_toggle',
         )
     )
     return keyboard
@@ -5564,6 +5643,7 @@ period_courses = {}
 USER_SELECTION_KEYS = (
     'selected_course',
     'selected_course_name',
+    'selected_teacher_name',
     'selected_group',
     'selected_week_index',
     'selected_day_index',
@@ -5571,6 +5651,9 @@ USER_SELECTION_KEYS = (
     'daily_digest_hour',
     'daily_digest_minute',
     'event_notifications_enabled',
+    'schedule_change_notifications_enabled',
+    'student_lesson_reminder_minutes',
+    'teacher_lesson_reminder_minutes',
 )
 SEARCH_CALLBACK_CACHE = {}
 SEARCH_CALLBACK_LIMIT = 3000
@@ -5608,6 +5691,7 @@ EVENTS_PAGE_SIZE = 8
 STAROSTA_ATTENDANCE_DAYS_PAGE_SIZE = 7
 STAROSTA_ATTENDANCE_STUDENTS_PAGE_SIZE = 8
 TEACHER_HOMEWORK_PAGE_SIZE = 8
+LESSON_REMINDER_OPTIONS = (None, 10, 30, 60, 120)
 
 
 def _telegram_id_from_message(message: types.Message):
@@ -5653,7 +5737,16 @@ async def _get_user_data_with_db_fallback(state: FSMContext, telegram_id):
         'daily_digest_minute',
         'event_notifications_enabled',
     )
-    if all(key in user_data and user_data.get(key) is not None for key in required_keys):
+    optional_keys = (
+        'selected_teacher_name',
+        'schedule_change_notifications_enabled',
+        'student_lesson_reminder_minutes',
+        'teacher_lesson_reminder_minutes',
+    )
+    if (
+        all(key in user_data and user_data.get(key) is not None for key in required_keys)
+        and all(key in user_data for key in optional_keys)
+    ):
         return user_data
 
     db_payload = await _load_user_selection_from_db(telegram_id)
@@ -8670,6 +8763,66 @@ async def build_day_schedule_payload_by_date(course_name, group_code, target_dat
     }
 
 
+def get_group_lessons_by_date(course_name, group_code, target_date):
+    """Возвращает занятия группы на конкретную дату для фоновых напоминаний."""
+    if isinstance(target_date, datetime):
+        target_date = target_date.date()
+
+    target_day = _find_day_by_date(course_name, group_code, target_date)
+    if target_day is None:
+        return None
+
+    week_schedule = schedule_data.get(target_day['course'], {}).get(group_code, {}).get(target_day['week_label'], [])
+    lessons = _get_day_lessons(week_schedule, target_day['week_days'][target_day['day_index']]['day_name'])
+    return {
+        'course': target_day['course'],
+        'course_name': _course_name(target_day['course']),
+        'group_code': group_code,
+        'week_label': target_day['week_label'],
+        'date_obj': target_date,
+        'lessons': lessons,
+    }
+
+
+def get_teacher_lessons_by_date(teacher_name: str, target_date):
+    """Возвращает занятия преподавателя на конкретную дату для фоновых напоминаний."""
+    if isinstance(target_date, datetime):
+        target_date = target_date.date()
+
+    teacher_key = _teacher_lookup_key(teacher_name)
+    if not teacher_key or target_date is None:
+        return []
+
+    items = []
+    for occurrence in _collect_search_occurrences():
+        if occurrence.get('date_obj') != target_date:
+            continue
+        if _teacher_lookup_key(occurrence.get('teacher')) != teacher_key:
+            continue
+        items.append(
+            {
+                'course': occurrence.get('course'),
+                'course_name': occurrence.get('course_name'),
+                'group_code': occurrence.get('group_code'),
+                'date_obj': occurrence.get('date_obj'),
+                'time_text': occurrence.get('time_text'),
+                'lesson_text': occurrence.get('lesson_text'),
+                'subject': occurrence.get('subject'),
+                'teacher': occurrence.get('teacher'),
+                'room': occurrence.get('room'),
+            }
+        )
+
+    items.sort(
+        key=lambda item: (
+            _normalize_cell_text(item.get('time_text')),
+            _normalize_cell_text(item.get('group_code')),
+            _normalize_cell_text(item.get('course_name')),
+        )
+    )
+    return items
+
+
 def build_week_schedule_payload(course, group_code, week_index=None):
     """Возвращает данные страницы недели."""
     weeks = _get_available_weeks(course, group_code)
@@ -9600,7 +9753,7 @@ async def settings_shift_digest_time(callback_query: types.CallbackQuery, state:
         daily_digest_minute=digest_minute,
     )
     await _render_settings_view(callback_query.message, state, telegram_id, edit=True)
-    await callback_query.answer(f'Новое время: {digest_hour:02d}:{digest_minute:02d} МСК')
+    await callback_query.answer(f'Новое время рассылки расписания: {digest_hour:02d}:{digest_minute:02d} МСК')
 
 
 async def settings_toggle_event_notifications(callback_query: types.CallbackQuery, state: FSMContext):
@@ -9616,6 +9769,58 @@ async def settings_toggle_event_notifications(callback_query: types.CallbackQuer
     )
     await _render_settings_view(callback_query.message, state, telegram_id, edit=True)
     await callback_query.answer('Настройки событий обновлены')
+
+
+async def settings_toggle_schedule_change_notifications(callback_query: types.CallbackQuery, state: FSMContext):
+    """Переключает уведомления пользователя об изменениях расписания."""
+    telegram_id = _telegram_id_from_callback(callback_query)
+    user_data = await _get_user_data_with_db_fallback(state, telegram_id)
+    current_value = _schedule_change_notifications_enabled_from_user_data(user_data)
+
+    await _update_user_selection(
+        state,
+        telegram_id,
+        schedule_change_notifications_enabled=not current_value,
+    )
+    await _render_settings_view(callback_query.message, state, telegram_id, edit=True)
+    await callback_query.answer('Настройки уведомлений об изменениях расписания обновлены')
+
+
+async def settings_toggle_student_lesson_reminder(callback_query: types.CallbackQuery, state: FSMContext):
+    """Переключает настройку напоминаний о парах для ученика."""
+    telegram_id = _telegram_id_from_callback(callback_query)
+    user_data = await _get_user_data_with_db_fallback(state, telegram_id)
+    current_value = _lesson_reminder_minutes_from_user_data(user_data, 'student_lesson_reminder_minutes')
+    next_value = _next_lesson_reminder_value(current_value)
+
+    await _update_user_selection(
+        state,
+        telegram_id,
+        student_lesson_reminder_minutes=next_value,
+    )
+    await _render_settings_view(callback_query.message, state, telegram_id, edit=True)
+    await callback_query.answer(f'Напоминания о парах: {_lesson_reminder_label(next_value)}')
+
+
+async def teacher_toggle_lesson_reminder(callback_query: types.CallbackQuery, state: FSMContext):
+    """Переключает настройку напоминаний о парах в панели учителя."""
+    telegram_id = _telegram_id_from_callback(callback_query)
+    access = await db_commands.get_teacher_access(telegram_id)
+    if not access.get('has_access'):
+        await callback_query.answer('⚠️ У вас нет доступа к панели учителя', show_alert=True)
+        return
+
+    user_data = await _get_user_data_with_db_fallback(state, telegram_id)
+    current_value = _lesson_reminder_minutes_from_user_data(user_data, 'teacher_lesson_reminder_minutes')
+    next_value = _next_lesson_reminder_value(current_value)
+
+    await _update_user_selection(
+        state,
+        telegram_id,
+        teacher_lesson_reminder_minutes=next_value,
+    )
+    await _render_teacher_panel(callback_query, state, telegram_id, edit=True)
+    await callback_query.answer(f'Напоминания о парах: {_lesson_reminder_label(next_value)}')
 
 
 async def settings_time_noop(callback_query: types.CallbackQuery):
@@ -9707,12 +9912,18 @@ def register_handlers_client(dp: Dispatcher):
     dp.register_callback_query_handler(settings_toggle_digest, Text(equals="settings_digest_toggle"))
     dp.register_callback_query_handler(settings_shift_digest_time, Text(startswith="settings_digest_time_"))
     dp.register_callback_query_handler(settings_toggle_event_notifications, Text(equals='settings_events_toggle'))
+    dp.register_callback_query_handler(
+        settings_toggle_schedule_change_notifications,
+        Text(equals='settings_schedule_changes_toggle'),
+    )
+    dp.register_callback_query_handler(settings_toggle_student_lesson_reminder, Text(equals='settings_student_reminder_toggle'))
     dp.register_callback_query_handler(settings_time_noop, Text(equals="settings_time_noop"))
     dp.register_callback_query_handler(admin_open, Text(equals='admin_open'), state='*')
     dp.register_callback_query_handler(admin_refresh, Text(equals='admin_refresh'), state='*')
     dp.register_callback_query_handler(admin_logout, Text(equals='admin_logout'), state='*')
     dp.register_callback_query_handler(teacher_open, Text(equals='teacher_open'), state='*')
     dp.register_callback_query_handler(teacher_logout, Text(equals='teacher_logout'), state='*')
+    dp.register_callback_query_handler(teacher_toggle_lesson_reminder, Text(equals='teacher_reminder_toggle'), state='*')
     dp.register_callback_query_handler(teacher_pick, Text(startswith='teacher_pick_'), state='*')
     dp.register_callback_query_handler(teacher_set, Text(startswith='teacher_set_'), state='*')
     dp.register_callback_query_handler(teacher_show_schedule, Text(equals='teacher_show_schedule'), state='*')

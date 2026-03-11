@@ -29,6 +29,11 @@ def _run_schema_migrations(sync_conn):
                 "ALTER TABLE user_schedule_states "
                 "ADD COLUMN daily_digest_enabled BOOLEAN NOT NULL DEFAULT TRUE"
             )
+        if 'selected_teacher_name' not in existing_columns:
+            alter_statements.append(
+                "ALTER TABLE user_schedule_states "
+                "ADD COLUMN selected_teacher_name VARCHAR(255) NULL"
+            )
         if 'daily_digest_hour' not in existing_columns:
             alter_statements.append(
                 "ALTER TABLE user_schedule_states "
@@ -43,6 +48,21 @@ def _run_schema_migrations(sync_conn):
             alter_statements.append(
                 "ALTER TABLE user_schedule_states "
                 "ADD COLUMN event_notifications_enabled BOOLEAN NOT NULL DEFAULT TRUE"
+            )
+        if 'schedule_change_notifications_enabled' not in existing_columns:
+            alter_statements.append(
+                "ALTER TABLE user_schedule_states "
+                "ADD COLUMN schedule_change_notifications_enabled BOOLEAN NOT NULL DEFAULT TRUE"
+            )
+        if 'student_lesson_reminder_minutes' not in existing_columns:
+            alter_statements.append(
+                "ALTER TABLE user_schedule_states "
+                "ADD COLUMN student_lesson_reminder_minutes INTEGER NULL"
+            )
+        if 'teacher_lesson_reminder_minutes' not in existing_columns:
+            alter_statements.append(
+                "ALTER TABLE user_schedule_states "
+                "ADD COLUMN teacher_lesson_reminder_minutes INTEGER NULL"
             )
 
         for statement in alter_statements:

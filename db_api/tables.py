@@ -156,6 +156,7 @@ class UserScheduleState(Base):
     telegram_id = Column(BigInteger, nullable=False, unique=True, index=True)
     selected_course = Column(String(255), nullable=True)
     selected_course_name = Column(String(255), nullable=True)
+    selected_teacher_name = Column(String(255), nullable=True)
     selected_group = Column(String(64), nullable=True)
     selected_week_index = Column(Integer, nullable=True)
     selected_day_index = Column(Integer, nullable=True)
@@ -163,6 +164,9 @@ class UserScheduleState(Base):
     daily_digest_hour = Column(Integer, nullable=False, default=20)
     daily_digest_minute = Column(Integer, nullable=False, default=0)
     event_notifications_enabled = Column(Boolean, nullable=False, default=True)
+    schedule_change_notifications_enabled = Column(Boolean, nullable=False, default=True)
+    student_lesson_reminder_minutes = Column(Integer, nullable=True)
+    teacher_lesson_reminder_minutes = Column(Integer, nullable=True)
     updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
@@ -182,6 +186,26 @@ class UserDailyNotification(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     telegram_id = Column(BigInteger, nullable=False, index=True)
     notification_type = Column(String(64), nullable=False, index=True)
+    target_date = Column(Date, nullable=False, index=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+
+class UserLessonReminderNotification(Base):
+    """Факт отправки напоминания о конкретной паре пользователю."""
+
+    __tablename__ = 'user_lesson_reminder_notifications'
+    __table_args__ = (
+        UniqueConstraint(
+            'telegram_id',
+            'reminder_key',
+            name='uq_user_lesson_reminder_notification',
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    telegram_id = Column(BigInteger, nullable=False, index=True)
+    reminder_type = Column(String(32), nullable=False, index=True)
+    reminder_key = Column(String(255), nullable=False, index=True)
     target_date = Column(Date, nullable=False, index=True)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
 

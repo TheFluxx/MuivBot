@@ -18,6 +18,7 @@ from db_api.tables import (
     LessonHomework,
     TeacherAssignment,
     Users,
+    UserLessonReminderNotification,
     UserScheduleState,
     UserDailyNotification,
     ScheduleCourse,
@@ -42,9 +43,11 @@ EMPTY_DATE_MARKERS = {'', 'не указана', 'none', 'null'}
 DEFAULT_DAILY_DIGEST_ENABLED = True
 DEFAULT_DAILY_DIGEST_HOUR = 20
 DEFAULT_DAILY_DIGEST_MINUTE = 0
+ALLOWED_LESSON_REMINDER_MINUTES = (10, 30, 60, 120)
 USER_SCHEDULE_FIELDS = (
     'selected_course',
     'selected_course_name',
+    'selected_teacher_name',
     'selected_group',
     'selected_week_index',
     'selected_day_index',
@@ -52,6 +55,9 @@ USER_SCHEDULE_FIELDS = (
     'daily_digest_hour',
     'daily_digest_minute',
     'event_notifications_enabled',
+    'schedule_change_notifications_enabled',
+    'student_lesson_reminder_minutes',
+    'teacher_lesson_reminder_minutes',
 )
 
 
@@ -115,6 +121,24 @@ def _normalize_event_notifications_enabled(value: Any) -> bool:
     if value is None:
         return True
     return bool(value)
+
+
+def _normalize_schedule_change_notifications_enabled(value: Any) -> bool:
+    if value is None:
+        return True
+    return bool(value)
+
+
+def _normalize_lesson_reminder_minutes(value: Any) -> int | None:
+    if value in (None, '', 0, '0', 'off', 'none', 'null'):
+        return None
+    try:
+        minutes = int(value)
+    except (TypeError, ValueError):
+        return None
+    if minutes in ALLOWED_LESSON_REMINDER_MINUTES:
+        return minutes
+    return None
 
 
 def _normalize_attendance_status(value: Any) -> str | None:
@@ -1402,6 +1426,7 @@ async def get_user_schedule_state(telegram_id: int):
         return {
             'selected_course': state_row.selected_course,
             'selected_course_name': state_row.selected_course_name,
+            'selected_teacher_name': state_row.selected_teacher_name,
             'selected_group': state_row.selected_group,
             'selected_week_index': state_row.selected_week_index,
             'selected_day_index': state_row.selected_day_index,
@@ -1410,6 +1435,15 @@ async def get_user_schedule_state(telegram_id: int):
             'daily_digest_minute': _normalize_daily_digest_minute(state_row.daily_digest_minute),
             'event_notifications_enabled': _normalize_event_notifications_enabled(
                 state_row.event_notifications_enabled
+            ),
+            'schedule_change_notifications_enabled': _normalize_schedule_change_notifications_enabled(
+                state_row.schedule_change_notifications_enabled
+            ),
+            'student_lesson_reminder_minutes': _normalize_lesson_reminder_minutes(
+                state_row.student_lesson_reminder_minutes
+            ),
+            'teacher_lesson_reminder_minutes': _normalize_lesson_reminder_minutes(
+                state_row.teacher_lesson_reminder_minutes
             ),
         }
 
@@ -1429,6 +1463,18 @@ async def upsert_user_schedule_state(telegram_id: int, **kwargs):
     if 'event_notifications_enabled' in payload:
         payload['event_notifications_enabled'] = _normalize_event_notifications_enabled(
             payload.get('event_notifications_enabled')
+        )
+    if 'schedule_change_notifications_enabled' in payload:
+        payload['schedule_change_notifications_enabled'] = _normalize_schedule_change_notifications_enabled(
+            payload.get('schedule_change_notifications_enabled')
+        )
+    if 'student_lesson_reminder_minutes' in payload:
+        payload['student_lesson_reminder_minutes'] = _normalize_lesson_reminder_minutes(
+            payload.get('student_lesson_reminder_minutes')
+        )
+    if 'teacher_lesson_reminder_minutes' in payload:
+        payload['teacher_lesson_reminder_minutes'] = _normalize_lesson_reminder_minutes(
+            payload.get('teacher_lesson_reminder_minutes')
         )
 
     async with get_session() as session:
@@ -1450,6 +1496,7 @@ async def upsert_user_schedule_state(telegram_id: int, **kwargs):
         return {
             'selected_course': state_row.selected_course,
             'selected_course_name': state_row.selected_course_name,
+            'selected_teacher_name': state_row.selected_teacher_name,
             'selected_group': state_row.selected_group,
             'selected_week_index': state_row.selected_week_index,
             'selected_day_index': state_row.selected_day_index,
@@ -1458,6 +1505,15 @@ async def upsert_user_schedule_state(telegram_id: int, **kwargs):
             'daily_digest_minute': _normalize_daily_digest_minute(state_row.daily_digest_minute),
             'event_notifications_enabled': _normalize_event_notifications_enabled(
                 state_row.event_notifications_enabled
+            ),
+            'schedule_change_notifications_enabled': _normalize_schedule_change_notifications_enabled(
+                state_row.schedule_change_notifications_enabled
+            ),
+            'student_lesson_reminder_minutes': _normalize_lesson_reminder_minutes(
+                state_row.student_lesson_reminder_minutes
+            ),
+            'teacher_lesson_reminder_minutes': _normalize_lesson_reminder_minutes(
+                state_row.teacher_lesson_reminder_minutes
             ),
         }
 
@@ -1474,6 +1530,8 @@ async def get_users_with_selected_groups(group_codes=None):
             UserScheduleState.daily_digest_enabled,
             UserScheduleState.daily_digest_hour,
             UserScheduleState.daily_digest_minute,
+            UserScheduleState.schedule_change_notifications_enabled,
+            UserScheduleState.student_lesson_reminder_minutes,
         ).where(UserScheduleState.selected_group.is_not(None))
 
         if group_codes:
@@ -1495,9 +1553,74 @@ async def get_users_with_selected_groups(group_codes=None):
                     'daily_digest_enabled': _normalize_daily_digest_enabled(row.daily_digest_enabled),
                     'daily_digest_hour': _normalize_daily_digest_hour(row.daily_digest_hour),
                     'daily_digest_minute': _normalize_daily_digest_minute(row.daily_digest_minute),
+                    'schedule_change_notifications_enabled': _normalize_schedule_change_notifications_enabled(
+                        row.schedule_change_notifications_enabled
+                    ),
+                    'student_lesson_reminder_minutes': _normalize_lesson_reminder_minutes(
+                        row.student_lesson_reminder_minutes
+                    ),
                 }
             )
         return users
+
+
+async def get_users_with_teacher_reminders():
+    """Возвращает учителей с включенными напоминаниями о парах."""
+    async with get_session() as session:
+        result = await session.execute(
+            select(
+                TeacherAssignment.telegram_id,
+                TeacherAssignment.teacher_name,
+                UserScheduleState.selected_teacher_name,
+                UserScheduleState.teacher_lesson_reminder_minutes,
+            )
+            .select_from(TeacherAssignment)
+            .outerjoin(UserScheduleState, UserScheduleState.telegram_id == TeacherAssignment.telegram_id)
+        )
+        rows = result.all()
+
+    users = []
+    for row in rows:
+        teacher_name = str(row.selected_teacher_name or '').strip() or str(row.teacher_name or '').strip() or None
+        reminder_minutes = _normalize_lesson_reminder_minutes(row.teacher_lesson_reminder_minutes)
+        if not teacher_name or reminder_minutes is None:
+            continue
+        users.append(
+            {
+                'telegram_id': row.telegram_id,
+                'teacher_name': teacher_name,
+                'teacher_lesson_reminder_minutes': reminder_minutes,
+            }
+        )
+
+    async with get_session() as session:
+        result = await session.execute(
+            select(
+                UserScheduleState.telegram_id,
+                UserScheduleState.selected_teacher_name,
+                UserScheduleState.teacher_lesson_reminder_minutes,
+            ).where(UserScheduleState.selected_teacher_name.is_not(None))
+        )
+        extra_rows = result.all()
+
+    known_pairs = {(int(item['telegram_id']), str(item['teacher_name'])) for item in users}
+    for row in extra_rows:
+        teacher_name = str(row.selected_teacher_name or '').strip() or None
+        reminder_minutes = _normalize_lesson_reminder_minutes(row.teacher_lesson_reminder_minutes)
+        if not teacher_name or reminder_minutes is None:
+            continue
+        key = (int(row.telegram_id), teacher_name)
+        if key in known_pairs:
+            continue
+        users.append(
+            {
+                'telegram_id': row.telegram_id,
+                'teacher_name': teacher_name,
+                'teacher_lesson_reminder_minutes': reminder_minutes,
+            }
+        )
+        known_pairs.add(key)
+    return users
 
 
 async def was_daily_notification_sent(telegram_id: int, notification_type: str, target_date):
@@ -1520,6 +1643,42 @@ async def mark_daily_notification_sent(telegram_id: int, notification_type: str,
             UserDailyNotification(
                 telegram_id=telegram_id,
                 notification_type=str(notification_type).strip()[:64],
+                target_date=target_date,
+            )
+        )
+        try:
+            await session.commit()
+            return True
+        except IntegrityError:
+            await session.rollback()
+            return False
+
+
+async def was_lesson_reminder_sent(telegram_id: int, reminder_key: str):
+    """Проверяет, отправлялось ли уже напоминание о конкретной паре."""
+    async with get_session() as session:
+        result = await session.execute(
+            select(UserLessonReminderNotification.id).where(
+                UserLessonReminderNotification.telegram_id == int(telegram_id),
+                UserLessonReminderNotification.reminder_key == str(reminder_key).strip(),
+            )
+        )
+        return result.scalar_one_or_none() is not None
+
+
+async def mark_lesson_reminder_sent(
+    telegram_id: int,
+    reminder_type: str,
+    reminder_key: str,
+    target_date,
+):
+    """Фиксирует отправку напоминания о паре пользователю."""
+    async with get_session() as session:
+        session.add(
+            UserLessonReminderNotification(
+                telegram_id=int(telegram_id),
+                reminder_type=str(reminder_type).strip()[:32],
+                reminder_key=str(reminder_key).strip()[:255],
                 target_date=target_date,
             )
         )

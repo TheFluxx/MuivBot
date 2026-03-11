@@ -19,6 +19,7 @@ from muiv_schedule_monitor import POLL_SECONDS, check_for_schedule_updates
 
 monitor_task = None
 daily_digest_task = None
+lesson_reminder_task = None
 
 DEFAULT_TIME_SLOTS = [
     '8:20-9:50',
@@ -46,6 +47,7 @@ MONITOR_CACHE_LIMIT = 4000
 DEFAULT_DAILY_TOMORROW_HOUR = db_commands.DEFAULT_DAILY_DIGEST_HOUR
 DEFAULT_DAILY_TOMORROW_MINUTE = db_commands.DEFAULT_DAILY_DIGEST_MINUTE
 DAILY_TOMORROW_NOTIFICATION_TYPE = 'tomorrow_evening'
+LESSON_REMINDER_WINDOW_SECONDS = 60
 
 
 def _load_moscow_timezone():
@@ -305,6 +307,207 @@ def _daily_digest_preferences(user: dict) -> tuple[bool, int, int]:
         minute = DEFAULT_DAILY_TOMORROW_MINUTE
 
     return enabled, hour % 24, max(0, min(59, minute))
+
+
+def _lesson_reminder_minutes(user: dict, key: str) -> int | None:
+    """Возвращает нормализованную настройку напоминаний о парах."""
+    value = user.get(key)
+    if value in (None, '', 0, '0', 'off', 'none', 'null'):
+        return None
+    try:
+        minutes = int(value)
+    except (TypeError, ValueError):
+        return None
+    if minutes in db_commands.ALLOWED_LESSON_REMINDER_MINUTES:
+        return minutes
+    return None
+
+
+def _lesson_start_datetime(target_date: date, time_text: str) -> datetime | None:
+    """Возвращает дату и время начала пары по строке времени."""
+    normalized = _normalize_time_slot(time_text)
+    match = re.match(r'^(\d{1,2}):(\d{2})-(\d{1,2}):(\d{2})$', normalized)
+    if not match:
+        return None
+
+    return datetime(
+        year=target_date.year,
+        month=target_date.month,
+        day=target_date.day,
+        hour=int(match.group(1)),
+        minute=int(match.group(2)),
+        tzinfo=MOSCOW_TZ,
+    )
+
+
+def _student_lesson_reminder_key(group_code: str, target_date: date, time_text: str, minutes: int) -> str:
+    """Возвращает стабильный ключ напоминания студента о паре."""
+    return f"student|{target_date.isoformat()}|{group_code}|{_normalize_time_slot(time_text)}|{int(minutes)}"
+
+
+def _teacher_lesson_reminder_key(teacher_name: str, group_code: str, target_date: date, time_text: str, minutes: int) -> str:
+    """Возвращает стабильный ключ напоминания преподавателя о паре."""
+    return (
+        f"teacher|{target_date.isoformat()}|{_normalize_text(teacher_name)}|"
+        f"{group_code}|{_normalize_time_slot(time_text)}|{int(minutes)}"
+    )
+
+
+def _lesson_homework_excerpt(lesson_text: str) -> str:
+    """Возвращает краткий текст домашнего задания для уведомления."""
+    value = _normalize_text(lesson_text)
+    if not value:
+        return ''
+    if len(value) <= 240:
+        return value
+    return value[:237].rstrip() + '...'
+
+
+async def _send_student_lesson_reminders(now_moscow: datetime):
+    """Отправляет напоминания студентам о ближайших парах."""
+    users = await db_commands.get_users_with_selected_groups()
+    sent_count = 0
+
+    for user in users:
+        telegram_id = user.get('telegram_id')
+        group_code = user.get('selected_group')
+        selected_course = user.get('selected_course')
+        course_name = user.get('selected_course_name') or _course_name_from_key(selected_course or '')
+        reminder_minutes = _lesson_reminder_minutes(user, 'student_lesson_reminder_minutes')
+        if not telegram_id or not group_code or not course_name or reminder_minutes is None:
+            continue
+
+        day_data = client.get_group_lessons_by_date(course_name, group_code, now_moscow.date())
+        if not day_data:
+            continue
+
+        homework_map = await db_commands.get_group_homework_for_day(group_code, now_moscow.date())
+        for lesson_index, lesson in enumerate(day_data.get('lessons') or []):
+            time_text = _normalize_text(lesson.get('time'))
+            start_at = _lesson_start_datetime(now_moscow.date(), time_text)
+            if start_at is None:
+                continue
+
+            reminder_at = start_at - timedelta(minutes=reminder_minutes)
+            delta_seconds = (now_moscow - reminder_at).total_seconds()
+            if delta_seconds < 0 or delta_seconds >= LESSON_REMINDER_WINDOW_SECONDS:
+                continue
+
+            reminder_key = _student_lesson_reminder_key(group_code, now_moscow.date(), time_text, reminder_minutes)
+            if await db_commands.was_lesson_reminder_sent(telegram_id, reminder_key):
+                continue
+
+            lesson_text = _clean_lesson_text(lesson.get('lesson'))
+            lines = [
+                '<b>⏰ Скоро пара</b>',
+                '',
+                f"👥 Группа: <b>{html.escape(str(group_code))}</b>",
+                f"📅 Дата: <b>{now_moscow.strftime('%d.%m.%y')} ({WEEKDAY_NAMES[now_moscow.weekday()]})</b>",
+                f"⏳ Через <b>{reminder_minutes} мин</b>",
+                f"🕒 Время: <b>{html.escape(time_text)}</b>",
+                f"📚 Пара: <b>{html.escape(lesson_text or 'Без названия')}</b>",
+            ]
+            homework = homework_map.get(lesson_index)
+            if homework and homework.get('homework_text'):
+                lines.append('')
+                lines.append(f"📝 Домашнее задание: <b>{html.escape(_lesson_homework_excerpt(homework.get('homework_text')))}</b>")
+
+            try:
+                await bot.send_message(int(telegram_id), '\n'.join(lines), parse_mode='HTML')
+                await db_commands.mark_lesson_reminder_sent(
+                    telegram_id,
+                    'student_lesson',
+                    reminder_key,
+                    now_moscow.date(),
+                )
+                sent_count += 1
+            except Exception as send_error:
+                print(f'[LESSON][WARN] cannot send student reminder to {telegram_id}: {send_error}')
+
+    return sent_count
+
+
+async def _send_teacher_lesson_reminders(now_moscow: datetime):
+    """Отправляет напоминания преподавателям о ближайших парах."""
+    users = await db_commands.get_users_with_teacher_reminders()
+    sent_count = 0
+
+    for user in users:
+        telegram_id = user.get('telegram_id')
+        teacher_name = user.get('teacher_name')
+        reminder_minutes = _lesson_reminder_minutes(user, 'teacher_lesson_reminder_minutes')
+        if not telegram_id or not teacher_name or reminder_minutes is None:
+            continue
+
+        lessons = client.get_teacher_lessons_by_date(teacher_name, now_moscow.date())
+        for lesson in lessons:
+            time_text = _normalize_text(lesson.get('time_text'))
+            start_at = _lesson_start_datetime(now_moscow.date(), time_text)
+            if start_at is None:
+                continue
+
+            reminder_at = start_at - timedelta(minutes=reminder_minutes)
+            delta_seconds = (now_moscow - reminder_at).total_seconds()
+            if delta_seconds < 0 or delta_seconds >= LESSON_REMINDER_WINDOW_SECONDS:
+                continue
+
+            reminder_key = _teacher_lesson_reminder_key(
+                teacher_name,
+                _normalize_text(lesson.get('group_code')),
+                now_moscow.date(),
+                time_text,
+                reminder_minutes,
+            )
+            if await db_commands.was_lesson_reminder_sent(telegram_id, reminder_key):
+                continue
+
+            lesson_text = _clean_lesson_text(lesson.get('lesson_text'))
+            lines = [
+                '<b>⏰ Скоро пара</b>',
+                '',
+                f"👨‍🏫 Преподаватель: <b>{html.escape(str(teacher_name))}</b>",
+                f"👥 Группа: <b>{html.escape(str(lesson.get('group_code') or '-'))}</b>",
+                f"📅 Дата: <b>{now_moscow.strftime('%d.%m.%y')} ({WEEKDAY_NAMES[now_moscow.weekday()]})</b>",
+                f"⏳ Через <b>{reminder_minutes} мин</b>",
+                f"🕒 Время: <b>{html.escape(time_text)}</b>",
+                f"📚 Пара: <b>{html.escape(lesson_text or 'Без названия')}</b>",
+            ]
+            room_text = _normalize_text(lesson.get('room'))
+            if room_text:
+                lines.append(f"🏫 Аудитория: <b>{html.escape(room_text)}</b>")
+
+            try:
+                await bot.send_message(int(telegram_id), '\n'.join(lines), parse_mode='HTML')
+                await db_commands.mark_lesson_reminder_sent(
+                    telegram_id,
+                    'teacher_lesson',
+                    reminder_key,
+                    now_moscow.date(),
+                )
+                sent_count += 1
+            except Exception as send_error:
+                print(f'[LESSON][WARN] cannot send teacher reminder to {telegram_id}: {send_error}')
+
+    return sent_count
+
+
+async def _lesson_reminder_loop():
+    """Фоновый цикл напоминаний о ближайших парах."""
+    await asyncio.sleep(10)
+
+    while True:
+        try:
+            now = _now_moscow()
+            student_sent = await _send_student_lesson_reminders(now)
+            teacher_sent = await _send_teacher_lesson_reminders(now)
+            if student_sent or teacher_sent:
+                print(f'[LESSON] student_sent={student_sent}, teacher_sent={teacher_sent}, now={now}')
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            raise
+        except Exception as loop_error:
+            print(f'[LESSON][ERR] loop failed: {loop_error}')
+            await asyncio.sleep(60)
 
 
 async def _send_daily_tomorrow_digest(now_moscow: datetime):
@@ -756,11 +959,17 @@ async def _notify_users_about_changes(changed_group_days, old_snapshot, new_snap
     for user in users:
         telegram_id = user.get('telegram_id')
         group_code = user.get('selected_group')
+        schedule_change_notifications_enabled = user.get('schedule_change_notifications_enabled')
         group_changes = changed_group_days.get(group_code, {})
         changed_dates = group_changes.get('changed_dates', [])
         new_dates = group_changes.get('new_dates', [])
 
-        if not telegram_id or not group_code or (not changed_dates and not new_dates):
+        if (
+            not telegram_id
+            or not group_code
+            or schedule_change_notifications_enabled is False
+            or (not changed_dates and not new_dates)
+        ):
             continue
 
         sent_any = False
@@ -883,7 +1092,7 @@ async def _schedule_monitor_loop():
 
 async def on_startup(dispatcher):
     """Инициализация БД, расписания и фонового мониторинга при запуске."""
-    global monitor_task, daily_digest_task
+    global monitor_task, daily_digest_task, lesson_reminder_task
 
     await create_base()
     setup_handlers(dispatcher)
@@ -923,12 +1132,16 @@ async def on_startup(dispatcher):
             f'(время по умолчанию {DEFAULT_DAILY_TOMORROW_HOUR:02d}:{DEFAULT_DAILY_TOMORROW_MINUTE:02d} МСК)'
         )
 
+    if lesson_reminder_task is None or lesson_reminder_task.done():
+        lesson_reminder_task = asyncio.create_task(_lesson_reminder_loop())
+        print('✅ Напоминания о парах запущены')
+
     print('Бот запущен!')
 
 
 async def on_shutdown(dispatcher):
     """Останавливает фоновые задачи при завершении бота."""
-    global monitor_task, daily_digest_task
+    global monitor_task, daily_digest_task, lesson_reminder_task
 
     if monitor_task and not monitor_task.done():
         monitor_task.cancel()
@@ -941,6 +1154,13 @@ async def on_shutdown(dispatcher):
         daily_digest_task.cancel()
         try:
             await daily_digest_task
+        except asyncio.CancelledError:
+            pass
+
+    if lesson_reminder_task and not lesson_reminder_task.done():
+        lesson_reminder_task.cancel()
+        try:
+            await lesson_reminder_task
         except asyncio.CancelledError:
             pass
 
