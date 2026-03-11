@@ -3,7 +3,7 @@ import re
 from datetime import datetime
 from typing import Any, Dict
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.exc import IntegrityError
 
 from db_api.database import get_session
@@ -12,8 +12,11 @@ from db_api.tables import (
     BotCallbackPayload,
     BotEvent,
     BotStarostaSession,
+    BotTeacherSession,
     GroupAttendanceMark,
     GroupStarostaAssignment,
+    LessonHomework,
+    TeacherAssignment,
     Users,
     UserScheduleState,
     UserDailyNotification,
@@ -119,6 +122,25 @@ def _normalize_attendance_status(value: Any) -> str | None:
     if normalized in {'present', 'absent'}:
         return normalized
     return None
+
+
+def _lesson_homework_row_to_dict(row: LessonHomework | None):
+    if row is None:
+        return None
+
+    return {
+        'id': row.id,
+        'teacher_name': str(row.teacher_name or '').strip() or None,
+        'group_code': str(row.group_code or '').strip() or None,
+        'target_date': row.target_date,
+        'lesson_index': int(row.lesson_index or 0),
+        'lesson_time': str(row.lesson_time or '').strip() or None,
+        'lesson_title': str(row.lesson_title or '').strip() or None,
+        'homework_text': str(row.homework_text or '').strip() or None,
+        'created_by_telegram_id': row.created_by_telegram_id,
+        'created_at': row.created_at,
+        'updated_at': row.updated_at,
+    }
 
 
 async def registration_check(telegram_id):
@@ -379,6 +401,164 @@ async def get_starosta_access(telegram_id: int):
     }
 
 
+async def get_teacher_session(telegram_id: int):
+    """Возвращает активную сессию главного входа учителей."""
+    async with get_session() as session:
+        result = await session.execute(
+            select(BotTeacherSession).where(BotTeacherSession.telegram_id == telegram_id)
+        )
+        session_row = result.scalar_one_or_none()
+        if session_row is None:
+            return None
+
+        return {
+            'telegram_id': session_row.telegram_id,
+            'login': session_row.login,
+            'authorized_at': session_row.authorized_at,
+        }
+
+
+async def is_super_teacher_authorized(telegram_id: int) -> bool:
+    """Проверяет, вошел ли пользователь через общий вход учителей."""
+    return await get_teacher_session(telegram_id) is not None
+
+
+async def authorize_teacher(telegram_id: int, login: str):
+    """Создает или обновляет сессию главного входа учителей."""
+    normalized_login = str(login).strip()
+
+    async with get_session() as session:
+        result = await session.execute(
+            select(BotTeacherSession).where(BotTeacherSession.telegram_id == telegram_id)
+        )
+        session_row = result.scalar_one_or_none()
+
+        if session_row is None:
+            session_row = BotTeacherSession(
+                telegram_id=telegram_id,
+                login=normalized_login,
+                authorized_at=datetime.utcnow(),
+            )
+            session.add(session_row)
+        else:
+            session_row.login = normalized_login
+            session_row.authorized_at = datetime.utcnow()
+
+        await session.commit()
+
+        return {
+            'telegram_id': session_row.telegram_id,
+            'login': session_row.login,
+            'authorized_at': session_row.authorized_at,
+        }
+
+
+async def revoke_teacher(telegram_id: int) -> bool:
+    """Завершает сессию учителя."""
+    async with get_session() as session:
+        result = await session.execute(
+            select(BotTeacherSession).where(BotTeacherSession.telegram_id == telegram_id)
+        )
+        session_row = result.scalar_one_or_none()
+        if session_row is None:
+            return False
+
+        await session.delete(session_row)
+        await session.commit()
+        return True
+
+
+async def get_user_teacher_name(telegram_id: int):
+    """Возвращает назначенного пользователю преподавателя."""
+    async with get_session() as session:
+        result = await session.execute(
+            select(TeacherAssignment.teacher_name)
+            .where(TeacherAssignment.telegram_id == telegram_id)
+        )
+        value = result.scalar_one_or_none()
+
+    normalized = str(value or '').strip()
+    return normalized or None
+
+
+async def assign_user_teacher(
+    teacher_name: str,
+    telegram_id: int,
+    assigned_by_telegram_id: int | None = None,
+):
+    """Назначает пользователю роль конкретного преподавателя."""
+    normalized_teacher = str(teacher_name or '').strip()
+    if not normalized_teacher:
+        return None
+
+    async with get_session() as session:
+        result = await session.execute(
+            select(TeacherAssignment).where(
+                or_(
+                    TeacherAssignment.telegram_id == telegram_id,
+                    TeacherAssignment.teacher_name == normalized_teacher,
+                )
+            )
+        )
+        rows = result.scalars().all()
+
+        target_row = None
+        for row in rows:
+            if int(row.telegram_id) == int(telegram_id):
+                target_row = row
+            elif str(row.teacher_name or '').strip() == normalized_teacher:
+                if target_row is None:
+                    target_row = row
+                else:
+                    await session.delete(row)
+
+        if target_row is None:
+            target_row = TeacherAssignment(
+                telegram_id=telegram_id,
+                teacher_name=normalized_teacher,
+                assigned_by_telegram_id=assigned_by_telegram_id,
+                created_at=datetime.utcnow(),
+                updated_at=datetime.utcnow(),
+            )
+            session.add(target_row)
+        else:
+            target_row.telegram_id = telegram_id
+            target_row.teacher_name = normalized_teacher
+            target_row.assigned_by_telegram_id = assigned_by_telegram_id
+            target_row.updated_at = datetime.utcnow()
+
+        await session.commit()
+
+    return await get_user_teacher_name(telegram_id)
+
+
+async def clear_user_teacher(telegram_id: int) -> bool:
+    """Снимает с пользователя роль преподавателя."""
+    async with get_session() as session:
+        result = await session.execute(
+            select(TeacherAssignment).where(TeacherAssignment.telegram_id == telegram_id)
+        )
+        row = result.scalar_one_or_none()
+        if row is None:
+            return False
+
+        await session.delete(row)
+        await session.commit()
+        return True
+
+
+async def get_teacher_access(telegram_id: int):
+    """Возвращает права пользователя в панели учителя."""
+    is_super = await is_super_teacher_authorized(telegram_id)
+    teacher_name = await get_user_teacher_name(telegram_id)
+    teachers = [teacher_name] if teacher_name else []
+    return {
+        'is_super': is_super,
+        'teachers': teachers,
+        'has_access': is_super or bool(teachers),
+    }
+
+
 async def get_admin_dashboard_stats():
     """Возвращает сводную статистику для админ-панели."""
     async with get_session() as session:
@@ -543,6 +723,7 @@ async def get_admin_users_page(
 
         telegram_ids = [row.telegram_id for row in rows]
         assignment_map: dict[int, list[str]] = {}
+        teacher_map: dict[int, str] = {}
         if telegram_ids:
             assignment_rows = (
                 await session.execute(
@@ -555,6 +736,18 @@ async def get_admin_users_page(
                 assignment_map.setdefault(int(assignment_row.telegram_id), []).append(
                     str(assignment_row.group_code).strip()
                 )
+
+            teacher_rows = (
+                await session.execute(
+                    select(TeacherAssignment.telegram_id, TeacherAssignment.teacher_name).where(
+                        TeacherAssignment.telegram_id.in_(telegram_ids)
+                    )
+                )
+            ).all()
+            for teacher_row in teacher_rows:
+                teacher_name = str(teacher_row.teacher_name or '').strip()
+                if teacher_name:
+                    teacher_map[int(teacher_row.telegram_id)] = teacher_name
 
     items = []
     for row in rows:
@@ -577,6 +770,7 @@ async def get_admin_users_page(
                     row.event_notifications_enabled
                 ),
                 'starosta_groups': sorted(assignment_map.get(int(row.telegram_id), []), key=str.casefold),
+                'teacher_name': teacher_map.get(int(row.telegram_id)),
             }
         )
 
@@ -619,6 +813,9 @@ async def get_admin_user_details(telegram_id: int):
                 .order_by(GroupStarostaAssignment.group_code.asc())
             )
         ).all()
+        teacher_name = await session.scalar(
+            select(TeacherAssignment.teacher_name).where(TeacherAssignment.telegram_id == telegram_id)
+        )
 
     if row is None:
         return None
@@ -642,6 +839,7 @@ async def get_admin_user_details(telegram_id: int):
             row.event_notifications_enabled
         ),
         'starosta_groups': [str(item.group_code).strip() for item in assignment_rows if str(item.group_code).strip()],
+        'teacher_name': str(teacher_name or '').strip() or None,
         'updated_at': row.updated_at,
     }
 
@@ -946,6 +1144,158 @@ async def get_student_attendance_days(telegram_id: int, allowed_group_codes: lis
         )
 
     return days
+
+
+async def get_group_homework_for_day(group_code: str, target_date):
+    """Возвращает домашние задания группы по датe, сгруппированные по номеру пары."""
+    normalized_group = str(group_code or '').strip() or None
+    if not normalized_group or target_date is None:
+        return {}
+
+    async with get_session() as session:
+        result = await session.execute(
+            select(LessonHomework).where(
+                LessonHomework.group_code == normalized_group,
+                LessonHomework.target_date == target_date,
+            )
+        )
+        rows = result.scalars().all()
+
+    items = {}
+    for row in rows:
+        row_data = _lesson_homework_row_to_dict(row)
+        if row_data is not None:
+            items[int(row_data['lesson_index'])] = row_data
+    return items
+
+
+async def get_lesson_homework(group_code: str, target_date, lesson_index: int):
+    """Возвращает домашнее задание для конкретной пары группы."""
+    normalized_group = str(group_code or '').strip() or None
+    if not normalized_group or target_date is None:
+        return None
+
+    try:
+        normalized_lesson_index = int(lesson_index)
+    except (TypeError, ValueError):
+        return None
+
+    async with get_session() as session:
+        result = await session.execute(
+            select(LessonHomework).where(
+                LessonHomework.group_code == normalized_group,
+                LessonHomework.target_date == target_date,
+                LessonHomework.lesson_index == normalized_lesson_index,
+            )
+        )
+        row = result.scalar_one_or_none()
+
+    return _lesson_homework_row_to_dict(row)
+
+
+async def upsert_lesson_homework(
+    *,
+    teacher_name: str | None,
+    group_code: str,
+    target_date,
+    lesson_index: int,
+    lesson_time: str,
+    lesson_title: str | None,
+    homework_text: str,
+    created_by_telegram_id: int | None = None,
+):
+    """Создает или обновляет домашнее задание для выбранной пары."""
+    normalized_group = str(group_code or '').strip() or None
+    normalized_teacher = str(teacher_name or '').strip() or None
+    normalized_time = str(lesson_time or '').strip()
+    normalized_title = str(lesson_title or '').strip() or None
+    normalized_homework = str(homework_text or '').strip()
+
+    if not normalized_group or target_date is None or not normalized_time or not normalized_homework:
+        return None
+
+    try:
+        normalized_lesson_index = int(lesson_index)
+    except (TypeError, ValueError):
+        return None
+
+    async with get_session() as session:
+        result = await session.execute(
+            select(LessonHomework).where(
+                LessonHomework.group_code == normalized_group,
+                LessonHomework.target_date == target_date,
+                LessonHomework.lesson_index == normalized_lesson_index,
+            )
+        )
+        row = result.scalar_one_or_none()
+        previous_text = str(row.homework_text or '').strip() if row is not None else ''
+
+        if row is None:
+            row = LessonHomework(
+                teacher_name=normalized_teacher,
+                group_code=normalized_group,
+                target_date=target_date,
+                lesson_index=normalized_lesson_index,
+                lesson_time=normalized_time[:64],
+                lesson_title=normalized_title,
+                homework_text=normalized_homework,
+                created_by_telegram_id=created_by_telegram_id,
+                created_at=datetime.utcnow(),
+                updated_at=datetime.utcnow(),
+            )
+            session.add(row)
+            action = 'created'
+        else:
+            row.teacher_name = normalized_teacher
+            row.lesson_time = normalized_time[:64]
+            row.lesson_title = normalized_title
+            row.created_by_telegram_id = created_by_telegram_id
+            row.updated_at = datetime.utcnow()
+            if previous_text == normalized_homework:
+                action = 'unchanged'
+            else:
+                row.homework_text = normalized_homework
+                action = 'updated'
+
+        await session.commit()
+        await session.refresh(row)
+
+    row_data = _lesson_homework_row_to_dict(row)
+    if row_data is None:
+        return None
+
+    row_data['action'] = action
+    row_data['previous_homework_text'] = previous_text or None
+    return row_data
+
+
+async def delete_lesson_homework(group_code: str, target_date, lesson_index: int):
+    """Удаляет домашнее задание для конкретной пары."""
+    normalized_group = str(group_code or '').strip() or None
+    if not normalized_group or target_date is None:
+        return None
+
+    try:
+        normalized_lesson_index = int(lesson_index)
+    except (TypeError, ValueError):
+        return None
+
+    async with get_session() as session:
+        result = await session.execute(
+            select(LessonHomework).where(
+                LessonHomework.group_code == normalized_group,
+                LessonHomework.target_date == target_date,
+                LessonHomework.lesson_index == normalized_lesson_index,
+            )
+        )
+        row = result.scalar_one_or_none()
+        if row is None:
+            return None
+
+        row_data = _lesson_homework_row_to_dict(row)
+        await session.delete(row)
+        await session.commit()
+        return row_data
 
 
 def _event_row_to_dict(event_row: BotEvent | None):

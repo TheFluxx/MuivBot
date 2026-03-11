@@ -74,6 +74,7 @@ async def configure_bot_commands():
             types.BotCommand('tomorrow', 'Расписание на завтра'),
             types.BotCommand('admin', 'Вход в админ-панель'),
             types.BotCommand('starosta', 'Панель старосты'),
+            types.BotCommand('teacher_panel', 'Панель учителя'),
             types.BotCommand('help', 'Все команды и примеры'),
         ]
     )
@@ -342,7 +343,7 @@ async def _send_daily_tomorrow_digest(now_moscow: datetime):
             continue
 
         try:
-            day_payload = client.build_day_schedule_payload_by_date(course_name, group_code, target_date)
+            day_payload = await client.build_day_schedule_payload_by_date(course_name, group_code, target_date)
             reply_markup = None
 
             if day_payload is not None:

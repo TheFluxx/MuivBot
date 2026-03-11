@@ -50,6 +50,34 @@ class BotStarostaSession(Base):
     authorized_at = Column(DateTime, nullable=False, default=datetime.utcnow)
 
 
+class BotTeacherSession(Base):
+    """Авторизованная сессия главного входа учителей в Telegram-боте."""
+
+    __tablename__ = 'bot_teacher_sessions'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    telegram_id = Column(BigInteger, nullable=False, unique=True, index=True)
+    login = Column(String(128), nullable=False)
+    authorized_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+
+class TeacherAssignment(Base):
+    """Назначение пользователю роли конкретного преподавателя."""
+
+    __tablename__ = 'teacher_assignments'
+    __table_args__ = (
+        UniqueConstraint('telegram_id', name='uq_teacher_assignment_telegram_id'),
+        UniqueConstraint('teacher_name', name='uq_teacher_assignment_teacher_name'),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    telegram_id = Column(BigInteger, nullable=False, index=True)
+    teacher_name = Column(String(255), nullable=False, index=True)
+    assigned_by_telegram_id = Column(BigInteger, nullable=True, index=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 class GroupStarostaAssignment(Base):
     """Назначение старосты на конкретную группу."""
 
@@ -89,6 +117,32 @@ class GroupAttendanceMark(Base):
     student_telegram_id = Column(BigInteger, nullable=False, index=True)
     status = Column(String(16), nullable=False, index=True)
     marked_by_telegram_id = Column(BigInteger, nullable=True, index=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class LessonHomework(Base):
+    """Домашнее задание для конкретной пары группы."""
+
+    __tablename__ = 'lesson_homeworks'
+    __table_args__ = (
+        UniqueConstraint(
+            'group_code',
+            'target_date',
+            'lesson_index',
+            name='uq_lesson_homework_group_date_lesson',
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    teacher_name = Column(String(255), nullable=True, index=True)
+    group_code = Column(String(64), nullable=False, index=True)
+    target_date = Column(Date, nullable=False, index=True)
+    lesson_index = Column(Integer, nullable=False)
+    lesson_time = Column(String(64), nullable=False)
+    lesson_title = Column(Text, nullable=True)
+    homework_text = Column(Text, nullable=False)
+    created_by_telegram_id = Column(BigInteger, nullable=True, index=True)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
 

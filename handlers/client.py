@@ -3,6 +3,7 @@ import secrets
 import os
 import re
 import html
+from difflib import SequenceMatcher
 from pathlib import Path
 from datetime import datetime, timedelta
 from aiogram import types, Dispatcher
@@ -13,7 +14,14 @@ from aiogram.utils.exceptions import MessageNotModified
 import xlrd
 from db_api import db_commands
 from create_bot import bot
-from data.config import ADMIN_LOGIN, ADMIN_PASSWORD, STAROSTA_LOGIN, STAROSTA_PASSWORD
+from data.config import (
+    ADMIN_LOGIN,
+    ADMIN_PASSWORD,
+    STAROSTA_LOGIN,
+    STAROSTA_PASSWORD,
+    TEACHER_LOGIN,
+    TEACHER_PASSWORD,
+)
 
 # Создаем клавиатуру
 def get_main_keyboard():
@@ -45,6 +53,19 @@ class StarostaAuthDialog(StatesGroup):
 
     waiting_login = State()
     waiting_password = State()
+
+
+class TeacherAuthDialog(StatesGroup):
+    """Состояния входа в панель учителя."""
+
+    waiting_login = State()
+    waiting_password = State()
+
+
+class TeacherHomeworkDialog(StatesGroup):
+    """Состояние ввода домашнего задания учителем."""
+
+    waiting_text = State()
 
 
 class AdminMessageDialog(StatesGroup):
@@ -93,6 +114,7 @@ def _commands_help_text():
         "• <code>/tomorrow</code> - показать расписание на завтра\n"
         "• <code>/admin</code> - вход в админ-панель\n"
         "• <code>/starosta</code> - вход в панель старосты\n"
+        "• <code>/teacher_panel</code> - вход в панель учителя\n"
         "• <code>/help</code> - показать эту справку\n\n"
         "<b>Примеры</b>\n"
         "• <code>/group ИД 30.1/Б3-22</code>\n"
@@ -101,7 +123,8 @@ def _commands_help_text():
         "• <code>/room ауд. 125</code>\n"
         "• <code>/subject Математические модели</code>\n"
         "• <code>/admin</code>\n"
-        "• <code>/starosta</code>"
+        "• <code>/starosta</code>\n"
+        "• <code>/teacher_panel</code>"
     )
 
 
@@ -212,6 +235,341 @@ def _is_starosta_credentials_valid(login_text: str, password_text: str) -> bool:
         secrets.compare_digest(normalized_login, _normalize_cell_text(STAROSTA_LOGIN))
         and secrets.compare_digest(normalized_password, _normalize_cell_text(STAROSTA_PASSWORD))
     )
+
+
+def _teacher_panel_enabled():
+    """Проверяет, настроен ли общий вход учителей через .env."""
+    return bool(_normalize_cell_text(TEACHER_LOGIN) and _normalize_cell_text(TEACHER_PASSWORD))
+
+
+def _is_teacher_credentials_valid(login_text: str, password_text: str) -> bool:
+    """Проверяет логин и пароль общего входа учителей."""
+    normalized_login = _normalize_cell_text(login_text)
+    normalized_password = _normalize_cell_text(password_text)
+    return (
+        secrets.compare_digest(normalized_login, _normalize_cell_text(TEACHER_LOGIN))
+        and secrets.compare_digest(normalized_password, _normalize_cell_text(TEACHER_PASSWORD))
+    )
+
+
+TEACHER_PREFIX_PATTERNS = (
+    r'^\s*декан\b[\s.,-]*',
+    r'^\s*зам\.?\s*декана\b[\s.,-]*',
+    r'^\s*доц\.?\b[\s.,-]*',
+    r'^\s*проф\.?\b[\s.,-]*',
+    r'^\s*ст\.?\s*пр\.?\b[\s.,-]*',
+    r'^\s*пр\.?\b[\s.,-]*',
+    r'^\s*рук\.?\s*обр\.?\s*пр\.?\b[\s.,-]*',
+    r'^\s*зав(?:едующий)?\.?\s*каф(?:едрой)?\.?\b[\s.,-]*',
+    r'^\s*зав\.?\s*каф\.?\b[\s.,-]*',
+    r'^\s*зав\.?\s*ка\.?\s*ф\.?\b[\s.,-]*',
+)
+TEACHER_SUFFIX_PATTERNS = (
+    r'\bстадион\b',
+    r'\bа\.?\s*уд\.?\s*\d+[а-яa-z/-]*\b',
+    r'\bауд\.?\s*\d+[а-яa-z/-]*\b',
+    r'\bкаб\.?\s*\d+[а-яa-z/-]*\b',
+    r'\bспортзал\b',
+)
+TEACHER_CANONICAL_CACHE = None
+
+
+def _format_teacher_surname(value: str):
+    """Приводит фамилию преподавателя к читаемому виду."""
+    parts = []
+    for chunk in str(value or '').split('-'):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        parts.append(chunk[:1].upper() + chunk[1:].lower())
+    return '-'.join(parts)
+
+
+def _split_teacher_name(name: str):
+    """Разбирает преподавателя в формате Фамилия И.О."""
+    text = _normalize_cell_text(name)
+    match = re.fullmatch(r'([А-Яа-яЁё-]+)\s+([А-ЯЁ])\.([А-ЯЁ])\.', text)
+    if not match:
+        return None
+    return match.group(1), match.group(2), match.group(3)
+
+
+def _teacher_names_look_similar(left_name: str, right_name: str):
+    """Проверяет, похожи ли два имени преподавателя с учетом опечаток."""
+    left_parts = _split_teacher_name(left_name)
+    right_parts = _split_teacher_name(right_name)
+    if not left_parts or not right_parts:
+        return False
+
+    left_surname, left_first, left_second = left_parts
+    right_surname, right_first, right_second = right_parts
+    if (left_first, left_second) != (right_first, right_second):
+        return False
+
+    left_key = _search_normalize_text(left_surname)
+    right_key = _search_normalize_text(right_surname)
+    if left_key == right_key:
+        return True
+
+    if abs(len(left_key) - len(right_key)) > 2:
+        return False
+
+    ratio = SequenceMatcher(None, left_key, right_key).ratio()
+    return ratio >= 0.84
+
+
+def _normalize_teacher_name(value):
+    """Нормализует имя преподавателя и убирает служебные приставки."""
+    text = _normalize_cell_text(value)
+    if not text:
+        return ''
+
+    text = ROOM_PATTERN.sub('', text)
+    text = text.replace('|', ' ')
+    text = re.sub(r'[;,]+', ' ', text)
+    text = re.sub(r'\s+', ' ', text).strip(' .,-')
+
+    previous = None
+    while text and text != previous:
+        previous = text
+        for pattern in TEACHER_PREFIX_PATTERNS:
+            text = re.sub(pattern, '', text, flags=re.IGNORECASE).strip(' .,-')
+
+    for pattern in TEACHER_SUFFIX_PATTERNS:
+        text = re.sub(pattern, '', text, flags=re.IGNORECASE)
+
+    text = re.sub(r'\bпроф(?=[А-Яа-яЁё])', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'\bдоц(?=[А-Яа-яЁё])', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'\bстпр(?=[А-Яа-яЁё])', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'\s+', ' ', text).strip(' .,-')
+
+    compact = re.sub(r'\s+', '', text)
+    match = re.fullmatch(r'([А-Яа-яЁё-]+)\.?([А-Яа-яЁё])\.?([А-Яа-яЁё])\.?', compact)
+    if match:
+        surname = _format_teacher_surname(match.group(1))
+        return f'{surname} {match.group(2).upper()}.{match.group(3).upper()}.'
+
+    match = re.fullmatch(r'([А-Яа-яЁё-]+)\s+([А-Яа-яЁё])\.\s*([А-Яа-яЁё])\.?', text)
+    if match:
+        surname = _format_teacher_surname(match.group(1))
+        return f'{surname} {match.group(2).upper()}.{match.group(3).upper()}.'
+
+    return _normalize_cell_text(text)
+
+
+def _get_teacher_canonical_map():
+    """Строит карту канонических имен преподавателей по реальному расписанию."""
+    global TEACHER_CANONICAL_CACHE
+    if TEACHER_CANONICAL_CACHE is not None:
+        return TEACHER_CANONICAL_CACHE
+
+    counts = {}
+    for occurrence in _collect_search_occurrences():
+        teacher_name = _normalize_teacher_name(occurrence.get('teacher'))
+        if not teacher_name:
+            continue
+        counts[teacher_name] = counts.get(teacher_name, 0) + 1
+
+    ordered_names = sorted(
+        counts.keys(),
+        key=lambda item: (-counts[item], len(item), item),
+    )
+
+    canonical_names = []
+    alias_map = {}
+    for name in ordered_names:
+        canonical_name = None
+        for existing in canonical_names:
+            if _teacher_names_look_similar(name, existing):
+                canonical_name = existing
+                break
+
+        if canonical_name is None:
+            canonical_names.append(name)
+            canonical_name = name
+
+        alias_map[name] = canonical_name
+
+    TEACHER_CANONICAL_CACHE = alias_map
+    return TEACHER_CANONICAL_CACHE
+
+
+def _teacher_canonical_name(value):
+    """Возвращает каноническое отображаемое имя преподавателя."""
+    normalized = _normalize_teacher_name(value)
+    if not normalized:
+        return ''
+    return _get_teacher_canonical_map().get(normalized, normalized)
+
+
+def _teacher_lookup_key(value):
+    """Возвращает стабильный ключ преподавателя для поиска и дедупликации."""
+    normalized = _teacher_canonical_name(value)
+    if not normalized:
+        return ''
+    return re.sub(r'[^a-zа-я0-9]+', '', _search_normalize_text(normalized))
+
+
+def _teacher_names_from_schedule(extra_names: list[str] | None = None):
+    """Возвращает список преподавателей из текущего расписания."""
+    teachers = {}
+    for occurrence in _collect_search_occurrences():
+        teacher_name = _normalize_teacher_name(occurrence.get('teacher'))
+        if teacher_name:
+            teachers.setdefault(_teacher_lookup_key(teacher_name), teacher_name)
+
+    for item in extra_names or []:
+        teacher_name = _normalize_teacher_name(item)
+        if teacher_name:
+            teachers.setdefault(_teacher_lookup_key(teacher_name), teacher_name)
+
+    return sorted(teachers.values(), key=str.casefold)
+
+
+async def _resolve_teacher_context(state: FSMContext, telegram_id: int):
+    """Возвращает права учителя, доступных преподавателей и текущий выбор."""
+    access = await db_commands.get_teacher_access(telegram_id)
+    user_data = await state.get_data()
+
+    available_teachers = _teacher_names_from_schedule(access.get('teachers') or []) if access.get('is_super') else sorted(
+        {
+            _normalize_teacher_name(item)
+            for item in (access.get('teachers') or [])
+            if _normalize_teacher_name(item)
+        },
+        key=str.casefold,
+    )
+
+    current_teacher = _normalize_teacher_name(user_data.get('teacher_selected_name')) or None
+    if current_teacher not in available_teachers:
+        current_teacher = available_teachers[0] if available_teachers else None
+
+    await state.update_data(teacher_selected_name=current_teacher)
+    return access, available_teachers, current_teacher
+
+
+def _build_teacher_panel_text(access: dict, current_teacher: str | None, teachers_count: int):
+    """Формирует текст панели учителя."""
+    role_text = 'Общий вход учителей' if access.get('is_super') else 'Назначенный преподаватель'
+    available_text = 'Все преподаватели из расписания' if access.get('is_super') else (
+        ', '.join(
+            _normalize_teacher_name(item)
+            for item in (access.get('teachers') or [])
+            if _normalize_teacher_name(item)
+        ) or 'нет доступа'
+    )
+
+    return '\n'.join(
+        [
+            '<b>👨‍🏫 Панель учителя</b>',
+            '',
+            f"👤 Роль: <b>{html.escape(role_text)}</b>",
+            f"👨‍🏫 Текущий преподаватель: <b>{html.escape(current_teacher or 'не выбран')}</b>",
+            f"📚 Доступные преподаватели: <b>{html.escape(available_text)}</b>",
+            f"🧾 В списке преподавателей: <b>{teachers_count}</b>",
+        ]
+    )
+
+
+def _build_teacher_panel_keyboard(current_teacher: str | None, can_switch_teachers: bool):
+    """Строит клавиатуру панели учителя."""
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    if can_switch_teachers or not current_teacher:
+        keyboard.add(
+            types.InlineKeyboardButton(
+                text=f"👨‍🏫 {current_teacher}" if current_teacher else '👨‍🏫 Выбрать преподавателя',
+                callback_data='teacher_pick_0',
+            )
+        )
+    if current_teacher:
+        keyboard.add(
+            types.InlineKeyboardButton(
+                text='📅 Открыть расписание',
+                callback_data='teacher_show_schedule',
+            )
+        )
+        keyboard.add(
+            types.InlineKeyboardButton(
+                text='📝 Домашние задания',
+                callback_data='teacher_hw',
+            )
+        )
+    keyboard.row(
+        types.InlineKeyboardButton(text='🔄 Обновить', callback_data='teacher_open'),
+        types.InlineKeyboardButton(text='🚪 Выйти', callback_data='teacher_logout'),
+    )
+    keyboard.add(types.InlineKeyboardButton(text='🏠 В главное меню', callback_data='main_menu'))
+    return keyboard
+
+
+def _build_teacher_picker_text(
+    title: str,
+    subtitle: str,
+    current_teacher: str | None,
+    page: int,
+    total_pages: int,
+    teachers_count: int,
+):
+    """Формирует текст inline-выбора преподавателя."""
+    lines = [
+        f'<b>{title}</b>',
+        '',
+        subtitle,
+        f"👨‍🏫 Текущий выбор: <b>{html.escape(current_teacher or 'не выбран')}</b>",
+        f"📄 Страница: <b>{page + 1}/{total_pages}</b>",
+        f"📚 Преподавателей: <b>{teachers_count}</b>",
+        '',
+        'Выберите преподавателя из списка ниже.',
+    ]
+    return '\n'.join(lines)
+
+
+def _build_teacher_picker_keyboard(
+    teachers: list[str],
+    current_teacher: str | None,
+    page: int,
+    *,
+    set_callback_format: str,
+    page_callback_format: str,
+    back_callback: str,
+    back_text: str,
+    clear_callback: str | None = None,
+):
+    """Строит клавиатуру выбора преподавателя."""
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    total_pages = max(1, (len(teachers) + ADMIN_FILTER_PAGE_SIZE - 1) // ADMIN_FILTER_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    start = page * ADMIN_FILTER_PAGE_SIZE
+    end = start + ADMIN_FILTER_PAGE_SIZE
+
+    for absolute_index in range(start, min(end, len(teachers))):
+        teacher_name = teachers[absolute_index]
+        marker = '✅ ' if teacher_name == current_teacher else ''
+        keyboard.add(
+            types.InlineKeyboardButton(
+                text=_truncate_button_text(f'{marker}{teacher_name}', 62),
+                callback_data=set_callback_format.format(index=absolute_index),
+            )
+        )
+
+    if total_pages > 1:
+        keyboard.row(
+            types.InlineKeyboardButton(
+                text='⬅️',
+                callback_data=page_callback_format.format(page=page - 1) if page > 0 else 'teacher_noop',
+            ),
+            types.InlineKeyboardButton(text=f'📄 {page + 1}/{total_pages}', callback_data='teacher_noop'),
+            types.InlineKeyboardButton(
+                text='➡️',
+                callback_data=page_callback_format.format(page=page + 1) if page < total_pages - 1 else 'teacher_noop',
+            ),
+        )
+
+    if clear_callback:
+        keyboard.add(types.InlineKeyboardButton(text='❌ Снять преподавателя', callback_data=clear_callback))
+
+    keyboard.add(types.InlineKeyboardButton(text=back_text, callback_data=back_callback))
+    return keyboard
 
 
 async def _resolve_starosta_context(state: FSMContext, telegram_id: int):
@@ -1199,6 +1557,869 @@ async def _render_starosta_user_attendance_view(
     return True
 
 
+async def _render_teacher_panel(target, state: FSMContext, telegram_id: int, *, edit: bool):
+    """Показывает панель учителя."""
+    access, available_teachers, current_teacher = await _resolve_teacher_context(state, telegram_id)
+    if not access.get('has_access'):
+        if edit:
+            await target.answer('⚠️ У вас нет доступа к панели учителя', show_alert=True)
+        else:
+            await target.answer('⚠️ У вас нет доступа к панели учителя')
+        return False
+
+    text = _build_teacher_panel_text(access, current_teacher, len(available_teachers))
+    keyboard = _build_teacher_panel_keyboard(
+        current_teacher,
+        can_switch_teachers=bool(access.get('is_super') or len(available_teachers) > 1 or not current_teacher),
+    )
+
+    if edit:
+        await _safe_edit_text(target.message, text, reply_markup=keyboard, parse_mode='HTML')
+        await target.answer()
+    else:
+        await target.answer(text, reply_markup=keyboard, parse_mode='HTML')
+    return True
+
+
+async def _render_teacher_picker(target, state: FSMContext, telegram_id: int, *, page: int, edit: bool):
+    """Показывает выбор преподавателя для панели учителя."""
+    access, available_teachers, current_teacher = await _resolve_teacher_context(state, telegram_id)
+    if not access.get('has_access'):
+        if edit:
+            await target.answer('⚠️ У вас нет доступа к панели учителя', show_alert=True)
+        else:
+            await target.answer('⚠️ У вас нет доступа к панели учителя')
+        return False
+
+    if not available_teachers:
+        if edit:
+            await target.answer('⚠️ В расписании пока нет преподавателей для выбора', show_alert=True)
+        else:
+            await target.answer('⚠️ В расписании пока нет преподавателей для выбора')
+        return False
+
+    total_pages = max(1, (len(available_teachers) + ADMIN_FILTER_PAGE_SIZE - 1) // ADMIN_FILTER_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    text = _build_teacher_picker_text(
+        '👨‍🏫 Выбор преподавателя',
+        'Эта привязка используется только внутри панели учителя.',
+        current_teacher,
+        page,
+        total_pages,
+        len(available_teachers),
+    )
+    keyboard = _build_teacher_picker_keyboard(
+        available_teachers,
+        current_teacher,
+        page,
+        set_callback_format='teacher_set_{index}',
+        page_callback_format='teacher_pick_{page}',
+        back_callback='teacher_open',
+        back_text='⬅️ В панель учителя',
+    )
+
+    if edit:
+        await _safe_edit_text(target.message, text, reply_markup=keyboard, parse_mode='HTML')
+        await target.answer()
+    else:
+        await target.answer(text, reply_markup=keyboard, parse_mode='HTML')
+    return True
+
+
+async def teacher_panel_command(message: types.Message, state: FSMContext):
+    """Открывает панель учителя или запускает вход по логину и паролю."""
+    await state.finish()
+    telegram_id = _telegram_id_from_message(message)
+    access = await db_commands.get_teacher_access(telegram_id)
+    if access.get('has_access'):
+        await _render_teacher_panel(message, state, telegram_id, edit=False)
+        return
+
+    if not _teacher_panel_enabled():
+        await message.answer('⚠️ Вас не назначили преподавателем, а общий вход учителей не настроен.')
+        return
+
+    await state.set_state(TeacherAuthDialog.waiting_login.state)
+    await message.answer(
+        "👨‍🏫 Вход в панель учителя\n\nВведите логин.\nДля отмены напишите <b>Отмена</b>.",
+        parse_mode='HTML',
+    )
+
+
+async def teacher_receive_login(message: types.Message, state: FSMContext):
+    """Принимает логин для входа в панель учителя."""
+    text_value = _normalize_cell_text(message.text)
+    if not text_value:
+        await message.answer('Введите логин.')
+        return
+
+    if _search_normalize_text(text_value) in {'отмена', 'cancel'}:
+        await state.finish()
+        await message.answer('Вход в панель учителя отменен.', reply_markup=get_main_keyboard())
+        return
+
+    await state.update_data(teacher_login=text_value)
+    await state.set_state(TeacherAuthDialog.waiting_password.state)
+    await message.answer(
+        "🔒 Теперь введите пароль.\nДля отмены напишите <b>Отмена</b>.",
+        parse_mode='HTML',
+    )
+
+
+async def teacher_receive_password(message: types.Message, state: FSMContext):
+    """Принимает пароль и завершает вход в панель учителя."""
+    password_text = _normalize_cell_text(message.text)
+    if not password_text:
+        await message.answer('Введите пароль.')
+        return
+
+    if _search_normalize_text(password_text) in {'отмена', 'cancel'}:
+        await state.finish()
+        await message.answer('Вход в панель учителя отменен.', reply_markup=get_main_keyboard())
+        return
+
+    state_data = await state.get_data()
+    login_text = state_data.get('teacher_login', '')
+
+    if not _is_teacher_credentials_valid(login_text, password_text):
+        await state.set_state(TeacherAuthDialog.waiting_login.state)
+        await state.update_data(teacher_login=None)
+        await message.answer(
+            "⚠️ Неверный логин или пароль.\nВведите логин заново или напишите <b>Отмена</b>.",
+            parse_mode='HTML',
+        )
+        return
+
+    telegram_id = _telegram_id_from_message(message)
+    await db_commands.authorize_teacher(telegram_id, login_text)
+    await state.finish()
+    await message.answer('✅ Вход выполнен.')
+    await _render_teacher_panel(message, state, telegram_id, edit=False)
+
+
+async def teacher_open(callback_query: types.CallbackQuery, state: FSMContext):
+    """Открывает панель учителя по callback."""
+    await _render_teacher_panel(callback_query, state, _telegram_id_from_callback(callback_query), edit=True)
+
+
+async def teacher_logout(callback_query: types.CallbackQuery, state: FSMContext):
+    """Выходит из панели учителя."""
+    telegram_id = _telegram_id_from_callback(callback_query)
+    if telegram_id is not None:
+        await db_commands.revoke_teacher(telegram_id)
+
+    await state.finish()
+    await _safe_edit_text(
+        callback_query.message,
+        "🔒 Вы вышли из панели учителя.",
+        reply_markup=types.InlineKeyboardMarkup().add(
+            types.InlineKeyboardButton(text='🏠 В главное меню', callback_data='main_menu')
+        ),
+    )
+    await callback_query.answer()
+
+
+async def teacher_pick(callback_query: types.CallbackQuery, state: FSMContext):
+    """Показывает выбор преподавателя в панели учителя."""
+    try:
+        page = int(callback_query.data.rsplit('_', 1)[1])
+    except (TypeError, ValueError, IndexError):
+        page = 0
+
+    await _render_teacher_picker(
+        callback_query,
+        state,
+        _telegram_id_from_callback(callback_query),
+        page=page,
+        edit=True,
+    )
+
+
+async def teacher_set(callback_query: types.CallbackQuery, state: FSMContext):
+    """Выбирает преподавателя внутри панели учителя."""
+    try:
+        selected_index = int(callback_query.data.rsplit('_', 1)[1])
+    except (TypeError, ValueError, IndexError):
+        await callback_query.answer('⚠️ Преподаватель не найден', show_alert=True)
+        return
+
+    telegram_id = _telegram_id_from_callback(callback_query)
+    access, available_teachers, _ = await _resolve_teacher_context(state, telegram_id)
+    if not access.get('has_access'):
+        await callback_query.answer('⚠️ У вас нет доступа к панели учителя', show_alert=True)
+        return
+
+    if selected_index < 0 or selected_index >= len(available_teachers):
+        await callback_query.answer('⚠️ Преподаватель не найден', show_alert=True)
+        return
+
+    await state.update_data(teacher_selected_name=available_teachers[selected_index])
+    await _render_teacher_panel(callback_query, state, telegram_id, edit=True)
+    await callback_query.answer('Преподаватель выбран')
+
+
+async def teacher_show_schedule(callback_query: types.CallbackQuery, state: FSMContext):
+    """Открывает расписание выбранного преподавателя."""
+    telegram_id = _telegram_id_from_callback(callback_query)
+    access, _, current_teacher = await _resolve_teacher_context(state, telegram_id)
+    if not access.get('has_access'):
+        await callback_query.answer('⚠️ У вас нет доступа к панели учителя', show_alert=True)
+        return
+
+    if not current_teacher:
+        await callback_query.answer('⚠️ Сначала выберите преподавателя', show_alert=True)
+        return
+
+    token = await _store_search_payload(
+        'search_entity',
+        {
+            'search_kind': 'teacher',
+            'entity': current_teacher,
+        },
+    )
+    await _render_search_entity(callback_query.message, token, None, edit=False)
+    await callback_query.answer()
+
+
+async def teacher_noop(callback_query: types.CallbackQuery):
+    """Служебная кнопка панели учителя."""
+    await callback_query.answer()
+
+
+def _build_teacher_homework_refs(teacher_name: str):
+    """Собирает пары выбранного преподавателя для назначения домашнего задания."""
+    teacher_key = _teacher_lookup_key(teacher_name)
+    if not teacher_key:
+        return []
+
+    refs = []
+    for course in sorted(schedule_data.keys()):
+        for group_code in sorted(schedule_data.get(course, {}).keys()):
+            weeks = _get_available_weeks(course, group_code)
+            for week_index, week_label in enumerate(weeks):
+                week_days = _build_week_day_items(course, group_code, week_label)
+                week_schedule = schedule_data.get(course, {}).get(group_code, {}).get(week_label, [])
+                for day_index, day_item in enumerate(week_days):
+                    day_date = day_item.get('date_obj')
+                    if day_date is None:
+                        continue
+
+                    lessons = _get_day_lessons(week_schedule, day_item['day_name'])
+                    for lesson_index, lesson in enumerate(lessons):
+                        lesson_teacher = _extract_teacher_from_lesson(lesson.get('lesson'))
+                        if _teacher_lookup_key(lesson_teacher) != teacher_key:
+                            continue
+
+                        refs.append(
+                            {
+                                'course': course,
+                                'course_name': _course_name(course),
+                                'period_label': _period_label_for_course(course),
+                                'group_code': group_code,
+                                'week_index': week_index,
+                                'week_label': week_label,
+                                'day_index': day_index,
+                                'day_name': day_item['day_name'],
+                                'day_title': day_item['day_title'],
+                                'date_obj': day_date,
+                                'date_short': day_item['date_short'],
+                                'is_today': day_item.get('is_today', False),
+                                'lesson_index': lesson_index,
+                                'time_text': _normalize_cell_text(lesson.get('time')) or 'Время не указано',
+                                'lesson_text': _normalize_cell_text(lesson.get('lesson')) or 'Без названия',
+                                'subject': _extract_subject_from_lesson(lesson.get('lesson')) or 'Без названия',
+                            }
+                        )
+
+    refs.sort(
+        key=lambda item: (
+            item['date_obj'] is None,
+            item['date_obj'] or datetime.max.date(),
+            item['time_text'],
+            item['group_code'],
+            item['course_name'],
+        )
+    )
+    return refs
+
+
+def _nearest_teacher_homework_page(lesson_refs):
+    """Возвращает страницу со следующей ближайшей парой преподавателя."""
+    if not lesson_refs:
+        return 0
+
+    today = datetime.now().date()
+    for index, item in enumerate(lesson_refs):
+        if item['date_obj'] >= today:
+            return index // TEACHER_HOMEWORK_PAGE_SIZE
+
+    return max(0, (len(lesson_refs) - 1) // TEACHER_HOMEWORK_PAGE_SIZE)
+
+
+def _teacher_homework_date_caption(lesson_ref: dict):
+    """Возвращает читаемую подпись даты пары для домашнего задания."""
+    return _format_search_date_caption(
+        lesson_ref.get('date_obj'),
+        lesson_ref.get('date_short'),
+        lesson_ref.get('day_title') or lesson_ref.get('day_name'),
+    )
+
+
+def _teacher_homework_button_text(lesson_ref: dict):
+    """Строит компактную подпись кнопки пары."""
+    marker = '💠 ' if lesson_ref.get('is_today') else ''
+    return f"{marker}{lesson_ref.get('date_short')} • {lesson_ref.get('time_text')} • {lesson_ref.get('group_code')}"
+
+
+def _teacher_homework_compose_button_text(lesson_ref: dict):
+    """Возвращает подпись пары для экрана ввода домашнего задания."""
+    return (
+        f"{lesson_ref.get('lesson_index', 0) + 1}. "
+        f"{lesson_ref.get('time_text')} • {lesson_ref.get('group_code')}"
+    )
+
+
+def _homework_text_lines(homework_text: str):
+    """Готовит строки домашнего задания для HTML-сообщения."""
+    normalized = str(homework_text or '').strip()
+    if not normalized:
+        return []
+    return [html.escape(line) for line in normalized.splitlines()] or [html.escape(normalized)]
+
+
+def _build_teacher_homework_list_text(current_teacher: str, lesson_refs, page: int):
+    """Формирует список пар преподавателя для выбора домашнего задания."""
+    total_pages = max(1, (len(lesson_refs) + TEACHER_HOMEWORK_PAGE_SIZE - 1) // TEACHER_HOMEWORK_PAGE_SIZE)
+    lines = [
+        '<b>📝 Домашние задания</b>',
+        '',
+        f"👨‍🏫 Преподаватель: <b>{html.escape(current_teacher or 'не выбран')}</b>",
+    ]
+
+    if not lesson_refs:
+        lines.extend(['', 'В расписании этого преподавателя пока не найдено пар с датой.'])
+        return '\n'.join(lines)
+
+    lines.extend(
+        [
+            f"📄 Страница: <b>{page + 1}/{total_pages}</b>",
+            f"📚 Доступных пар: <b>{len(lesson_refs)}</b>",
+            '',
+            'Выберите пару, чтобы добавить или изменить домашнее задание.',
+        ]
+    )
+    return '\n'.join(lines)
+
+
+def _build_teacher_homework_list_keyboard(lesson_refs, page: int):
+    """Строит клавиатуру списка пар преподавателя."""
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    total_pages = max(1, (len(lesson_refs) + TEACHER_HOMEWORK_PAGE_SIZE - 1) // TEACHER_HOMEWORK_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    start = page * TEACHER_HOMEWORK_PAGE_SIZE
+    end = start + TEACHER_HOMEWORK_PAGE_SIZE
+
+    for ref_index in range(start, min(end, len(lesson_refs))):
+        lesson_ref = lesson_refs[ref_index]
+        keyboard.add(
+            types.InlineKeyboardButton(
+                text=_truncate_button_text(_teacher_homework_button_text(lesson_ref), 62),
+                callback_data=f'teacher_hw_open_{ref_index}_{page}',
+            )
+        )
+
+    if total_pages > 1:
+        keyboard.row(
+            types.InlineKeyboardButton(
+                text='⬅️',
+                callback_data=f'teacher_hw_page_{page - 1}' if page > 0 else 'teacher_noop',
+            ),
+            types.InlineKeyboardButton(text=f'📄 {page + 1}/{total_pages}', callback_data='teacher_noop'),
+            types.InlineKeyboardButton(
+                text='➡️',
+                callback_data=f'teacher_hw_page_{page + 1}' if page < total_pages - 1 else 'teacher_noop',
+            ),
+        )
+
+    keyboard.row(
+        types.InlineKeyboardButton(text='🔄 Обновить', callback_data='teacher_hw'),
+        types.InlineKeyboardButton(text='⬅️ В панель учителя', callback_data='teacher_open'),
+    )
+    return keyboard
+
+
+def _build_teacher_homework_detail_text(current_teacher: str, lesson_ref: dict, homework: dict | None):
+    """Формирует карточку пары с текущим домашним заданием."""
+    lines = [
+        '<b>📝 Домашнее задание</b>',
+        '',
+        f"👨‍🏫 Преподаватель: <b>{html.escape(current_teacher or 'не выбран')}</b>",
+        f"👥 Группа: <b>{html.escape(lesson_ref.get('group_code') or '-')}</b>",
+        f"🎓 Курс: <b>{html.escape(lesson_ref.get('course_name') or '-')}</b>",
+        f"🗓️ Период: <b>{html.escape(lesson_ref.get('period_label') or '-')}</b>",
+        f"📅 Дата: <b>{html.escape(_teacher_homework_date_caption(lesson_ref))}</b>",
+        f"⏰ Пара: <b>{lesson_ref.get('lesson_index', 0) + 1}. {html.escape(lesson_ref.get('time_text') or '-')}</b>",
+        f"📚 Занятие: <b>{html.escape(lesson_ref.get('subject') or lesson_ref.get('lesson_text') or '-')}</b>",
+    ]
+
+    if homework and homework.get('homework_text'):
+        lines.extend(['', '📝 <b>Текущее задание:</b>'])
+        lines.extend(_homework_text_lines(homework.get('homework_text')))
+    else:
+        lines.extend(['', '📝 <b>Домашнее задание пока не задано.</b>'])
+
+    return '\n'.join(lines)
+
+
+def _build_teacher_homework_detail_keyboard(ref_index: int, page: int, homework: dict | None):
+    """Строит клавиатуру карточки пары преподавателя."""
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    keyboard.add(
+        types.InlineKeyboardButton(
+            text='✏️ Изменить задание' if homework and homework.get('homework_text') else '📝 Задать задание',
+            callback_data=f'teacher_hw_edit_{ref_index}_{page}',
+        )
+    )
+    if homework and homework.get('homework_text'):
+        keyboard.add(
+            types.InlineKeyboardButton(
+                text='🗑️ Удалить задание',
+                callback_data=f'teacher_hw_delete_{ref_index}_{page}',
+            )
+        )
+
+    keyboard.row(
+        types.InlineKeyboardButton(text='⬅️ К парам', callback_data=f'teacher_hw_page_{page}'),
+        types.InlineKeyboardButton(text='⬅️ В панель учителя', callback_data='teacher_open'),
+    )
+    return keyboard
+
+
+def _build_teacher_homework_compose_text(current_teacher: str, lesson_ref: dict, homework: dict | None):
+    """Формирует экран ввода текста домашнего задания."""
+    lines = [
+        '<b>📝 Введите домашнее задание</b>',
+        '',
+        f"👨‍🏫 Преподаватель: <b>{html.escape(current_teacher or 'не выбран')}</b>",
+        f"👥 Группа: <b>{html.escape(lesson_ref.get('group_code') or '-')}</b>",
+        f"📅 Дата: <b>{html.escape(_teacher_homework_date_caption(lesson_ref))}</b>",
+        f"⏰ Пара: <b>{html.escape(_teacher_homework_compose_button_text(lesson_ref))}</b>",
+        f"📚 Занятие: <b>{html.escape(lesson_ref.get('subject') or lesson_ref.get('lesson_text') or '-')}</b>",
+        '',
+    ]
+
+    if homework and homework.get('homework_text'):
+        lines.append('Текущее домашнее задание:')
+        lines.extend(_homework_text_lines(homework.get('homework_text')))
+        lines.append('')
+
+    lines.extend(
+        [
+            'Отправьте следующим сообщением текст домашнего задания.',
+            'Для отмены нажмите кнопку ниже или напишите «Отмена».',
+        ]
+    )
+    return '\n'.join(lines)
+
+
+def _build_teacher_homework_compose_keyboard():
+    """Строит клавиатуру экрана ввода домашнего задания."""
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    keyboard.add(types.InlineKeyboardButton(text='⬅️ Отмена', callback_data='teacher_hw_cancel'))
+    return keyboard
+
+
+async def _clear_teacher_homework_context(state: FSMContext):
+    """Сбрасывает служебный контекст ввода домашнего задания учителя."""
+    await state.reset_state(with_data=False)
+    await state.update_data(
+        teacher_hw_ref_index=None,
+        teacher_hw_origin_chat_id=None,
+        teacher_hw_origin_message_id=None,
+        teacher_hw_origin_page=None,
+    )
+
+
+async def _render_teacher_homework_list(target, state: FSMContext, telegram_id: int, *, page: int | None, edit: bool):
+    """Показывает список пар преподавателя для выбора домашнего задания."""
+    access, _, current_teacher = await _resolve_teacher_context(state, telegram_id)
+    if not access.get('has_access'):
+        if edit:
+            await target.answer('⚠️ У вас нет доступа к панели учителя', show_alert=True)
+        else:
+            await target.answer('⚠️ У вас нет доступа к панели учителя')
+        return False
+
+    if not current_teacher:
+        if edit:
+            await target.answer('⚠️ Сначала выберите преподавателя', show_alert=True)
+        else:
+            await target.answer('⚠️ Сначала выберите преподавателя')
+        return False
+
+    lesson_refs = _build_teacher_homework_refs(current_teacher)
+    if page is None:
+        page = _nearest_teacher_homework_page(lesson_refs)
+
+    total_pages = max(1, (len(lesson_refs) + TEACHER_HOMEWORK_PAGE_SIZE - 1) // TEACHER_HOMEWORK_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    text = _build_teacher_homework_list_text(current_teacher, lesson_refs, page)
+    keyboard = _build_teacher_homework_list_keyboard(lesson_refs, page)
+
+    if edit:
+        await _safe_edit_text(target.message, text, reply_markup=keyboard, parse_mode='HTML')
+        await target.answer()
+    else:
+        await target.answer(text, reply_markup=keyboard, parse_mode='HTML')
+    return True
+
+
+async def _render_teacher_homework_detail(
+    target,
+    state: FSMContext,
+    telegram_id: int,
+    *,
+    ref_index: int,
+    page: int,
+    edit: bool,
+):
+    """Показывает карточку выбранной пары преподавателя."""
+    access, _, current_teacher = await _resolve_teacher_context(state, telegram_id)
+    if not access.get('has_access'):
+        if edit:
+            await target.answer('⚠️ У вас нет доступа к панели учителя', show_alert=True)
+        else:
+            await target.answer('⚠️ У вас нет доступа к панели учителя')
+        return False
+
+    if not current_teacher:
+        if edit:
+            await target.answer('⚠️ Сначала выберите преподавателя', show_alert=True)
+        else:
+            await target.answer('⚠️ Сначала выберите преподавателя')
+        return False
+
+    lesson_refs = _build_teacher_homework_refs(current_teacher)
+    if ref_index < 0 or ref_index >= len(lesson_refs):
+        if edit:
+            await target.answer('⚠️ Пара не найдена', show_alert=True)
+        else:
+            await target.answer('⚠️ Пара не найдена')
+        return False
+
+    lesson_ref = lesson_refs[ref_index]
+    homework = await db_commands.get_lesson_homework(
+        lesson_ref['group_code'],
+        lesson_ref['date_obj'],
+        lesson_ref['lesson_index'],
+    )
+    text = _build_teacher_homework_detail_text(current_teacher, lesson_ref, homework)
+    keyboard = _build_teacher_homework_detail_keyboard(ref_index, page, homework)
+
+    if edit:
+        await _safe_edit_text(target.message, text, reply_markup=keyboard, parse_mode='HTML')
+        await target.answer()
+    else:
+        await target.answer(text, reply_markup=keyboard, parse_mode='HTML')
+    return True
+
+
+async def _restore_teacher_homework_origin(state: FSMContext, telegram_id: int):
+    """Возвращает учителя к карточке пары после сохранения или отмены."""
+    user_data = await state.get_data()
+    chat_id = user_data.get('teacher_hw_origin_chat_id')
+    message_id = user_data.get('teacher_hw_origin_message_id')
+    ref_index = user_data.get('teacher_hw_ref_index')
+    page = user_data.get('teacher_hw_origin_page', 0)
+    if chat_id is None or message_id is None or ref_index is None:
+        return
+
+    access, _, current_teacher = await _resolve_teacher_context(state, telegram_id)
+    if not access.get('has_access') or not current_teacher:
+        return
+
+    lesson_refs = _build_teacher_homework_refs(current_teacher)
+    if ref_index < 0 or ref_index >= len(lesson_refs):
+        return
+
+    lesson_ref = lesson_refs[ref_index]
+    homework = await db_commands.get_lesson_homework(
+        lesson_ref['group_code'],
+        lesson_ref['date_obj'],
+        lesson_ref['lesson_index'],
+    )
+    await _safe_edit_message_text_by_id(
+        int(chat_id),
+        int(message_id),
+        _build_teacher_homework_detail_text(current_teacher, lesson_ref, homework),
+        reply_markup=_build_teacher_homework_detail_keyboard(int(ref_index), int(page or 0), homework),
+        parse_mode='HTML',
+    )
+
+
+async def _send_teacher_homework_notifications(lesson_ref: dict, current_teacher: str, homework_result: dict):
+    """Рассылает домашнее задание всем пользователям нужной группы."""
+    recipients = await db_commands.get_admin_message_recipients(group_code=lesson_ref.get('group_code'))
+    if not recipients:
+        return {
+            'total': 0,
+            'sent': 0,
+        }
+
+    action = homework_result.get('action')
+    title = '📝 Новое домашнее задание' if action == 'created' else '🔄 Домашнее задание обновлено'
+    lines = [
+        f"<b>{title}</b>",
+        '',
+        f"👥 Группа: <b>{html.escape(lesson_ref.get('group_code') or '-')}</b>",
+        f"📅 Дата: <b>{html.escape(_teacher_homework_date_caption(lesson_ref))}</b>",
+        f"⏰ Пара: <b>{lesson_ref.get('lesson_index', 0) + 1}. {html.escape(lesson_ref.get('time_text') or '-')}</b>",
+        f"📚 Занятие: <b>{html.escape(lesson_ref.get('subject') or lesson_ref.get('lesson_text') or '-')}</b>",
+        f"👨‍🏫 Преподаватель: <b>{html.escape(current_teacher or '-')}</b>",
+        '',
+        '📝 <b>Задание:</b>',
+    ]
+    lines.extend(_homework_text_lines(homework_result.get('homework_text') or ''))
+    text = '\n'.join(lines)
+
+    sent_count = 0
+    for recipient in recipients:
+        telegram_id = recipient.get('telegram_id')
+        if not telegram_id:
+            continue
+        try:
+            await bot.send_message(int(telegram_id), text, parse_mode='HTML')
+            sent_count += 1
+        except Exception:
+            continue
+
+    return {
+        'total': len(recipients),
+        'sent': sent_count,
+    }
+
+
+def _parse_teacher_homework_numbers(callback_data: str, prefix: str, expected_parts: int):
+    """Извлекает числовые параметры callback-кнопок домашнего задания."""
+    payload = str(callback_data or '')
+    if not payload.startswith(prefix):
+        return None
+
+    parts = payload[len(prefix):].split('_')
+    if len(parts) != expected_parts:
+        return None
+
+    try:
+        return [int(part) for part in parts]
+    except (TypeError, ValueError):
+        return None
+
+
+async def teacher_homework_open(callback_query: types.CallbackQuery, state: FSMContext):
+    """Открывает список пар преподавателя для назначения домашнего задания."""
+    await _render_teacher_homework_list(
+        callback_query,
+        state,
+        _telegram_id_from_callback(callback_query),
+        page=None,
+        edit=True,
+    )
+
+
+async def teacher_homework_change_page(callback_query: types.CallbackQuery, state: FSMContext):
+    """Переключает страницу списка пар преподавателя."""
+    parsed = _parse_teacher_homework_numbers(callback_query.data, 'teacher_hw_page_', 1)
+    if parsed is None:
+        await callback_query.answer('⚠️ Страница не найдена', show_alert=True)
+        return
+
+    await _render_teacher_homework_list(
+        callback_query,
+        state,
+        _telegram_id_from_callback(callback_query),
+        page=parsed[0],
+        edit=True,
+    )
+
+
+async def teacher_homework_open_detail(callback_query: types.CallbackQuery, state: FSMContext):
+    """Открывает карточку выбранной пары преподавателя."""
+    parsed = _parse_teacher_homework_numbers(callback_query.data, 'teacher_hw_open_', 2)
+    if parsed is None:
+        await callback_query.answer('⚠️ Пара не найдена', show_alert=True)
+        return
+
+    ref_index, page = parsed
+    await _render_teacher_homework_detail(
+        callback_query,
+        state,
+        _telegram_id_from_callback(callback_query),
+        ref_index=ref_index,
+        page=page,
+        edit=True,
+    )
+
+
+async def teacher_homework_start_edit(callback_query: types.CallbackQuery, state: FSMContext):
+    """Переводит учителя в режим ввода домашнего задания."""
+    parsed = _parse_teacher_homework_numbers(callback_query.data, 'teacher_hw_edit_', 2)
+    if parsed is None:
+        await callback_query.answer('⚠️ Пара не найдена', show_alert=True)
+        return
+
+    ref_index, page = parsed
+    telegram_id = _telegram_id_from_callback(callback_query)
+    access, _, current_teacher = await _resolve_teacher_context(state, telegram_id)
+    if not access.get('has_access') or not current_teacher:
+        await callback_query.answer('⚠️ У вас нет доступа к панели учителя', show_alert=True)
+        return
+
+    lesson_refs = _build_teacher_homework_refs(current_teacher)
+    if ref_index < 0 or ref_index >= len(lesson_refs):
+        await callback_query.answer('⚠️ Пара не найдена', show_alert=True)
+        return
+
+    lesson_ref = lesson_refs[ref_index]
+    homework = await db_commands.get_lesson_homework(
+        lesson_ref['group_code'],
+        lesson_ref['date_obj'],
+        lesson_ref['lesson_index'],
+    )
+
+    await state.update_data(
+        teacher_hw_ref_index=ref_index,
+        teacher_hw_origin_chat_id=callback_query.message.chat.id,
+        teacher_hw_origin_message_id=callback_query.message.message_id,
+        teacher_hw_origin_page=page,
+    )
+    await state.set_state(TeacherHomeworkDialog.waiting_text.state)
+    await _safe_edit_text(
+        callback_query.message,
+        _build_teacher_homework_compose_text(current_teacher, lesson_ref, homework),
+        reply_markup=_build_teacher_homework_compose_keyboard(),
+        parse_mode='HTML',
+    )
+    await callback_query.answer()
+
+
+async def teacher_homework_delete(callback_query: types.CallbackQuery, state: FSMContext):
+    """Удаляет домашнее задание у выбранной пары."""
+    parsed = _parse_teacher_homework_numbers(callback_query.data, 'teacher_hw_delete_', 2)
+    if parsed is None:
+        await callback_query.answer('⚠️ Пара не найдена', show_alert=True)
+        return
+
+    ref_index, page = parsed
+    telegram_id = _telegram_id_from_callback(callback_query)
+    access, _, current_teacher = await _resolve_teacher_context(state, telegram_id)
+    if not access.get('has_access') or not current_teacher:
+        await callback_query.answer('⚠️ У вас нет доступа к панели учителя', show_alert=True)
+        return
+
+    lesson_refs = _build_teacher_homework_refs(current_teacher)
+    if ref_index < 0 or ref_index >= len(lesson_refs):
+        await callback_query.answer('⚠️ Пара не найдена', show_alert=True)
+        return
+
+    lesson_ref = lesson_refs[ref_index]
+    deleted = await db_commands.delete_lesson_homework(
+        lesson_ref['group_code'],
+        lesson_ref['date_obj'],
+        lesson_ref['lesson_index'],
+    )
+    if deleted is None:
+        await callback_query.answer('ℹ️ Для этой пары домашнее задание не найдено', show_alert=True)
+        return
+
+    await _render_teacher_homework_detail(
+        callback_query,
+        state,
+        telegram_id,
+        ref_index=ref_index,
+        page=page,
+        edit=True,
+    )
+    await callback_query.answer('Домашнее задание удалено')
+
+
+async def teacher_homework_cancel(callback_query: types.CallbackQuery, state: FSMContext):
+    """Отменяет ввод домашнего задания и возвращает к карточке пары."""
+    telegram_id = _telegram_id_from_callback(callback_query)
+    await _restore_teacher_homework_origin(state, telegram_id)
+    await _clear_teacher_homework_context(state)
+    await callback_query.answer('Ввод домашнего задания отменен')
+
+
+async def teacher_receive_homework_text(message: types.Message, state: FSMContext):
+    """Сохраняет текст домашнего задания и рассылает его группе."""
+    telegram_id = _telegram_id_from_message(message)
+    text_value = _normalize_cell_text(message.text)
+    if not text_value:
+        await message.answer('Введите текст домашнего задания.')
+        return
+
+    if _admin_message_is_cancel(text_value):
+        await _restore_teacher_homework_origin(state, telegram_id)
+        await _clear_teacher_homework_context(state)
+        await message.answer('Ввод домашнего задания отменен.', reply_markup=get_main_keyboard())
+        return
+
+    user_data = await state.get_data()
+    ref_index = user_data.get('teacher_hw_ref_index')
+    if ref_index is None:
+        await _clear_teacher_homework_context(state)
+        await message.answer('⚠️ Не удалось определить выбранную пару. Откройте раздел заново.')
+        return
+
+    access, _, current_teacher = await _resolve_teacher_context(state, telegram_id)
+    if not access.get('has_access') or not current_teacher:
+        await _clear_teacher_homework_context(state)
+        await message.answer('⚠️ У вас нет доступа к панели учителя.')
+        return
+
+    lesson_refs = _build_teacher_homework_refs(current_teacher)
+    if ref_index < 0 or ref_index >= len(lesson_refs):
+        await _clear_teacher_homework_context(state)
+        await message.answer('⚠️ Пара больше не найдена в расписании. Откройте раздел заново.')
+        return
+
+    lesson_ref = lesson_refs[ref_index]
+    result = await db_commands.upsert_lesson_homework(
+        teacher_name=current_teacher,
+        group_code=lesson_ref['group_code'],
+        target_date=lesson_ref['date_obj'],
+        lesson_index=lesson_ref['lesson_index'],
+        lesson_time=lesson_ref['time_text'],
+        lesson_title=lesson_ref['subject'] or lesson_ref['lesson_text'],
+        homework_text=text_value,
+        created_by_telegram_id=telegram_id,
+    )
+    if result is None:
+        await message.answer('⚠️ Не удалось сохранить домашнее задание.')
+        return
+
+    notify_stats = {'sent': 0, 'total': 0}
+    if result.get('action') in {'created', 'updated'}:
+        notify_stats = await _send_teacher_homework_notifications(lesson_ref, current_teacher, result)
+
+    await _restore_teacher_homework_origin(state, telegram_id)
+    await _clear_teacher_homework_context(state)
+
+    if result.get('action') == 'unchanged':
+        await message.answer('Домашнее задание не изменилось.', reply_markup=get_main_keyboard())
+        return
+
+    action_text = 'сохранено' if result.get('action') == 'created' else 'обновлено'
+    await message.answer(
+        (
+            f"📝 Домашнее задание {action_text}.\n"
+            f"👥 Группа: {lesson_ref['group_code']}\n"
+            f"📨 Отправлено: {notify_stats.get('sent', 0)} из {notify_stats.get('total', 0)}"
+        ),
+        reply_markup=get_main_keyboard(),
+    )
+
+
 def _build_admin_panel_keyboard():
     """Строит клавиатуру админ-панели."""
     keyboard = types.InlineKeyboardMarkup(row_width=2)
@@ -1674,6 +2895,7 @@ def _build_admin_user_details_text(user_details: dict):
         if _normalize_cell_text(group)
     ]
     starosta_text = ', '.join(starosta_groups) if starosta_groups else 'не назначен'
+    teacher_text = _normalize_teacher_name(user_details.get('teacher_name')) or 'не назначен'
 
     lines = [
         '<b>👤 Пользователь</b>',
@@ -1684,6 +2906,7 @@ def _build_admin_user_details_text(user_details: dict):
         f"👥 Группа: <b>{html.escape(group_text)}</b>",
         f"🔔 Рассылка: <b>{html.escape(digest_text)}</b>",
         f"🎉 События: <b>{html.escape(event_notifications_text)}</b>",
+        f"👨‍🏫 Преподаватель: <b>{html.escape(teacher_text)}</b>",
         f"⭐ Староста групп: <b>{html.escape(starosta_text)}</b>",
         f"🔗 Реферал: <b>{html.escape(referrer_text)}</b>",
         f"🕒 Обновлено: <b>{html.escape(updated_text)}</b>",
@@ -1694,10 +2917,17 @@ def _build_admin_user_details_text(user_details: dict):
 def _build_admin_user_details_keyboard(target_telegram_id: int, user_details: dict | None = None):
     """Строит клавиатуру карточки пользователя."""
     keyboard = types.InlineKeyboardMarkup(row_width=1)
+    teacher_assigned = bool(_normalize_teacher_name((user_details or {}).get('teacher_name')))
     keyboard.add(
         types.InlineKeyboardButton(
             text='📊 Посещаемость',
             callback_data=f'admin_users_att_open_{target_telegram_id}',
+        )
+    )
+    keyboard.add(
+        types.InlineKeyboardButton(
+            text='👨‍🏫 Изменить преподавателя' if teacher_assigned else '👨‍🏫 Назначить преподавателя',
+            callback_data=f'admin_users_teacher_pick_{target_telegram_id}_0',
         )
     )
     keyboard.add(
@@ -3083,6 +4313,131 @@ async def admin_users_change_attendance_page(callback_query: types.CallbackQuery
     )
 
 
+async def _render_admin_teacher_picker(
+    target,
+    state: FSMContext,
+    viewer_telegram_id: int,
+    target_telegram_id: int,
+    *,
+    page: int,
+    edit: bool,
+):
+    """Показывает админу выбор преподавателя для пользователя."""
+    if not await db_commands.is_admin_authorized(viewer_telegram_id):
+        if edit:
+            await target.answer('⚠️ Сначала войдите в админ-панель через /admin', show_alert=True)
+        else:
+            await target.answer('⚠️ Сначала войдите в админ-панель через /admin')
+        return False
+
+    user_details = await db_commands.get_admin_user_details(target_telegram_id)
+    if not user_details:
+        if edit:
+            await target.answer('⚠️ Пользователь не найден', show_alert=True)
+        else:
+            await target.answer('⚠️ Пользователь не найден')
+        return False
+
+    current_teacher = _normalize_teacher_name(user_details.get('teacher_name')) or None
+    teachers = _teacher_names_from_schedule([current_teacher] if current_teacher else None)
+    if not teachers:
+        if edit:
+            await target.answer('⚠️ В расписании пока нет преподавателей для выбора', show_alert=True)
+        else:
+            await target.answer('⚠️ В расписании пока нет преподавателей для выбора')
+        return False
+
+    total_pages = max(1, (len(teachers) + ADMIN_FILTER_PAGE_SIZE - 1) // ADMIN_FILTER_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    text = _build_teacher_picker_text(
+        '👨‍🏫 Назначение преподавателя',
+        f"Пользователь: <b>{html.escape(_build_admin_message_target_label(user_details))}</b>",
+        current_teacher,
+        page,
+        total_pages,
+        len(teachers),
+    )
+    keyboard = _build_teacher_picker_keyboard(
+        teachers,
+        current_teacher,
+        page,
+        set_callback_format=f'admin_users_teacher_set_{target_telegram_id}_{{index}}',
+        page_callback_format=f'admin_users_teacher_pick_{target_telegram_id}_{{page}}',
+        back_callback=f'admin_users_info_{target_telegram_id}',
+        back_text='⬅️ К карточке пользователя',
+        clear_callback=f'admin_users_teacher_clear_{target_telegram_id}' if current_teacher else None,
+    )
+
+    if edit:
+        await _safe_edit_text(target.message, text, reply_markup=keyboard, parse_mode='HTML')
+        await target.answer()
+    else:
+        await target.answer(text, reply_markup=keyboard, parse_mode='HTML')
+    return True
+
+
+async def admin_users_pick_teacher(callback_query: types.CallbackQuery, state: FSMContext):
+    """Открывает inline-выбор преподавателя для пользователя."""
+    parsed = _parse_attendance_view_numbers(callback_query.data, 'admin_users_teacher_pick_', 2)
+    if parsed is None:
+        await callback_query.answer('⚠️ Пользователь не найден', show_alert=True)
+        return
+
+    target_telegram_id, page = parsed
+    await _render_admin_teacher_picker(
+        callback_query,
+        state,
+        _telegram_id_from_callback(callback_query),
+        target_telegram_id,
+        page=page,
+        edit=True,
+    )
+
+
+async def admin_users_set_teacher(callback_query: types.CallbackQuery, state: FSMContext):
+    """Назначает пользователю выбранного преподавателя."""
+    parsed = _parse_attendance_view_numbers(callback_query.data, 'admin_users_teacher_set_', 2)
+    if parsed is None:
+        await callback_query.answer('⚠️ Преподаватель не найден', show_alert=True)
+        return
+
+    target_telegram_id, selected_index = parsed
+    telegram_id = _telegram_id_from_callback(callback_query)
+    if not await db_commands.is_admin_authorized(telegram_id):
+        await callback_query.answer('⚠️ Сначала войдите в админ-панель через /admin', show_alert=True)
+        return
+
+    user_details = await db_commands.get_admin_user_details(target_telegram_id)
+    current_teacher = _normalize_teacher_name((user_details or {}).get('teacher_name')) or None
+    teachers = _teacher_names_from_schedule([current_teacher] if current_teacher else None)
+    if selected_index < 0 or selected_index >= len(teachers):
+        await callback_query.answer('⚠️ Преподаватель не найден', show_alert=True)
+        return
+
+    teacher_name = teachers[selected_index]
+    await db_commands.assign_user_teacher(teacher_name, target_telegram_id, telegram_id)
+    await _render_admin_user_details_view(callback_query, telegram_id, target_telegram_id, edit=True)
+    await callback_query.answer(f'Назначен преподаватель: {teacher_name}')
+
+
+async def admin_users_clear_teacher(callback_query: types.CallbackQuery, state: FSMContext):
+    """Снимает с пользователя роль преподавателя."""
+    parsed = _parse_attendance_view_numbers(callback_query.data, 'admin_users_teacher_clear_', 1)
+    if parsed is None:
+        await callback_query.answer('⚠️ Пользователь не найден', show_alert=True)
+        return
+
+    target_telegram_id = parsed[0]
+    telegram_id = _telegram_id_from_callback(callback_query)
+    if not await db_commands.is_admin_authorized(telegram_id):
+        await callback_query.answer('⚠️ Сначала войдите в админ-панель через /admin', show_alert=True)
+        return
+
+    await db_commands.clear_user_teacher(target_telegram_id)
+    await _render_admin_user_details_view(callback_query, telegram_id, target_telegram_id, edit=True)
+    await callback_query.answer('Роль преподавателя снята')
+
+
 async def admin_message_cancel(callback_query: types.CallbackQuery, state: FSMContext):
     """Отменяет ввод админ-сообщения и возвращает предыдущий экран."""
     telegram_id = _telegram_id_from_callback(callback_query)
@@ -4252,6 +5607,7 @@ ADMIN_FILTER_PAGE_SIZE = 8
 EVENTS_PAGE_SIZE = 8
 STAROSTA_ATTENDANCE_DAYS_PAGE_SIZE = 7
 STAROSTA_ATTENDANCE_STUDENTS_PAGE_SIZE = 8
+TEACHER_HOMEWORK_PAGE_SIZE = 8
 
 
 def _telegram_id_from_message(message: types.Message):
@@ -4768,7 +6124,7 @@ def parse_excel_file():
 
 def init_schedule():
     """Инициализирует и загружает расписание в память."""
-    global schedule_data, group_info_data, week_days_info, course_display_names, course_period_ids, period_id_to_label, period_courses
+    global schedule_data, group_info_data, week_days_info, course_display_names, course_period_ids, period_id_to_label, period_courses, TEACHER_CANONICAL_CACHE
     
     # Очищаем предыдущие данные
     schedule_data.clear()
@@ -4778,6 +6134,7 @@ def init_schedule():
     course_period_ids.clear()
     period_id_to_label.clear()
     period_courses.clear()
+    TEACHER_CANONICAL_CACHE = None
     
     # Пробуем парсить файл
     parse_excel_file()
@@ -5124,10 +6481,7 @@ def _extract_teacher_from_lesson(lesson_text):
         return ''
 
     meta = text.split('|', 1)[1].strip()
-    meta = ROOM_PATTERN.sub('', meta)
-    meta = re.sub(r'\s+', ' ', meta)
-    meta = re.sub(r'^[,; ]+|[,; ]+$', '', meta)
-    return meta
+    return _normalize_teacher_name(meta)
 
 
 def _extract_room_from_lesson(lesson_text):
@@ -5186,22 +6540,29 @@ def _collect_search_occurrences():
 
 def _search_entity_matches(search_kind, query_text):
     """Ищет сущности нужного типа по подстроке."""
-    normalized_query = _search_normalize_text(query_text)
+    normalized_query = _teacher_lookup_key(query_text) if search_kind == 'teacher' else _search_normalize_text(query_text)
     if len(normalized_query) < 2:
         return []
 
     matches = {}
     for occurrence in _collect_search_occurrences():
-        entity_value = _normalize_cell_text(occurrence.get(search_kind))
+        if search_kind == 'teacher':
+            entity_value = _normalize_teacher_name(occurrence.get(search_kind))
+            normalized_value = _teacher_lookup_key(entity_value)
+            match_key = normalized_value
+        else:
+            entity_value = _normalize_cell_text(occurrence.get(search_kind))
+            normalized_value = _search_normalize_text(entity_value)
+            match_key = entity_value
+
         if not entity_value:
             continue
 
-        normalized_value = _search_normalize_text(entity_value)
         if normalized_query not in normalized_value:
             continue
 
         item = matches.setdefault(
-            entity_value,
+            match_key,
             {
                 'entity': entity_value,
                 'normalized': normalized_value,
@@ -5240,7 +6601,11 @@ def _search_occurrences_for_entity(search_kind, entity_value):
     occurrences = [
         occurrence
         for occurrence in _collect_search_occurrences()
-        if _normalize_cell_text(occurrence.get(search_kind)) == _normalize_cell_text(entity_value)
+        if (
+            _teacher_lookup_key(occurrence.get(search_kind)) == _teacher_lookup_key(entity_value)
+            if search_kind == 'teacher'
+            else _normalize_cell_text(occurrence.get(search_kind)) == _normalize_cell_text(entity_value)
+        )
     ]
     occurrences.sort(
         key=lambda item: (
@@ -5783,7 +7148,7 @@ async def date_command(message: types.Message, state: FSMContext):
         return
 
     course_name = user_data.get('selected_course_name') or _course_name(course)
-    day_payload = build_day_schedule_payload_by_date(course_name, group_code, target_date)
+    day_payload = await build_day_schedule_payload_by_date(course_name, group_code, target_date)
     if day_payload is None:
         await message.answer(
             f"📭 На {target_date.strftime('%d.%m.%y')} для группы {group_code} нет занятий или дата еще не опубликована."
@@ -7229,8 +8594,8 @@ def _build_week_overview_text(course, group_code, week_label, week_days):
     return ''.join(lines)
 
 
-def _build_day_view_text(course, group_code, week_label, week_days, day_index):
-    """Формирует текст страницы дня."""
+async def _build_day_view_text(course, group_code, week_label, week_days, day_index):
+    """Формирует текст страницы дня с учетом домашнего задания."""
     if not week_days:
         return '⚠️ Неделя не содержит дней', 0
 
@@ -7239,6 +8604,7 @@ def _build_day_view_text(course, group_code, week_label, week_days, day_index):
 
     week_schedule = schedule_data.get(course, {}).get(group_code, {}).get(week_label, [])
     lessons = _get_day_lessons(week_schedule, day_item['day_name'])
+    homework_map = await db_commands.get_group_homework_for_day(group_code, day_item.get('date_obj'))
 
     header_day = f"{day_item['date_short']} ({day_item['day_title']})"
     if day_item['is_today']:
@@ -7258,17 +8624,25 @@ def _build_day_view_text(course, group_code, week_label, week_days, day_index):
     if not lessons:
         lines.append('😌 Свободный день: занятий нет')
     else:
-        for lesson in lessons:
+        for lesson_index, lesson in enumerate(lessons):
             time_text = html.escape(_normalize_cell_text(lesson.get('time')) or 'Время не указано')
             lesson_text = html.escape(_normalize_cell_text(lesson.get('lesson')) or 'Без названия')
             if len(lesson_text) > 180:
                 lesson_text = f"{lesson_text[:177]}..."
             lines.append(f"• ⏰ <b>{time_text}</b> {lesson_text}")
 
+            homework = homework_map.get(lesson_index)
+            if homework and homework.get('homework_text'):
+                homework_lines = _homework_text_lines(homework.get('homework_text'))
+                if homework_lines:
+                    lines.append(f"   └ 📝 <b>Домашнее задание:</b> {homework_lines[0]}")
+                    for extra_line in homework_lines[1:]:
+                        lines.append(f"      {extra_line}")
+
     return '\n'.join(lines), day_index
 
 
-def build_day_schedule_payload_by_date(course_name, group_code, target_date):
+async def build_day_schedule_payload_by_date(course_name, group_code, target_date):
     """Возвращает данные страницы дня по конкретной дате."""
     if isinstance(target_date, datetime):
         target_date = target_date.date()
@@ -7277,7 +8651,7 @@ def build_day_schedule_payload_by_date(course_name, group_code, target_date):
     if target_day is None:
         return None
 
-    text, day_index = _build_day_view_text(
+    text, day_index = await _build_day_view_text(
         target_day['course'],
         group_code,
         target_day['week_label'],
@@ -7550,7 +8924,7 @@ async def _render_day_view(callback_query: types.CallbackQuery, state: FSMContex
         today_index = next((idx for idx, item in enumerate(week_days) if item['is_today']), None)
         day_index = today_index if today_index is not None else 0
 
-    text, day_index = _build_day_view_text(course, group_code, week_label, week_days, day_index)
+    text, day_index = await _build_day_view_text(course, group_code, week_label, week_days, day_index)
 
     await _update_user_selection(
         state,
@@ -7583,7 +8957,7 @@ async def _show_relative_day_schedule(message: types.Message, state: FSMContext,
 
     course_name = user_data.get('selected_course_name') or _course_name(course)
     target_date = datetime.now().date() + timedelta(days=day_shift)
-    day_payload = build_day_schedule_payload_by_date(course_name, group_code, target_date)
+    day_payload = await build_day_schedule_payload_by_date(course_name, group_code, target_date)
 
     if day_payload is None:
         await message.answer(
@@ -8256,6 +9630,7 @@ def register_handlers_client(dp: Dispatcher):
     dp.register_message_handler(cmd_help, commands=['help'], state='*')
     dp.register_message_handler(admin_command, commands=['admin'], state='*')
     dp.register_message_handler(starosta_command, commands=['starosta'], state='*')
+    dp.register_message_handler(teacher_panel_command, commands=['teacher_panel'], state='*')
     dp.register_message_handler(search_entrypoint, commands=['search'], state='*')
     dp.register_message_handler(group_command, commands=['group'], state='*')
     dp.register_message_handler(date_command, commands=['date'], state='*')
@@ -8276,6 +9651,9 @@ def register_handlers_client(dp: Dispatcher):
     dp.register_message_handler(admin_receive_message_text, state=AdminMessageDialog.waiting_text)
     dp.register_message_handler(starosta_receive_login, state=StarostaAuthDialog.waiting_login)
     dp.register_message_handler(starosta_receive_password, state=StarostaAuthDialog.waiting_password)
+    dp.register_message_handler(teacher_receive_login, state=TeacherAuthDialog.waiting_login)
+    dp.register_message_handler(teacher_receive_password, state=TeacherAuthDialog.waiting_password)
+    dp.register_message_handler(teacher_receive_homework_text, state=TeacherHomeworkDialog.waiting_text)
     dp.register_message_handler(starosta_receive_message_text, state=StarostaMessageDialog.waiting_text)
     dp.register_message_handler(admin_event_receive_datetime, state=AdminEventDialog.waiting_datetime)
     dp.register_message_handler(admin_event_receive_text, state=AdminEventDialog.waiting_text)
@@ -8333,6 +9711,18 @@ def register_handlers_client(dp: Dispatcher):
     dp.register_callback_query_handler(admin_open, Text(equals='admin_open'), state='*')
     dp.register_callback_query_handler(admin_refresh, Text(equals='admin_refresh'), state='*')
     dp.register_callback_query_handler(admin_logout, Text(equals='admin_logout'), state='*')
+    dp.register_callback_query_handler(teacher_open, Text(equals='teacher_open'), state='*')
+    dp.register_callback_query_handler(teacher_logout, Text(equals='teacher_logout'), state='*')
+    dp.register_callback_query_handler(teacher_pick, Text(startswith='teacher_pick_'), state='*')
+    dp.register_callback_query_handler(teacher_set, Text(startswith='teacher_set_'), state='*')
+    dp.register_callback_query_handler(teacher_show_schedule, Text(equals='teacher_show_schedule'), state='*')
+    dp.register_callback_query_handler(teacher_homework_open, Text(equals='teacher_hw'), state='*')
+    dp.register_callback_query_handler(teacher_homework_change_page, Text(startswith='teacher_hw_page_'), state='*')
+    dp.register_callback_query_handler(teacher_homework_open_detail, Text(startswith='teacher_hw_open_'), state='*')
+    dp.register_callback_query_handler(teacher_homework_start_edit, Text(startswith='teacher_hw_edit_'), state='*')
+    dp.register_callback_query_handler(teacher_homework_delete, Text(startswith='teacher_hw_delete_'), state='*')
+    dp.register_callback_query_handler(teacher_homework_cancel, Text(equals='teacher_hw_cancel'), state='*')
+    dp.register_callback_query_handler(teacher_noop, Text(equals='teacher_noop'), state='*')
     dp.register_callback_query_handler(starosta_open, Text(equals='starosta_open'), state='*')
     dp.register_callback_query_handler(starosta_logout, Text(equals='starosta_logout'), state='*')
     dp.register_callback_query_handler(starosta_pick_group, Text(startswith='starosta_group_pick_'), state='*')
@@ -8368,6 +9758,9 @@ def register_handlers_client(dp: Dispatcher):
     dp.register_callback_query_handler(admin_users_start_single_message, Text(startswith='admin_users_message_'), state='*')
     dp.register_callback_query_handler(admin_users_open_attendance, Text(startswith='admin_users_att_open_'), state='*')
     dp.register_callback_query_handler(admin_users_change_attendance_page, Text(startswith='admin_users_att_page_'), state='*')
+    dp.register_callback_query_handler(admin_users_pick_teacher, Text(startswith='admin_users_teacher_pick_'), state='*')
+    dp.register_callback_query_handler(admin_users_set_teacher, Text(startswith='admin_users_teacher_set_'), state='*')
+    dp.register_callback_query_handler(admin_users_clear_teacher, Text(startswith='admin_users_teacher_clear_'), state='*')
     dp.register_callback_query_handler(admin_message_cancel, Text(equals='admin_message_cancel'), state='*')
     dp.register_callback_query_handler(admin_users_toggle_starosta_assignment, Text(startswith='admin_users_starosta_toggle_'), state='*')
     dp.register_callback_query_handler(admin_users_show_details, Text(startswith='admin_users_info_'), state='*')
