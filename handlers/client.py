@@ -73,6 +73,12 @@ class SupportDialog(StatesGroup):
     waiting_text = State()
 
 
+class SupportReplyDialog(StatesGroup):
+    """Состояние отправки ответа на вопрос из раздела поддержки."""
+
+    waiting_text = State()
+
+
 class AdminMessageDialog(StatesGroup):
     waiting_text = State()
 
@@ -810,6 +816,33 @@ def _build_support_compose_keyboard():
     return keyboard
 
 
+def _build_support_reply_compose_text(target_label: str, reply_mode: str):
+    """Формирует экран ввода ответа на вопрос пользователя."""
+    role_map = {
+        'starosta': 'старосты',
+        'teacher': 'преподавателя',
+        'admin': 'администрации',
+    }
+    return '\n'.join(
+        [
+            '<b>↩️ Ответ пользователю</b>',
+            '',
+            f"Получатель: <b>{html.escape(target_label)}</b>",
+            f"От имени: <b>{html.escape(role_map.get(reply_mode, 'поддержки'))}</b>",
+            '',
+            'Отправьте следующим сообщением текст ответа.',
+            'Для отмены нажмите кнопку ниже или напишите «Отмена».',
+        ]
+    )
+
+
+def _build_support_reply_compose_keyboard():
+    """Строит клавиатуру экрана ввода ответа на вопрос пользователя."""
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    keyboard.add(types.InlineKeyboardButton(text='⬅️ Отмена', callback_data='support_reply_cancel'))
+    return keyboard
+
+
 def _filter_support_recipients(recipients: list[dict], sender_telegram_id: int | None):
     """Убирает отправителя из списка адресатов и очищает дубли."""
     unique = {}
@@ -866,6 +899,27 @@ def _build_support_forward_text(
         ]
     )
     return '\n'.join(lines)
+
+
+def _build_support_reply_forward_text(message: types.Message, reply_mode: str, reply_text: str):
+    """Формирует текст ответа пользователю на его вопрос."""
+    responder_label = _support_sender_label(message)
+    header_map = {
+        'starosta': '⭐ Ответ старосты',
+        'teacher': '👨‍🏫 Ответ преподавателя',
+        'admin': '🏛️ Ответ администрации',
+    }
+
+    return '\n'.join(
+        [
+            f"<b>{header_map.get(reply_mode, '🆘 Ответ на вопрос')}</b>",
+            '',
+            f"👤 От: <b>{html.escape(responder_label)}</b>",
+            '',
+            '💬 Сообщение:',
+            html.escape(reply_text),
+        ]
+    )
 
 
 def _build_starosta_users_text(page_data: dict, group_label: str | None):
@@ -4186,6 +4240,16 @@ async def _clear_support_context(state: FSMContext):
     )
 
 
+async def _clear_support_reply_context(state: FSMContext):
+    """Сбрасывает служебные данные экрана ответа на вопрос пользователя."""
+    await state.reset_state(with_data=False)
+    await state.update_data(
+        support_reply_mode=None,
+        support_reply_target_telegram_id=None,
+        support_reply_target_label=None,
+    )
+
+
 async def _restore_support_origin(state: FSMContext, telegram_id: int):
     """Возвращает пользователя к экрану поддержки после отправки или отмены вопроса."""
     user_data = await state.get_data()
@@ -4202,6 +4266,20 @@ async def _restore_support_origin(state: FSMContext, telegram_id: int):
         reply_markup=_build_support_keyboard(),
         parse_mode='HTML',
     )
+
+
+async def _support_reply_allowed(reply_mode: str, telegram_id: int) -> bool:
+    """Проверяет, может ли пользователь отвечать на вопросы выбранной роли."""
+    normalized_mode = _normalize_cell_text(reply_mode)
+    if normalized_mode == 'admin':
+        return await db_commands.is_admin_authorized(telegram_id)
+    if normalized_mode == 'starosta':
+        access = await db_commands.get_starosta_access(telegram_id)
+        return bool(access.get('has_access'))
+    if normalized_mode == 'teacher':
+        access = await db_commands.get_teacher_access(telegram_id)
+        return bool(access.get('has_access'))
+    return False
 
 
 async def _render_admin_users_view(target, state: FSMContext, telegram_id, *, edit: bool):
@@ -10138,6 +10216,54 @@ async def support_message_cancel(callback_query: types.CallbackQuery, state: FSM
     await callback_query.answer('Отправка отменена')
 
 
+async def support_reply_start(callback_query: types.CallbackQuery, state: FSMContext):
+    """Открывает ввод ответа пользователю под сообщением из поддержки."""
+    payload = str(callback_query.data or '')
+    prefix = 'support_reply_to_'
+    if not payload.startswith(prefix):
+        await callback_query.answer('⚠️ Не удалось открыть ответ', show_alert=True)
+        return
+
+    raw = payload[len(prefix):]
+    try:
+        reply_mode, target_text = raw.rsplit('_', 1)
+        target_telegram_id = int(target_text)
+    except (TypeError, ValueError):
+        await callback_query.answer('⚠️ Пользователь не найден', show_alert=True)
+        return
+
+    telegram_id = _telegram_id_from_callback(callback_query)
+    if not await _support_reply_allowed(reply_mode, telegram_id):
+        await callback_query.answer('⚠️ У вас нет доступа к ответу на это сообщение', show_alert=True)
+        return
+
+    user_details = await db_commands.get_admin_user_details(target_telegram_id)
+    target_label = _build_admin_message_target_label(user_details) if user_details else f'ID {target_telegram_id}'
+
+    await state.update_data(
+        support_reply_mode=reply_mode,
+        support_reply_target_telegram_id=target_telegram_id,
+        support_reply_target_label=target_label,
+    )
+    await state.set_state(SupportReplyDialog.waiting_text.state)
+    await callback_query.message.answer(
+        _build_support_reply_compose_text(target_label, reply_mode),
+        reply_markup=_build_support_reply_compose_keyboard(),
+        parse_mode='HTML',
+    )
+    await callback_query.answer()
+
+
+async def support_reply_cancel(callback_query: types.CallbackQuery, state: FSMContext):
+    """Отменяет ввод ответа пользователю."""
+    await _clear_support_reply_context(state)
+    await _safe_edit_text(
+        callback_query.message,
+        '↩️ Отправка ответа отменена.',
+    )
+    await callback_query.answer('Ответ отменен')
+
+
 async def support_receive_message_text(message: types.Message, state: FSMContext):
     """Получает текст вопроса пользователя и отправляет его через поддержку."""
     telegram_id = _telegram_id_from_message(message)
@@ -10185,10 +10311,18 @@ async def support_receive_message_text(message: types.Message, state: FSMContext
     success_count = 0
     failed_count = 0
     for recipient in recipients:
+        keyboard = types.InlineKeyboardMarkup(row_width=1)
+        keyboard.add(
+            types.InlineKeyboardButton(
+                text='↩️ Ответить',
+                callback_data=f'support_reply_to_{support_mode}_{int(telegram_id)}',
+            )
+        )
         try:
             await bot.send_message(
                 int(recipient['telegram_id']),
                 forward_text,
+                reply_markup=keyboard,
                 parse_mode='HTML',
             )
             success_count += 1
@@ -10201,6 +10335,43 @@ async def support_receive_message_text(message: types.Message, state: FSMContext
         f'✅ Вопрос отправлен: {success_count}\n'
         f'❌ Ошибок доставки: {failed_count}'
     )
+
+
+async def support_reply_receive_message_text(message: types.Message, state: FSMContext):
+    """Получает текст ответа и отправляет его пользователю, который задал вопрос."""
+    telegram_id = _telegram_id_from_message(message)
+    text_value = (message.text or message.caption or '').strip()
+    if not text_value:
+        await message.answer('Отправьте текстовое сообщение или нажмите «Отмена».')
+        return
+
+    if _search_normalize_text(text_value) in {'отмена', 'cancel'}:
+        await _clear_support_reply_context(state)
+        await message.answer('Отправка ответа отменена.')
+        return
+
+    user_data = await state.get_data()
+    reply_mode = _normalize_cell_text(user_data.get('support_reply_mode'))
+    target_telegram_id = user_data.get('support_reply_target_telegram_id')
+    if not target_telegram_id:
+        await _clear_support_reply_context(state)
+        await message.answer('⚠️ Получатель не найден.')
+        return
+
+    if not await _support_reply_allowed(reply_mode, telegram_id):
+        await _clear_support_reply_context(state)
+        await message.answer('⚠️ У вас нет доступа к отправке такого ответа.')
+        return
+
+    reply_text = _build_support_reply_forward_text(message, reply_mode, text_value)
+    try:
+        await bot.send_message(int(target_telegram_id), reply_text, parse_mode='HTML')
+    except Exception:
+        await message.answer('⚠️ Не удалось отправить ответ пользователю.')
+        return
+
+    await _clear_support_reply_context(state)
+    await message.answer('✅ Ответ отправлен.')
 
 
 async def support_noop(callback_query: types.CallbackQuery):
@@ -10362,6 +10533,7 @@ def register_handlers_client(dp: Dispatcher):
     dp.register_message_handler(teacher_receive_password, state=TeacherAuthDialog.waiting_password)
     dp.register_message_handler(teacher_receive_homework_text, state=TeacherHomeworkDialog.waiting_text)
     dp.register_message_handler(support_receive_message_text, state=SupportDialog.waiting_text)
+    dp.register_message_handler(support_reply_receive_message_text, state=SupportReplyDialog.waiting_text)
     dp.register_message_handler(starosta_receive_message_text, state=StarostaMessageDialog.waiting_text)
     dp.register_message_handler(admin_event_receive_datetime, state=AdminEventDialog.waiting_datetime)
     dp.register_message_handler(admin_event_receive_text, state=AdminEventDialog.waiting_text)
@@ -10417,6 +10589,8 @@ def register_handlers_client(dp: Dispatcher):
     dp.register_callback_query_handler(support_pick_teacher, Text(startswith='support_pick_teacher_'), state='*')
     dp.register_callback_query_handler(support_set_teacher, Text(startswith='support_teacher_set_'), state='*')
     dp.register_callback_query_handler(support_message_cancel, Text(equals='support_message_cancel'), state='*')
+    dp.register_callback_query_handler(support_reply_start, Text(startswith='support_reply_to_'), state='*')
+    dp.register_callback_query_handler(support_reply_cancel, Text(equals='support_reply_cancel'), state='*')
     dp.register_callback_query_handler(support_noop, Text(equals='support_noop'), state='*')
     dp.register_callback_query_handler(settings_open, Text(equals="settings_open"))
     dp.register_callback_query_handler(settings_toggle_digest, Text(equals="settings_digest_toggle"))
