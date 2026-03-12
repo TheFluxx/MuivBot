@@ -583,6 +583,143 @@ async def get_teacher_access(telegram_id: int):
     }
 
 
+def _sort_support_recipients(items: list[dict]):
+    """Сортирует получателей служебных сообщений по username и telegram_id."""
+    return sorted(
+        items,
+        key=lambda item: (
+            (str(item.get('username') or '').casefold() if item.get('username') else '~~~'),
+            int(item.get('telegram_id') or 0),
+        ),
+    )
+
+
+async def get_support_admin_recipients():
+    """Возвращает администраторов, которым можно отправить вопрос через поддержку."""
+    async with get_session() as session:
+        result = await session.execute(
+            select(
+                BotAdminSession.telegram_id,
+                Users.username,
+            )
+            .select_from(BotAdminSession)
+            .outerjoin(Users, Users.telegram_id == BotAdminSession.telegram_id)
+        )
+        rows = result.all()
+
+    recipients = [
+        {
+            'telegram_id': row.telegram_id,
+            'username': str(row.username or '').strip() or None,
+        }
+        for row in rows
+        if row.telegram_id is not None
+    ]
+    return _sort_support_recipients(recipients)
+
+
+async def get_support_starosta_recipients(group_code: str):
+    """Возвращает старост, которым можно отправить вопрос по выбранной группе."""
+    normalized_group = str(group_code or '').strip()
+    if not normalized_group:
+        return []
+
+    recipients: dict[int, dict] = {}
+    async with get_session() as session:
+        assigned_result = await session.execute(
+            select(
+                GroupStarostaAssignment.telegram_id,
+                Users.username,
+            )
+            .select_from(GroupStarostaAssignment)
+            .outerjoin(Users, Users.telegram_id == GroupStarostaAssignment.telegram_id)
+            .where(GroupStarostaAssignment.group_code == normalized_group)
+        )
+        assigned_rows = assigned_result.all()
+        super_result = await session.execute(
+            select(
+                BotStarostaSession.telegram_id,
+                Users.username,
+            )
+            .select_from(BotStarostaSession)
+            .outerjoin(Users, Users.telegram_id == BotStarostaSession.telegram_id)
+        )
+        super_rows = super_result.all()
+
+    for row in assigned_rows:
+        if row.telegram_id is None:
+            continue
+        recipients[int(row.telegram_id)] = {
+            'telegram_id': row.telegram_id,
+            'username': str(row.username or '').strip() or None,
+        }
+
+    for row in super_rows:
+        if row.telegram_id is None:
+            continue
+        recipients.setdefault(
+            int(row.telegram_id),
+            {
+                'telegram_id': row.telegram_id,
+                'username': str(row.username or '').strip() or None,
+            },
+        )
+
+    return _sort_support_recipients(list(recipients.values()))
+
+
+async def get_support_teacher_recipients(teacher_name: str):
+    """Возвращает преподавателей, которым можно отправить вопрос по выбранному имени."""
+    normalized_teacher = str(teacher_name or '').strip()
+    if not normalized_teacher:
+        return []
+
+    recipients: dict[int, dict] = {}
+    async with get_session() as session:
+        assigned_result = await session.execute(
+            select(
+                TeacherAssignment.telegram_id,
+                Users.username,
+            )
+            .select_from(TeacherAssignment)
+            .outerjoin(Users, Users.telegram_id == TeacherAssignment.telegram_id)
+            .where(TeacherAssignment.teacher_name == normalized_teacher)
+        )
+        assigned_rows = assigned_result.all()
+        super_result = await session.execute(
+            select(
+                BotTeacherSession.telegram_id,
+                Users.username,
+            )
+            .select_from(BotTeacherSession)
+            .join(UserScheduleState, UserScheduleState.telegram_id == BotTeacherSession.telegram_id)
+            .outerjoin(Users, Users.telegram_id == BotTeacherSession.telegram_id)
+            .where(UserScheduleState.selected_teacher_name == normalized_teacher)
+        )
+        super_rows = super_result.all()
+
+    for row in assigned_rows:
+        if row.telegram_id is None:
+            continue
+        recipients[int(row.telegram_id)] = {
+            'telegram_id': row.telegram_id,
+            'username': str(row.username or '').strip() or None,
+        }
+
+    for row in super_rows:
+        if row.telegram_id is None:
+            continue
+        recipients.setdefault(
+            int(row.telegram_id),
+            {
+                'telegram_id': row.telegram_id,
+                'username': str(row.username or '').strip() or None,
+            },
+        )
+
+    return _sort_support_recipients(list(recipients.values()))
+
+
 async def get_admin_dashboard_stats():
     """Возвращает сводную статистику для админ-панели."""
     async with get_session() as session:

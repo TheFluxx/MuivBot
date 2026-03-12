@@ -29,7 +29,8 @@ def get_main_keyboard():
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
     kb.add(types.KeyboardButton("📅 Мое расписание"))
     kb.row(types.KeyboardButton("📊 Посещаемость"), types.KeyboardButton("🔎 Поиск"))
-    kb.row(types.KeyboardButton("🎉 События"), types.KeyboardButton("💼 Настройки"))
+    kb.row(types.KeyboardButton("🎉 События"), types.KeyboardButton("🆘 Поддержка"))
+    kb.add(types.KeyboardButton("💼 Настройки"))
     return kb
 
 
@@ -62,6 +63,12 @@ class TeacherAuthDialog(StatesGroup):
 
 class TeacherHomeworkDialog(StatesGroup):
     """Состояние ввода домашнего задания учителем."""
+
+    waiting_text = State()
+
+
+class SupportDialog(StatesGroup):
+    """Состояние отправки вопроса через раздел поддержки."""
 
     waiting_text = State()
 
@@ -649,6 +656,217 @@ def _build_starosta_panel_keyboard(current_group: str | None, can_switch_groups:
     )
     keyboard.add(types.InlineKeyboardButton(text='🏠 В главное меню', callback_data='main_menu'))
     return keyboard
+
+
+def _support_sender_label(message: types.Message):
+    """Возвращает короткое имя отправителя для пересылки вопроса через поддержку."""
+    if not message or not message.from_user:
+        return 'Неизвестный пользователь'
+
+    username = _normalize_cell_text(message.from_user.username)
+    if username:
+        return f'@{username}'
+
+    full_name = ' '.join(
+        part.strip()
+        for part in (message.from_user.first_name, message.from_user.last_name)
+        if str(part or '').strip()
+    )
+    if full_name:
+        return full_name
+
+    return f'ID {message.from_user.id}'
+
+
+def _build_support_text(user_data):
+    """Формирует главный экран раздела поддержки."""
+    group_code = _normalize_cell_text(user_data.get('selected_group'))
+    course_key = _normalize_cell_text(user_data.get('selected_course'))
+    course_label = _course_display(course_key) if course_key else None
+
+    lines = [
+        '<b>🆘 Поддержка</b>',
+        '',
+        'Выберите, кому отправить вопрос.',
+    ]
+    if group_code:
+        lines.extend(
+            [
+                '',
+                f"👥 Группа: <b>{html.escape(group_code)}</b>",
+            ]
+        )
+        if course_label:
+            lines.append(f"🎓 Курс: <b>{html.escape(course_label)}</b>")
+    else:
+        lines.extend(
+            [
+                '',
+                'ℹ️ Для обращения к старосте или преподавателю сначала выберите свою группу.',
+            ]
+        )
+
+    return '\n'.join(lines)
+
+
+def _build_support_keyboard():
+    """Строит клавиатуру главного экрана поддержки."""
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    keyboard.add(
+        types.InlineKeyboardButton(
+            text='⭐ Задать вопрос старосте',
+            callback_data='support_to_starosta',
+        )
+    )
+    keyboard.add(
+        types.InlineKeyboardButton(
+            text='👨‍🏫 Задать вопрос преподавателю',
+            callback_data='support_pick_teacher_0',
+        )
+    )
+    keyboard.add(
+        types.InlineKeyboardButton(
+            text='🏛️ Задать вопрос администрации',
+            callback_data='support_to_admin',
+        )
+    )
+    keyboard.add(types.InlineKeyboardButton(text='🏠 В меню', callback_data='main_menu'))
+    return keyboard
+
+
+def _support_teacher_names():
+    """Возвращает всех преподавателей из текущего расписания."""
+    return _teacher_names_from_schedule()
+
+
+def _build_support_teacher_picker_text(page: int, total_pages: int, teachers_count: int):
+    """Формирует текст выбора преподавателя в разделе поддержки."""
+    return '\n'.join(
+        [
+            '<b>👨‍🏫 Выбор преподавателя</b>',
+            '',
+            f"📄 Страница: <b>{page + 1}/{total_pages}</b> • Найдено: <b>{teachers_count}</b>",
+            '',
+            'Нажмите на преподавателя ниже, чтобы задать вопрос.',
+        ]
+    )
+
+
+def _build_support_teacher_picker_keyboard(teachers: list[str], page: int, total_pages: int):
+    """Строит клавиатуру выбора преподавателя в разделе поддержки."""
+    start_index = page * SUPPORT_TEACHER_PAGE_SIZE
+    page_items = teachers[start_index:start_index + SUPPORT_TEACHER_PAGE_SIZE]
+
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    for offset, teacher_name in enumerate(page_items):
+        keyboard.add(
+            types.InlineKeyboardButton(
+                text=f"👨‍🏫 {teacher_name}",
+                callback_data=f"support_teacher_set_{start_index + offset}",
+            )
+        )
+
+    if total_pages > 1:
+        keyboard.row(
+            types.InlineKeyboardButton(
+                text='⬅️',
+                callback_data=f"support_pick_teacher_{max(0, page - 1)}",
+            ),
+            types.InlineKeyboardButton(
+                text=f"📄 {page + 1}/{total_pages}",
+                callback_data='support_noop',
+            ),
+            types.InlineKeyboardButton(
+                text='➡️',
+                callback_data=f"support_pick_teacher_{min(total_pages - 1, page + 1)}",
+            ),
+        )
+
+    keyboard.row(
+        types.InlineKeyboardButton(text='⬅️ К поддержке', callback_data='support_open'),
+        types.InlineKeyboardButton(text='🏠 В меню', callback_data='main_menu'),
+    )
+    return keyboard
+
+
+def _build_support_compose_text(target_label: str):
+    """Формирует экран ввода текста вопроса в разделе поддержки."""
+    return '\n'.join(
+        [
+            '<b>📝 Новый вопрос</b>',
+            '',
+            f"Получатель: <b>{html.escape(target_label)}</b>",
+            '',
+            'Отправьте следующим сообщением текст вопроса.',
+            'Для отмены нажмите кнопку ниже или напишите «Отмена».',
+        ]
+    )
+
+
+def _build_support_compose_keyboard():
+    """Строит клавиатуру экрана ввода вопроса."""
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    keyboard.add(types.InlineKeyboardButton(text='⬅️ Отмена', callback_data='support_message_cancel'))
+    return keyboard
+
+
+def _filter_support_recipients(recipients: list[dict], sender_telegram_id: int | None):
+    """Убирает отправителя из списка адресатов и очищает дубли."""
+    unique = {}
+    for recipient in recipients or []:
+        recipient_id = recipient.get('telegram_id')
+        if recipient_id is None:
+            continue
+        if sender_telegram_id is not None and int(recipient_id) == int(sender_telegram_id):
+            continue
+        unique[int(recipient_id)] = recipient
+    return list(unique.values())
+
+
+def _build_support_forward_text(
+    message: types.Message,
+    user_data: dict,
+    support_mode: str,
+    question_text: str,
+    *,
+    teacher_name: str | None = None,
+):
+    """Формирует текст, который бот отправляет адресатам вопроса."""
+    sender_telegram_id = _telegram_id_from_message(message)
+    sender_label = _support_sender_label(message)
+    group_code = _normalize_cell_text(user_data.get('selected_group'))
+    course_key = _normalize_cell_text(user_data.get('selected_course'))
+    course_label = _course_display(course_key) if course_key else None
+
+    header_map = {
+        'starosta': '⭐ Вопрос старосте',
+        'teacher': '👨‍🏫 Вопрос преподавателю',
+        'admin': '🏛️ Вопрос администрации',
+    }
+
+    lines = [
+        f"<b>{header_map.get(support_mode, '🆘 Новый вопрос')}</b>",
+        '',
+        f"👤 От: <b>{html.escape(sender_label)}</b>",
+    ]
+    if sender_telegram_id is not None:
+        lines.append(f"🆔 Telegram ID: <code>{int(sender_telegram_id)}</code>")
+    if course_label:
+        lines.append(f"🎓 Курс: <b>{html.escape(course_label)}</b>")
+    if group_code:
+        lines.append(f"👥 Группа: <b>{html.escape(group_code)}</b>")
+    if support_mode == 'teacher' and teacher_name:
+        lines.append(f"👨‍🏫 Преподаватель: <b>{html.escape(teacher_name)}</b>")
+
+    lines.extend(
+        [
+            '',
+            '💬 Сообщение:',
+            html.escape(question_text),
+        ]
+    )
+    return '\n'.join(lines)
+
 
 def _build_starosta_users_text(page_data: dict, group_label: str | None):
     """Формирует текст списка учеников для панели старосты."""
@@ -1628,6 +1846,43 @@ async def _render_teacher_picker(target, state: FSMContext, telegram_id: int, *,
         back_callback='teacher_open',
         back_text='⬅️ В панель учителя',
     )
+
+    if edit:
+        await _safe_edit_text(target.message, text, reply_markup=keyboard, parse_mode='HTML')
+        await target.answer()
+    else:
+        await target.answer(text, reply_markup=keyboard, parse_mode='HTML')
+    return True
+
+
+async def _render_support_view(target, state: FSMContext, telegram_id: int, *, edit: bool):
+    """Показывает главный экран раздела поддержки."""
+    user_data = await _get_user_data_with_db_fallback(state, telegram_id)
+    text = _build_support_text(user_data)
+    keyboard = _build_support_keyboard()
+
+    if edit:
+        await _safe_edit_text(target.message, text, reply_markup=keyboard, parse_mode='HTML')
+        await target.answer()
+    else:
+        await target.answer(text, reply_markup=keyboard, parse_mode='HTML')
+    return True
+
+
+async def _render_support_teacher_picker(target, state: FSMContext, telegram_id: int, *, page: int, edit: bool):
+    """Показывает inline-выбор преподавателя для раздела поддержки."""
+    teachers = _support_teacher_names()
+    if not teachers:
+        if edit:
+            await target.answer('⚠️ В расписании пока нет преподавателей для выбора', show_alert=True)
+        else:
+            await target.answer('⚠️ В расписании пока нет преподавателей для выбора')
+        return False
+
+    total_pages = max(1, (len(teachers) + SUPPORT_TEACHER_PAGE_SIZE - 1) // SUPPORT_TEACHER_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    text = _build_support_teacher_picker_text(page, total_pages, len(teachers))
+    keyboard = _build_support_teacher_picker_keyboard(teachers, page, total_pages)
 
     if edit:
         await _safe_edit_text(target.message, text, reply_markup=keyboard, parse_mode='HTML')
@@ -3918,6 +4173,37 @@ async def _restore_starosta_message_origin(state: FSMContext):
     )
 
 
+async def _clear_support_context(state: FSMContext):
+    """Сбрасывает служебные данные раздела поддержки."""
+    await state.reset_state(with_data=False)
+    await state.update_data(
+        support_mode=None,
+        support_group_code=None,
+        support_teacher_name=None,
+        support_target_label=None,
+        support_origin_chat_id=None,
+        support_origin_message_id=None,
+    )
+
+
+async def _restore_support_origin(state: FSMContext, telegram_id: int):
+    """Возвращает пользователя к экрану поддержки после отправки или отмены вопроса."""
+    user_data = await state.get_data()
+    chat_id = user_data.get('support_origin_chat_id')
+    message_id = user_data.get('support_origin_message_id')
+    if not chat_id or not message_id:
+        return
+
+    refreshed_user_data = await _get_user_data_with_db_fallback(state, telegram_id)
+    await _safe_edit_message_text_by_id(
+        int(chat_id),
+        int(message_id),
+        _build_support_text(refreshed_user_data),
+        reply_markup=_build_support_keyboard(),
+        parse_mode='HTML',
+    )
+
+
 async def _render_admin_users_view(target, state: FSMContext, telegram_id, *, edit: bool):
     """Показывает список пользователей с фильтрами по курсу и группе."""
     if not await db_commands.is_admin_authorized(telegram_id):
@@ -5692,6 +5978,7 @@ STAROSTA_ATTENDANCE_DAYS_PAGE_SIZE = 7
 STAROSTA_ATTENDANCE_STUDENTS_PAGE_SIZE = 8
 TEACHER_HOMEWORK_PAGE_SIZE = 8
 LESSON_REMINDER_OPTIONS = (None, 10, 30, 60, 120)
+SUPPORT_TEACHER_PAGE_SIZE = 8
 
 
 def _telegram_id_from_message(message: types.Message):
@@ -9707,6 +9994,220 @@ async def change_group(callback_query: types.CallbackQuery):
     await callback_query.answer()
 
 
+async def support(message: types.Message, state: FSMContext):
+    """Открывает раздел поддержки из главного меню."""
+    await state.finish()
+    await _render_support_view(message, state, _telegram_id_from_message(message), edit=False)
+
+
+async def support_open(callback_query: types.CallbackQuery, state: FSMContext):
+    """Открывает или обновляет главный экран поддержки."""
+    await _clear_support_context(state)
+    await _render_support_view(callback_query, state, _telegram_id_from_callback(callback_query), edit=True)
+
+
+async def _start_support_compose(
+    callback_query: types.CallbackQuery,
+    state: FSMContext,
+    *,
+    support_mode: str,
+    target_label: str,
+    group_code: str | None = None,
+    teacher_name: str | None = None,
+):
+    """Переводит пользователя в режим ввода вопроса для выбранного адресата."""
+    await state.update_data(
+        support_mode=support_mode,
+        support_group_code=group_code,
+        support_teacher_name=teacher_name,
+        support_target_label=target_label,
+        support_origin_chat_id=callback_query.message.chat.id,
+        support_origin_message_id=callback_query.message.message_id,
+    )
+    await state.set_state(SupportDialog.waiting_text.state)
+    await _safe_edit_text(
+        callback_query.message,
+        _build_support_compose_text(target_label),
+        reply_markup=_build_support_compose_keyboard(),
+        parse_mode='HTML',
+    )
+    await callback_query.answer()
+
+
+async def support_to_starosta(callback_query: types.CallbackQuery, state: FSMContext):
+    """Запускает отправку вопроса старосте выбранной группы."""
+    telegram_id = _telegram_id_from_callback(callback_query)
+    user_data = await _get_user_data_with_db_fallback(state, telegram_id)
+    group_code = _normalize_cell_text(user_data.get('selected_group'))
+    if not group_code:
+        await callback_query.answer('⚠️ Сначала выберите группу', show_alert=True)
+        return
+
+    recipients = _filter_support_recipients(
+        await db_commands.get_support_starosta_recipients(group_code),
+        telegram_id,
+    )
+    if not recipients:
+        await callback_query.answer('⚠️ Для вашей группы пока нет доступной старосты в боте', show_alert=True)
+        return
+
+    await _start_support_compose(
+        callback_query,
+        state,
+        support_mode='starosta',
+        target_label=f'старосте группы {group_code}',
+        group_code=group_code,
+    )
+
+
+async def support_to_admin(callback_query: types.CallbackQuery, state: FSMContext):
+    """Запускает отправку вопроса администрации."""
+    telegram_id = _telegram_id_from_callback(callback_query)
+    recipients = _filter_support_recipients(
+        await db_commands.get_support_admin_recipients(),
+        telegram_id,
+    )
+    if not recipients:
+        await callback_query.answer('⚠️ Администрация пока недоступна в боте', show_alert=True)
+        return
+
+    await _start_support_compose(
+        callback_query,
+        state,
+        support_mode='admin',
+        target_label='администрации',
+    )
+
+
+async def support_pick_teacher(callback_query: types.CallbackQuery, state: FSMContext):
+    """Открывает выбор преподавателя для вопроса через поддержку."""
+    try:
+        page = int(callback_query.data.rsplit('_', 1)[1])
+    except (TypeError, ValueError, IndexError):
+        page = 0
+
+    await _render_support_teacher_picker(
+        callback_query,
+        state,
+        _telegram_id_from_callback(callback_query),
+        page=page,
+        edit=True,
+    )
+
+
+async def support_set_teacher(callback_query: types.CallbackQuery, state: FSMContext):
+    """Выбирает преподавателя и переводит пользователя к вводу вопроса."""
+    try:
+        selected_index = int(callback_query.data.rsplit('_', 1)[1])
+    except (TypeError, ValueError, IndexError):
+        await callback_query.answer('⚠️ Преподаватель не найден', show_alert=True)
+        return
+
+    telegram_id = _telegram_id_from_callback(callback_query)
+    user_data = await _get_user_data_with_db_fallback(state, telegram_id)
+    group_code = _normalize_cell_text(user_data.get('selected_group'))
+    teachers = _support_teacher_names()
+    if selected_index < 0 or selected_index >= len(teachers):
+        await callback_query.answer('⚠️ Преподаватель не найден', show_alert=True)
+        return
+
+    teacher_name = teachers[selected_index]
+    recipients = _filter_support_recipients(
+        await db_commands.get_support_teacher_recipients(teacher_name),
+        telegram_id,
+    )
+    if not recipients:
+        await callback_query.answer('⚠️ Этому преподавателю пока нельзя написать через бота', show_alert=True)
+        return
+
+    await _start_support_compose(
+        callback_query,
+        state,
+        support_mode='teacher',
+        target_label=f'преподавателю {teacher_name}',
+        group_code=group_code,
+        teacher_name=teacher_name,
+    )
+
+
+async def support_message_cancel(callback_query: types.CallbackQuery, state: FSMContext):
+    """Отменяет ввод вопроса и возвращает пользователя в раздел поддержки."""
+    telegram_id = _telegram_id_from_callback(callback_query)
+    await _restore_support_origin(state, telegram_id)
+    await _clear_support_context(state)
+    await callback_query.answer('Отправка отменена')
+
+
+async def support_receive_message_text(message: types.Message, state: FSMContext):
+    """Получает текст вопроса пользователя и отправляет его через поддержку."""
+    telegram_id = _telegram_id_from_message(message)
+    text_value = (message.text or message.caption or '').strip()
+    if not text_value:
+        await message.answer('Отправьте текстовое сообщение или нажмите «Отмена».')
+        return
+
+    if _search_normalize_text(text_value) in {'отмена', 'cancel'}:
+        await _restore_support_origin(state, telegram_id)
+        await _clear_support_context(state)
+        await message.answer('Отправка отменена.')
+        return
+
+    user_data = await state.get_data()
+    support_mode = _normalize_cell_text(user_data.get('support_mode'))
+    group_code = _normalize_cell_text(user_data.get('support_group_code'))
+    teacher_name = _normalize_teacher_name(user_data.get('support_teacher_name'))
+
+    if support_mode == 'starosta':
+        recipients = await db_commands.get_support_starosta_recipients(group_code)
+    elif support_mode == 'teacher':
+        recipients = await db_commands.get_support_teacher_recipients(teacher_name)
+    elif support_mode == 'admin':
+        recipients = await db_commands.get_support_admin_recipients()
+    else:
+        recipients = []
+
+    recipients = _filter_support_recipients(recipients, telegram_id)
+    if not recipients:
+        await _restore_support_origin(state, telegram_id)
+        await _clear_support_context(state)
+        await message.answer('⚠️ Получатели не найдены.')
+        return
+
+    sender_data = await _get_user_data_with_db_fallback(state, telegram_id)
+    forward_text = _build_support_forward_text(
+        message,
+        sender_data,
+        support_mode,
+        text_value,
+        teacher_name=teacher_name,
+    )
+
+    success_count = 0
+    failed_count = 0
+    for recipient in recipients:
+        try:
+            await bot.send_message(
+                int(recipient['telegram_id']),
+                forward_text,
+                parse_mode='HTML',
+            )
+            success_count += 1
+        except Exception:
+            failed_count += 1
+
+    await _restore_support_origin(state, telegram_id)
+    await _clear_support_context(state)
+    await message.answer(
+        f'✅ Вопрос отправлен: {success_count}\n'
+        f'❌ Ошибок доставки: {failed_count}'
+    )
+
+
+async def support_noop(callback_query: types.CallbackQuery):
+    """Служебная кнопка раздела поддержки."""
+    await callback_query.answer()
+
+
 async def settings_open(callback_query: types.CallbackQuery, state: FSMContext):
     """Открывает или обновляет экран настроек."""
     await _render_settings_view(
@@ -9844,6 +10345,7 @@ def register_handlers_client(dp: Dispatcher):
     dp.register_message_handler(search_subject_command, commands=['subject'], state='*')
     dp.register_message_handler(schedule_today, commands=['today'])
     dp.register_message_handler(schedule_tomorrow, commands=['tomorrow'])
+    dp.register_message_handler(support, text='🆘 Поддержка', state='*')
     dp.register_message_handler(search_entrypoint, text='🔎 Поиск', state='*')
     dp.register_message_handler(user_events, text='🎉 События', state='*')
     dp.register_message_handler(settings, text='💼 Настройки')
@@ -9859,6 +10361,7 @@ def register_handlers_client(dp: Dispatcher):
     dp.register_message_handler(teacher_receive_login, state=TeacherAuthDialog.waiting_login)
     dp.register_message_handler(teacher_receive_password, state=TeacherAuthDialog.waiting_password)
     dp.register_message_handler(teacher_receive_homework_text, state=TeacherHomeworkDialog.waiting_text)
+    dp.register_message_handler(support_receive_message_text, state=SupportDialog.waiting_text)
     dp.register_message_handler(starosta_receive_message_text, state=StarostaMessageDialog.waiting_text)
     dp.register_message_handler(admin_event_receive_datetime, state=AdminEventDialog.waiting_datetime)
     dp.register_message_handler(admin_event_receive_text, state=AdminEventDialog.waiting_text)
@@ -9908,6 +10411,13 @@ def register_handlers_client(dp: Dispatcher):
     dp.register_callback_query_handler(refresh_schedule, Text(startswith="refresh_"))
     dp.register_callback_query_handler(back_to_courses, Text(startswith="back_to_courses"))
     dp.register_callback_query_handler(main_menu, Text(startswith="main_menu"))
+    dp.register_callback_query_handler(support_open, Text(equals='support_open'), state='*')
+    dp.register_callback_query_handler(support_to_starosta, Text(equals='support_to_starosta'), state='*')
+    dp.register_callback_query_handler(support_to_admin, Text(equals='support_to_admin'), state='*')
+    dp.register_callback_query_handler(support_pick_teacher, Text(startswith='support_pick_teacher_'), state='*')
+    dp.register_callback_query_handler(support_set_teacher, Text(startswith='support_teacher_set_'), state='*')
+    dp.register_callback_query_handler(support_message_cancel, Text(equals='support_message_cancel'), state='*')
+    dp.register_callback_query_handler(support_noop, Text(equals='support_noop'), state='*')
     dp.register_callback_query_handler(settings_open, Text(equals="settings_open"))
     dp.register_callback_query_handler(settings_toggle_digest, Text(equals="settings_digest_toggle"))
     dp.register_callback_query_handler(settings_shift_digest_time, Text(startswith="settings_digest_time_"))
