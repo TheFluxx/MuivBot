@@ -74,6 +74,7 @@ async def configure_bot_commands():
             types.BotCommand('subject', 'Пример: /subject Эконометрика'),
             types.BotCommand('today', 'Расписание на сегодня'),
             types.BotCommand('tomorrow', 'Расписание на завтра'),
+            types.BotCommand('faq', 'Часто задаваемые вопросы'),
             types.BotCommand('admin', 'Вход в админ-панель'),
             types.BotCommand('starosta', 'Панель старосты'),
             types.BotCommand('teacher_panel', 'Панель учителя'),

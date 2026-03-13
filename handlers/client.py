@@ -22,6 +22,7 @@ from data.config import (
     TEACHER_LOGIN,
     TEACHER_PASSWORD,
 )
+from data.faq_entries import FAQ_ITEMS
 
 # Создаем клавиатуру
 def get_main_keyboard():
@@ -29,8 +30,8 @@ def get_main_keyboard():
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
     kb.add(types.KeyboardButton("📅 Мое расписание"))
     kb.row(types.KeyboardButton("📊 Посещаемость"), types.KeyboardButton("🔎 Поиск"))
-    kb.row(types.KeyboardButton("🎉 События"), types.KeyboardButton("🆘 Поддержка"))
-    kb.add(types.KeyboardButton("💼 Настройки"))
+    kb.row(types.KeyboardButton("🎉 События"), types.KeyboardButton("❓ FAQ"))
+    kb.row(types.KeyboardButton("🆘 Поддержка"), types.KeyboardButton("💼 Настройки"))
     return kb
 
 
@@ -123,6 +124,7 @@ def _commands_help_text():
         "• <code>/subject Эконометрика</code> - найти расписание предмета\n"
         "• <code>/today</code> - показать расписание на сегодня\n"
         "• <code>/tomorrow</code> - показать расписание на завтра\n"
+        "• <code>/faq</code> - открыть часто задаваемые вопросы\n"
         "• <code>/admin</code> - вход в админ-панель\n"
         "• <code>/starosta</code> - вход в панель старосты\n"
         "• <code>/teacher_panel</code> - вход в панель учителя\n"
@@ -133,6 +135,7 @@ def _commands_help_text():
         "• <code>/teacher Леденчук</code>\n"
         "• <code>/room ауд. 125</code>\n"
         "• <code>/subject Математические модели</code>\n"
+        "• <code>/faq</code>\n"
         "• <code>/admin</code>\n"
         "• <code>/starosta</code>\n"
         "• <code>/teacher_panel</code>"
@@ -5744,6 +5747,211 @@ async def user_events_noop(callback_query: types.CallbackQuery):
     await callback_query.answer()
 
 
+def _faq_page_for_index(index: int):
+    """Возвращает страницу FAQ, на которой находится вопрос."""
+    if not FAQ_ITEMS:
+        return 0
+    return max(0, min(int(index) // FAQ_PAGE_SIZE, max(0, _faq_total_pages() - 1)))
+
+
+def _faq_total_pages():
+    """Возвращает количество страниц FAQ."""
+    return max(1, (len(FAQ_ITEMS) + FAQ_PAGE_SIZE - 1) // FAQ_PAGE_SIZE)
+
+
+def _faq_answer_to_html(answer_text: str):
+    """Безопасно форматирует текст ответа FAQ и делает URL кликабельными."""
+    escaped = html.escape(str(answer_text or ''))
+    return re.sub(
+        r'(https?://[^\s<]+)',
+        lambda match: f'<a href="{match.group(1)}">{match.group(1)}</a>',
+        escaped,
+    )
+
+
+def _build_faq_list_text(page: int, total_pages: int):
+    """Формирует текст списка вопросов FAQ."""
+    if not FAQ_ITEMS:
+        return '\n'.join(
+            [
+                '<b>❓ FAQ</b>',
+                '',
+                'Список вопросов пока пуст.',
+            ]
+        )
+
+    return '\n'.join(
+        [
+            '<b>❓ FAQ</b>',
+            '',
+            'Часто задаваемые вопросы для студентов МУИВ.',
+            f'📄 Страница: <b>{page + 1}/{total_pages}</b> • Вопросов: <b>{len(FAQ_ITEMS)}</b>',
+            '',
+            'Выберите вопрос ниже.',
+        ]
+    )
+
+
+def _build_faq_list_keyboard(page: int, total_pages: int):
+    """Строит клавиатуру списка вопросов FAQ."""
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+
+    if FAQ_ITEMS:
+        start = page * FAQ_PAGE_SIZE
+        end = start + FAQ_PAGE_SIZE
+        for item_index, item in enumerate(FAQ_ITEMS[start:end], start=start):
+            question = _truncate_button_text(f'{item_index + 1}. {item.get("question", "")}', 62)
+            keyboard.add(
+                types.InlineKeyboardButton(
+                    text=question,
+                    callback_data=f'faq_item_{item_index}',
+                )
+            )
+
+        if total_pages > 1:
+            keyboard.row(
+                types.InlineKeyboardButton(
+                    text='⬅️',
+                    callback_data=f'faq_page_{max(0, page - 1)}',
+                ),
+                types.InlineKeyboardButton(
+                    text=f'📄 {page + 1}/{total_pages}',
+                    callback_data='faq_noop',
+                ),
+                types.InlineKeyboardButton(
+                    text='➡️',
+                    callback_data=f'faq_page_{min(total_pages - 1, page + 1)}',
+                ),
+            )
+
+    keyboard.add(types.InlineKeyboardButton(text='🏠 В меню', callback_data='main_menu'))
+    return keyboard
+
+
+def _build_faq_detail_text(index: int):
+    """Формирует текст карточки одного вопроса FAQ."""
+    item = FAQ_ITEMS[index]
+    question = html.escape(str(item.get('question', 'Вопрос не найден')))
+    answer = _faq_answer_to_html(item.get('answer', 'Ответ пока не добавлен.'))
+
+    return '\n'.join(
+        [
+            '<b>❓ FAQ</b>',
+            f'Вопрос <b>{index + 1}/{len(FAQ_ITEMS)}</b>',
+            '',
+            f'<b>{question}</b>',
+            '',
+            answer,
+        ]
+    )
+
+
+def _build_faq_detail_keyboard(index: int):
+    """Строит клавиатуру карточки вопроса FAQ."""
+    keyboard = types.InlineKeyboardMarkup(row_width=2)
+    nav_buttons = []
+
+    if index > 0:
+        nav_buttons.append(
+            types.InlineKeyboardButton(
+                text='⬅️ Предыдущий',
+                callback_data=f'faq_item_{index - 1}',
+            )
+        )
+    if index < len(FAQ_ITEMS) - 1:
+        nav_buttons.append(
+            types.InlineKeyboardButton(
+                text='Следующий ➡️',
+                callback_data=f'faq_item_{index + 1}',
+            )
+        )
+    if nav_buttons:
+        keyboard.row(*nav_buttons)
+
+    keyboard.row(
+        types.InlineKeyboardButton(
+            text='↩️ К списку',
+            callback_data=f'faq_page_{_faq_page_for_index(index)}',
+        ),
+        types.InlineKeyboardButton(text='🏠 В меню', callback_data='main_menu'),
+    )
+    return keyboard
+
+
+async def _render_faq_list_view(target, *, edit: bool, page: int | None = None):
+    """Показывает список вопросов FAQ."""
+    total_pages = _faq_total_pages()
+    if page is None:
+        page = 0
+    page = max(0, min(int(page), total_pages - 1))
+
+    text = _build_faq_list_text(page, total_pages)
+    keyboard = _build_faq_list_keyboard(page, total_pages)
+
+    if edit:
+        await _safe_edit_text(target.message, text, reply_markup=keyboard, parse_mode='HTML')
+        await target.answer()
+    else:
+        if isinstance(target, types.CallbackQuery):
+            await target.message.answer(text, reply_markup=keyboard, parse_mode='HTML')
+            await target.answer()
+        else:
+            await target.answer(text, reply_markup=keyboard, parse_mode='HTML')
+
+
+async def _render_faq_detail_view(target, index: int, *, edit: bool):
+    """Показывает карточку вопроса FAQ."""
+    if index < 0 or index >= len(FAQ_ITEMS):
+        if isinstance(target, types.CallbackQuery):
+            await target.answer('⚠️ Вопрос не найден', show_alert=True)
+        return
+
+    text = _build_faq_detail_text(index)
+    keyboard = _build_faq_detail_keyboard(index)
+
+    if edit:
+        await _safe_edit_text(target.message, text, reply_markup=keyboard, parse_mode='HTML')
+        await target.answer()
+    else:
+        if isinstance(target, types.CallbackQuery):
+            await target.message.answer(text, reply_markup=keyboard, parse_mode='HTML')
+            await target.answer()
+        else:
+            await target.answer(text, reply_markup=keyboard, parse_mode='HTML')
+
+
+async def faq(message: types.Message):
+    """Открывает FAQ из главного меню или по команде."""
+    await _render_faq_list_view(message, edit=False, page=0)
+
+
+async def faq_change_page(callback_query: types.CallbackQuery):
+    """Переключает страницу списка FAQ."""
+    try:
+        page = int(callback_query.data.rsplit('_', 1)[1])
+    except (TypeError, ValueError, IndexError):
+        await callback_query.answer('⚠️ Некорректная страница FAQ', show_alert=True)
+        return
+
+    await _render_faq_list_view(callback_query, edit=True, page=page)
+
+
+async def faq_open_item(callback_query: types.CallbackQuery):
+    """Открывает выбранный вопрос FAQ."""
+    try:
+        index = int(callback_query.data.rsplit('_', 1)[1])
+    except (TypeError, ValueError, IndexError):
+        await callback_query.answer('⚠️ Вопрос FAQ не найден', show_alert=True)
+        return
+
+    await _render_faq_detail_view(callback_query, index, edit=True)
+
+
+async def faq_noop(callback_query: types.CallbackQuery):
+    """Служебная кнопка FAQ."""
+    await callback_query.answer()
+
+
 async def user_attendance_change_page(callback_query: types.CallbackQuery, state: FSMContext):
     """Листает дни на экране собственной посещаемости."""
     parsed = _parse_attendance_view_numbers(callback_query.data, 'user_att_page_', 1)
@@ -6052,6 +6260,7 @@ ROOM_PATTERN = re.compile(r'(?i)\b(?:ауд\.?|каб\.?|кабинет|лаб\.
 ADMIN_USERS_PAGE_SIZE = 8
 ADMIN_FILTER_PAGE_SIZE = 8
 EVENTS_PAGE_SIZE = 8
+FAQ_PAGE_SIZE = 8
 STAROSTA_ATTENDANCE_DAYS_PAGE_SIZE = 7
 STAROSTA_ATTENDANCE_STUDENTS_PAGE_SIZE = 8
 TEACHER_HOMEWORK_PAGE_SIZE = 8
@@ -10514,11 +10723,13 @@ def register_handlers_client(dp: Dispatcher):
     dp.register_message_handler(search_teacher_command, commands=['teacher'], state='*')
     dp.register_message_handler(search_room_command, commands=['room'], state='*')
     dp.register_message_handler(search_subject_command, commands=['subject'], state='*')
+    dp.register_message_handler(faq, commands=['faq'], state='*')
     dp.register_message_handler(schedule_today, commands=['today'])
     dp.register_message_handler(schedule_tomorrow, commands=['tomorrow'])
     dp.register_message_handler(support, text='🆘 Поддержка', state='*')
     dp.register_message_handler(search_entrypoint, text='🔎 Поиск', state='*')
     dp.register_message_handler(user_events, text='🎉 События', state='*')
+    dp.register_message_handler(faq, text='❓ FAQ', state='*')
     dp.register_message_handler(settings, text='💼 Настройки')
     dp.register_message_handler(my_schedule, text='📅 Мое расписание')
     dp.register_message_handler(user_attendance, text='📊 Посещаемость')
@@ -10675,6 +10886,9 @@ def register_handlers_client(dp: Dispatcher):
     dp.register_callback_query_handler(user_events_shift_detail, Text(startswith='events_next_'), state='*')
     dp.register_callback_query_handler(user_events_open_attachment, Text(startswith='events_media_'), state='*')
     dp.register_callback_query_handler(user_events_noop, Text(equals='events_noop'), state='*')
+    dp.register_callback_query_handler(faq_change_page, Text(startswith='faq_page_'), state='*')
+    dp.register_callback_query_handler(faq_open_item, Text(startswith='faq_item_'), state='*')
+    dp.register_callback_query_handler(faq_noop, Text(equals='faq_noop'), state='*')
     dp.register_callback_query_handler(user_attendance_change_page, Text(startswith='user_att_page_'), state='*')
     dp.register_callback_query_handler(attendance_noop, Text(equals='attendance_noop'), state='*')
     dp.register_callback_query_handler(change_group, Text(startswith="change_group"))
