@@ -1,8 +1,10 @@
 import asyncio
+import csv
 import secrets
 import os
 import re
 import html
+import io
 from difflib import SequenceMatcher
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -100,6 +102,12 @@ async def cmd_start(message: types.Message):
     if username is None:
         username = message.from_user.first_name
     user_exists = await db_commands.registration_check(telegram_id)
+    _log_message_action(
+        message,
+        'start',
+        'Запуск бота',
+        details={'is_new': not bool(user_exists)},
+    )
     if not user_exists:
         try:
             referrer_id = int(message.get_args())
@@ -144,12 +152,14 @@ def _commands_help_text():
 
 async def cmd_help(message: types.Message):
     """Показывает пользователю список команд с примерами."""
+    _log_message_action(message, 'help', 'Открыта справка')
     await message.answer(_commands_help_text(), reply_markup=get_main_keyboard(), parse_mode='HTML')
 
 
 async def admin_command(message: types.Message, state: FSMContext):
     """Запускает вход в админ-панель или открывает ее для авторизованного пользователя."""
     await state.finish()
+    _log_message_action(message, 'admin_command', 'Запрошен вход в админку', role='admin')
 
     if not _admin_panel_enabled():
         await message.answer(
@@ -216,6 +226,7 @@ async def admin_receive_password(message: types.Message, state: FSMContext):
 
     telegram_id = _telegram_id_from_message(message)
     await db_commands.authorize_admin(telegram_id, login_text)
+    _log_message_action(message, 'admin_login_success', 'Успешный вход в админку', role='admin')
     await state.finish()
     await message.answer('✅ Вход выполнен.')
     await _render_admin_panel(message, telegram_id, edit=False)
@@ -1952,6 +1963,7 @@ async def _render_support_teacher_picker(target, state: FSMContext, telegram_id:
 async def teacher_panel_command(message: types.Message, state: FSMContext):
     """Открывает панель учителя или запускает вход по логину и паролю."""
     await state.finish()
+    _log_message_action(message, 'teacher_panel_command', 'Запрошен вход в панель учителя', role='teacher')
     telegram_id = _telegram_id_from_message(message)
     access = await db_commands.get_teacher_access(telegram_id)
     if access.get('has_access'):
@@ -2015,6 +2027,7 @@ async def teacher_receive_password(message: types.Message, state: FSMContext):
 
     telegram_id = _telegram_id_from_message(message)
     await db_commands.authorize_teacher(telegram_id, login_text)
+    _log_message_action(message, 'teacher_login_success', 'Успешный вход в панель учителя', role='teacher')
     await state.finish()
     await message.answer('✅ Вход выполнен.')
     await _render_teacher_panel(message, state, telegram_id, edit=False)
@@ -2756,7 +2769,10 @@ def _build_admin_panel_keyboard():
         types.InlineKeyboardButton(text='📣 Создать событие', callback_data='admin_event_create'),
     )
     keyboard.row(
+        types.InlineKeyboardButton(text='📈 Действия', callback_data='admin_logs'),
         types.InlineKeyboardButton(text='🔄 Обновить', callback_data='admin_refresh'),
+    )
+    keyboard.row(
         types.InlineKeyboardButton(text='🚪 Выйти', callback_data='admin_logout'),
     )
     keyboard.add(types.InlineKeyboardButton(text='🏠 В главное меню', callback_data='main_menu'))
@@ -2796,6 +2812,127 @@ def _build_admin_panel_text(stats: dict, session_data: dict | None):
     return '\n'.join(lines)
 
 
+def _build_user_action_actor_label(action_item: dict):
+    """Формирует компактную подпись пользователя для отчета по действиям."""
+    username = _normalize_cell_text((action_item or {}).get('username')) or None
+    telegram_id = (action_item or {}).get('telegram_id')
+
+    if username:
+        username_label = username if username.startswith('@') else f'@{username}'
+        if telegram_id is not None:
+            return f'{html.escape(username_label)} (<code>{telegram_id}</code>)'
+        return html.escape(username_label)
+
+    if telegram_id is not None:
+        return f'<code>{telegram_id}</code>'
+
+    return 'неизвестный пользователь'
+
+
+def _build_user_action_details_preview(details):
+    """Формирует короткое описание деталей действия для админского отчета."""
+    if not isinstance(details, dict):
+        return None
+
+    fragments = []
+    if details.get('query'):
+        fragments.append(f"запрос: {str(details['query'])[:40]}")
+    if details.get('group_code'):
+        fragments.append(f"группа: {details['group_code']}")
+    if details.get('teacher_name'):
+        fragments.append(f"преподаватель: {str(details['teacher_name'])[:40]}")
+    if details.get('target_label'):
+        fragments.append(f"адресат: {str(details['target_label'])[:40]}")
+    if details.get('target_date'):
+        fragments.append(f"дата: {details['target_date']}")
+    if details.get('results_count') is not None:
+        fragments.append(f"результатов: {details['results_count']}")
+    if details.get('recipients_count') is not None:
+        fragments.append(f"получателей: {details['recipients_count']}")
+    if details.get('success_count') is not None:
+        fragments.append(f"доставлено: {details['success_count']}")
+    if details.get('period_days') is not None:
+        fragments.append(f"период: {details['period_days']} дн.")
+
+    if not fragments and details.get('is_new') is not None:
+        fragments.append('новый пользователь' if details.get('is_new') else 'повторный вход')
+
+    return '; '.join(fragments[:3]) or None
+
+
+def _build_admin_logs_text(report: dict, days: int):
+    """Формирует текст экрана отчета по действиям пользователей."""
+    days = _normalize_admin_logs_days(days)
+    period_label = 'сегодня' if days == 1 else f'за {days} дней'
+    recent_actions = report.get('recent_actions') or []
+    top_actions = report.get('top_actions') or []
+    top_users = report.get('top_users') or []
+
+    lines = [
+        '<b>📈 Действия пользователей</b>',
+        '',
+        f'Период: <b>{period_label}</b>',
+        f"• Всего действий: <b>{report.get('total_actions', 0)}</b>",
+        f"• Уникальных пользователей: <b>{report.get('unique_users', 0)}</b>",
+    ]
+
+    if top_actions:
+        lines.extend(['', '<b>Топ действий</b>'])
+        for index, item in enumerate(top_actions, start=1):
+            action_label = html.escape(str(item.get('action_label') or item.get('action_key') or 'Действие'))
+            lines.append(f"{index}. {action_label} — <b>{item.get('actions_count', 0)}</b>")
+
+    if top_users:
+        lines.extend(['', '<b>Самые активные пользователи</b>'])
+        for index, item in enumerate(top_users, start=1):
+            actor = _build_user_action_actor_label(item)
+            lines.append(f"{index}. {actor} — <b>{item.get('actions_count', 0)}</b>")
+
+    lines.extend(['', '<b>Последние действия</b>'])
+    if not recent_actions:
+        lines.append('За выбранный период действий пока нет.')
+        return '\n'.join(lines)
+
+    for item in recent_actions:
+        created_at = item.get('created_at')
+        created_text = created_at.strftime('%d.%m.%Y %H:%M') if created_at else 'неизвестно'
+        actor = _build_user_action_actor_label(item)
+        action_label = html.escape(str(item.get('action_label') or item.get('action_key') or 'Действие'))
+        role = _normalize_cell_text(item.get('role')) or 'user'
+        details_preview = _build_user_action_details_preview(item.get('details'))
+
+        lines.append(f"• <b>{created_text}</b> — {actor}")
+        lines.append(f"  {html.escape(role)}: {action_label}")
+        if details_preview:
+            lines.append(f"  {html.escape(details_preview)}")
+
+    return '\n'.join(lines)
+
+
+def _build_admin_logs_keyboard(days: int):
+    """Строит клавиатуру экрана отчета по действиям пользователей."""
+    days = _normalize_admin_logs_days(days)
+    keyboard = types.InlineKeyboardMarkup(row_width=3)
+    keyboard.row(
+        *[
+            types.InlineKeyboardButton(
+                text=f"{'✅ ' if option == days else ''}{'Сегодня' if option == 1 else f'{option} дн.'}",
+                callback_data=f'admin_logs_period_{option}',
+            )
+            for option in ADMIN_LOG_PERIOD_OPTIONS
+        ]
+    )
+    keyboard.row(
+        types.InlineKeyboardButton(text='⬇️ CSV-отчет', callback_data=f'admin_logs_export_{days}'),
+        types.InlineKeyboardButton(text='🔄 Обновить', callback_data=f'admin_logs_period_{days}'),
+    )
+    keyboard.row(
+        types.InlineKeyboardButton(text='⬅️ В админку', callback_data='admin_open'),
+        types.InlineKeyboardButton(text='🏠 В главное меню', callback_data='main_menu'),
+    )
+    return keyboard
+
+
 async def _render_admin_panel(target, telegram_id, *, edit: bool):
     """Показывает экран админ-панели."""
     if not await db_commands.is_admin_authorized(telegram_id):
@@ -2809,6 +2946,33 @@ async def _render_admin_panel(target, telegram_id, *, edit: bool):
     session_data = await db_commands.get_admin_session(telegram_id)
     text = _build_admin_panel_text(stats, session_data)
     keyboard = _build_admin_panel_keyboard()
+
+    if edit:
+        await _safe_edit_text(target.message, text, reply_markup=keyboard, parse_mode='HTML')
+        await target.answer()
+    else:
+        await target.answer(text, reply_markup=keyboard, parse_mode='HTML')
+
+    return True
+
+
+async def _render_admin_logs_view(target, telegram_id: int, *, days: int = 7, edit: bool):
+    """Показывает экран журнала действий пользователей в админке."""
+    if not await db_commands.is_admin_authorized(telegram_id):
+        if edit:
+            await target.answer('⚠️ Сначала войдите в админ-панель через /admin', show_alert=True)
+        else:
+            await target.answer('⚠️ Сначала войдите в админ-панель через /admin')
+        return False
+
+    normalized_days = _normalize_admin_logs_days(days)
+    report = await db_commands.get_user_action_report(
+        days=normalized_days,
+        recent_limit=ADMIN_LOG_RECENT_LIMIT,
+        top_limit=ADMIN_LOG_TOP_LIMIT,
+    )
+    text = _build_admin_logs_text(report, normalized_days)
+    keyboard = _build_admin_logs_keyboard(normalized_days)
 
     if edit:
         await _safe_edit_text(target.message, text, reply_markup=keyboard, parse_mode='HTML')
@@ -2862,6 +3026,7 @@ async def _render_starosta_panel(target, state: FSMContext, telegram_id: int, *,
 async def starosta_command(message: types.Message, state: FSMContext):
     """Открывает панель старосты или запускает вход главной старосты."""
     await state.finish()
+    _log_message_action(message, 'starosta_command', 'Запрошен вход в панель старосты', role='starosta')
     telegram_id = _telegram_id_from_message(message)
     access = await db_commands.get_starosta_access(telegram_id)
     if access.get('has_access'):
@@ -2925,6 +3090,7 @@ async def starosta_receive_password(message: types.Message, state: FSMContext):
 
     telegram_id = _telegram_id_from_message(message)
     await db_commands.authorize_starosta(telegram_id, login_text)
+    _log_message_action(message, 'starosta_login_success', 'Успешный вход в панель старосты', role='starosta')
     await state.finish()
     await message.answer('✅ Вход выполнен.')
     await _render_starosta_panel(message, state, telegram_id, edit=False)
@@ -3133,6 +3299,99 @@ async def _render_starosta_user_details_view(target, telegram_id: int, target_te
 async def admin_open(callback_query: types.CallbackQuery, state: FSMContext):
     """Открывает админ-панель по callback-кнопке."""
     await _render_admin_panel(callback_query, _telegram_id_from_callback(callback_query), edit=True)
+
+
+async def admin_logs_open(callback_query: types.CallbackQuery, state: FSMContext):
+    """Открывает экран отчета по действиям пользователей."""
+    _log_callback_action(callback_query, 'admin_logs_open', 'Открыт отчет по действиям', role='admin')
+    await _render_admin_logs_view(
+        callback_query,
+        _telegram_id_from_callback(callback_query),
+        days=7,
+        edit=True,
+    )
+
+
+async def admin_logs_change_period(callback_query: types.CallbackQuery, state: FSMContext):
+    """Переключает период отчета по действиям пользователей."""
+    try:
+        days = int(str(callback_query.data or '').rsplit('_', 1)[1])
+    except (TypeError, ValueError, IndexError):
+        await callback_query.answer('⚠️ Некорректный период отчета', show_alert=True)
+        return
+
+    normalized_days = _normalize_admin_logs_days(days)
+    _log_callback_action(
+        callback_query,
+        'admin_logs_period_change',
+        'Изменен период отчета по действиям',
+        role='admin',
+        details={'period_days': normalized_days},
+    )
+    await _render_admin_logs_view(
+        callback_query,
+        _telegram_id_from_callback(callback_query),
+        days=normalized_days,
+        edit=True,
+    )
+
+
+async def admin_logs_export(callback_query: types.CallbackQuery, state: FSMContext):
+    """Выгружает CSV-отчет по действиям пользователей за выбранный период."""
+    telegram_id = _telegram_id_from_callback(callback_query)
+    if not await db_commands.is_admin_authorized(telegram_id):
+        await callback_query.answer('⚠️ Сначала войдите в админ-панель через /admin', show_alert=True)
+        return
+
+    try:
+        days = int(str(callback_query.data or '').rsplit('_', 1)[1])
+    except (TypeError, ValueError, IndexError):
+        await callback_query.answer('⚠️ Некорректный период отчета', show_alert=True)
+        return
+
+    normalized_days = _normalize_admin_logs_days(days)
+    rows = await db_commands.get_user_action_export_rows(normalized_days)
+    if not rows:
+        await callback_query.answer('За выбранный период данных для выгрузки нет.', show_alert=True)
+        return
+
+    buffer = io.StringIO()
+    writer = csv.writer(buffer, delimiter=';')
+    writer.writerow(['created_at', 'telegram_id', 'username', 'role', 'source', 'action_key', 'action_label', 'details'])
+
+    for item in rows:
+        created_at = item.get('created_at')
+        created_text = created_at.strftime('%Y-%m-%d %H:%M:%S') if created_at else ''
+        writer.writerow(
+            [
+                created_text,
+                item.get('telegram_id') or '',
+                item.get('username') or '',
+                item.get('role') or '',
+                item.get('source') or '',
+                item.get('action_key') or '',
+                item.get('action_label') or '',
+                str(item.get('details') or ''),
+            ]
+        )
+
+    payload = io.BytesIO(buffer.getvalue().encode('utf-8-sig'))
+    payload.seek(0)
+    filename = f'user_actions_{normalized_days}d_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv'
+
+    _log_callback_action(
+        callback_query,
+        'admin_logs_export',
+        'Выгружен CSV-отчет по действиям',
+        role='admin',
+        details={'period_days': normalized_days, 'rows_count': len(rows)},
+    )
+
+    await callback_query.message.answer_document(
+        types.InputFile(payload, filename=filename),
+        caption=f'📄 Отчет по действиям пользователей за {normalized_days} дн.',
+    )
+    await callback_query.answer('CSV-отчет отправлен')
 
 
 async def admin_refresh(callback_query: types.CallbackQuery, state: FSMContext):
@@ -4384,6 +4643,7 @@ async def _render_admin_group_filter_picker(callback_query: types.CallbackQuery,
 
 async def admin_users_open(callback_query: types.CallbackQuery, state: FSMContext):
     """Открывает экран списка пользователей в админ-панели."""
+    _log_callback_action(callback_query, 'admin_users_open', 'Открыт список пользователей', role='admin')
     await _render_admin_users_view(callback_query, state, _telegram_id_from_callback(callback_query), edit=True)
 
 
@@ -4880,6 +5140,13 @@ async def admin_receive_message_text(message: types.Message, state: FSMContext):
         except Exception:
             failed_count += 1
 
+    _log_message_action(
+        message,
+        'admin_message_sent',
+        'Админ отправил сообщение',
+        role='admin',
+        details={'mode': mode, 'recipients_count': len(recipients), 'success_count': success_count},
+    )
     await _restore_admin_message_origin(state)
     await _clear_admin_message_context(state)
     await message.answer(
@@ -5324,6 +5591,20 @@ async def _finalize_admin_event_creation(
         except Exception:
             failed_count += 1
 
+    if event:
+        _schedule_user_action_log(
+            telegram_id,
+            None,
+            'admin_event_created',
+            'Создано событие',
+            role='admin',
+            source='system',
+            details={
+                'event_id': event.get('id'),
+                'success_count': success_count,
+                'recipients_count': len(recipients),
+            },
+        )
     return event, success_count, failed_count
 
 
@@ -5334,6 +5615,7 @@ async def admin_event_create_start(callback_query: types.CallbackQuery, state: F
         await callback_query.answer('⚠️ Сначала войдите в админ-панель через /admin', show_alert=True)
         return
 
+    _log_callback_action(callback_query, 'admin_event_create_start', 'Начато создание события', role='admin')
     await state.update_data(
         admin_event_at_iso=None,
         admin_event_description=None,
@@ -5590,6 +5872,7 @@ async def _send_event_detail_view(chat_id: int, event_id: int, page: int | None 
 
 async def user_events(message: types.Message):
     """Открывает список событий из главного меню."""
+    _log_message_action(message, 'events_open', 'Открыт раздел событий')
     await _render_events_list_view(message, edit=False, mode='upcoming')
 
 
@@ -5645,6 +5928,7 @@ async def user_events_open_detail(callback_query: types.CallbackQuery):
         await callback_query.answer('⚠️ Некорректное событие', show_alert=True)
         return
 
+    _log_callback_action(callback_query, 'event_detail_open', 'Открыта карточка события', details={'event_id': event_id, 'mode': mode, 'page': page})
     sent = await _send_event_detail_view(callback_query.message.chat.id, event_id, page, mode)
     if not sent:
         await callback_query.answer('⚠️ Событие не найдено', show_alert=True)
@@ -5922,6 +6206,7 @@ async def _render_faq_detail_view(target, index: int, *, edit: bool):
 
 async def faq(message: types.Message):
     """Открывает FAQ из главного меню или по команде."""
+    _log_message_action(message, 'faq_open', 'Открыт раздел FAQ')
     await _render_faq_list_view(message, edit=False, page=0)
 
 
@@ -5944,6 +6229,12 @@ async def faq_open_item(callback_query: types.CallbackQuery):
         await callback_query.answer('⚠️ Вопрос FAQ не найден', show_alert=True)
         return
 
+    _log_callback_action(
+        callback_query,
+        'faq_item_open',
+        'Открыт ответ FAQ',
+        details={'faq_index': index},
+    )
     await _render_faq_detail_view(callback_query, index, edit=True)
 
 
@@ -6154,11 +6445,13 @@ async def _render_settings_view(target_message: types.Message, state: FSMContext
 
 async def settings(message: types.Message, state: FSMContext):
     """Показывает раздел настроек."""
+    _log_message_action(message, 'settings_open', 'Открыт раздел настроек')
     await _render_settings_view(message, state, _telegram_id_from_message(message), edit=False)
 
 
 async def user_attendance(message: types.Message, state: FSMContext):
     """Показывает пользователю его посещаемость."""
+    _log_message_action(message, 'attendance_open', 'Открыт раздел посещаемости')
     await _render_self_attendance_view(
         message,
         state,
@@ -6266,6 +6559,9 @@ STAROSTA_ATTENDANCE_STUDENTS_PAGE_SIZE = 8
 TEACHER_HOMEWORK_PAGE_SIZE = 8
 LESSON_REMINDER_OPTIONS = (None, 10, 30, 60, 120)
 SUPPORT_TEACHER_PAGE_SIZE = 8
+ADMIN_LOG_PERIOD_OPTIONS = (1, 7, 30)
+ADMIN_LOG_RECENT_LIMIT = 8
+ADMIN_LOG_TOP_LIMIT = 5
 
 
 def _telegram_id_from_message(message: types.Message):
@@ -6280,6 +6576,139 @@ def _telegram_id_from_callback(callback_query: types.CallbackQuery):
     if callback_query and callback_query.from_user:
         return callback_query.from_user.id
     return None
+
+
+def _username_from_message(message: types.Message):
+    """Возвращает username или имя пользователя из сообщения."""
+    if not message or not message.from_user:
+        return None
+
+    username = str(message.from_user.username or '').strip()
+    if username:
+        return username
+
+    return str(message.from_user.first_name or '').strip() or None
+
+
+def _username_from_callback(callback_query: types.CallbackQuery):
+    """Возвращает username или имя пользователя из callback-запроса."""
+    if not callback_query or not callback_query.from_user:
+        return None
+
+    username = str(callback_query.from_user.username or '').strip()
+    if username:
+        return username
+
+    return str(callback_query.from_user.first_name or '').strip() or None
+
+
+def _normalize_admin_logs_days(days):
+    """Нормализует выбранный период отчета по действиям."""
+    try:
+        normalized = int(days)
+    except (TypeError, ValueError):
+        normalized = 7
+
+    if normalized not in ADMIN_LOG_PERIOD_OPTIONS:
+        return 7
+    return normalized
+
+
+async def _log_user_action(
+    telegram_id,
+    username,
+    action_key: str,
+    action_label: str,
+    *,
+    role: str = 'user',
+    source: str = 'message',
+    details: dict | None = None,
+):
+    """Сохраняет действие пользователя, не прерывая основной сценарий при ошибке."""
+    if telegram_id is None or not action_key:
+        return
+
+    try:
+        await db_commands.log_user_action(
+            telegram_id=int(telegram_id),
+            username=username,
+            role=role,
+            source=source,
+            action_key=action_key,
+            action_label=action_label,
+            details=details,
+        )
+    except Exception as log_error:
+        print(f"ERROR: cannot save user action log: {log_error}")
+
+
+def _schedule_user_action_log(
+    telegram_id,
+    username,
+    action_key: str,
+    action_label: str,
+    *,
+    role: str = 'user',
+    source: str = 'message',
+    details: dict | None = None,
+):
+    """Планирует сохранение действия пользователя в фоне."""
+    if telegram_id is None or not action_key:
+        return
+
+    asyncio.create_task(
+        _log_user_action(
+            telegram_id,
+            username,
+            action_key,
+            action_label,
+            role=role,
+            source=source,
+            details=details,
+        )
+    )
+
+
+def _log_message_action(
+    message: types.Message,
+    action_key: str,
+    action_label: str,
+    *,
+    role: str = 'user',
+    source: str = 'message',
+    details: dict | None = None,
+):
+    """Логирует действие, инициированное сообщением."""
+    _schedule_user_action_log(
+        _telegram_id_from_message(message),
+        _username_from_message(message),
+        action_key,
+        action_label,
+        role=role,
+        source=source,
+        details=details,
+    )
+
+
+def _log_callback_action(
+    callback_query: types.CallbackQuery,
+    action_key: str,
+    action_label: str,
+    *,
+    role: str = 'user',
+    source: str = 'callback',
+    details: dict | None = None,
+):
+    """Логирует действие, инициированное callback-кнопкой."""
+    _schedule_user_action_log(
+        _telegram_id_from_callback(callback_query),
+        _username_from_callback(callback_query),
+        action_key,
+        action_label,
+        role=role,
+        source=source,
+        details=details,
+    )
 
 
 async def _load_user_selection_from_db(telegram_id):
@@ -7561,6 +7990,7 @@ async def _render_search_entity(message, token, page_index: int | None, *, edit:
 
 async def search_entrypoint(message: types.Message, state: FSMContext):
     """Открывает меню поиска."""
+    _log_message_action(message, 'search_open', 'Открыт поиск')
     await _render_search_start(message, state, edit=False)
 
 
@@ -7610,6 +8040,12 @@ async def _process_search_query(message: types.Message, state: FSMContext, searc
         return
 
     matches = _search_entity_matches(search_kind, normalized_text)
+    _log_message_action(
+        message,
+        f'search_{search_kind}',
+        f'Выполнен поиск: {search_kind}',
+        details={'query': normalized_text, 'results_count': len(matches)},
+    )
     if not matches:
         await message.answer(
             f"😕 {meta['empty']}\n\nПопробуйте написать короче или точнее.\n{meta['prompt']}",
@@ -7729,6 +8165,12 @@ async def group_command(message: types.Message, state: FSMContext):
         return
 
     matches = _find_group_matches(query_text)
+    _log_message_action(
+        message,
+        'group_search',
+        'Поиск группы',
+        details={'query': query_text, 'results_count': len(matches)},
+    )
     if not matches:
         await message.answer(
             f"😕 По запросу <b>{html.escape(query_text)}</b> группы не найдены.",
@@ -7796,6 +8238,12 @@ async def date_command(message: types.Message, state: FSMContext):
         return
 
     target_date = _parse_schedule_date(query_text)
+    _log_message_action(
+        message,
+        'schedule_by_date',
+        'Запрошено расписание по дате',
+        details={'target_date': query_text},
+    )
     if target_date is None:
         await message.answer(
             "⚠️ Не удалось распознать дату.\nПоддерживаются форматы: <code>14.03.26</code>, <code>14.03.2026</code>, <code>2026-03-14</code>.",
@@ -9706,11 +10154,13 @@ async def _show_relative_day_schedule(message: types.Message, state: FSMContext,
 
 async def schedule_today(message: types.Message, state: FSMContext):
     """Показывает расписание на сегодня."""
+    _log_message_action(message, 'schedule_today', 'Запрошено расписание на сегодня')
     await _show_relative_day_schedule(message, state, 0)
 
 
 async def schedule_tomorrow(message: types.Message, state: FSMContext):
     """Показывает расписание на завтра."""
+    _log_message_action(message, 'schedule_tomorrow', 'Запрошено расписание на завтра')
     await _show_relative_day_schedule(message, state, 1)
 
 async def _render_week_picker(callback_query: types.CallbackQuery, state: FSMContext):
@@ -9760,6 +10210,7 @@ async def process_group_choice(callback_query: types.CallbackQuery, state: FSMCo
         await callback_query.answer('📭 Для выбранной группы нет расписания', show_alert=True)
         return
 
+    _log_callback_action(callback_query, 'group_selected', 'Выбрана группа', details={'course_name': course_name, 'group_code': group_code})
     await _update_user_selection(
         state,
         _telegram_id_from_callback(callback_query),
@@ -10242,6 +10693,7 @@ async def main_menu(callback_query: types.CallbackQuery):
 # Хендлер для команды "Мое расписание"
 async def my_schedule(message: types.Message, state: FSMContext):
     """Показывает текущее выбранное расписание пользователя."""
+    _log_message_action(message, 'my_schedule_open', 'Открыто мое расписание')
     user_data = await _get_user_data_with_db_fallback(state, _telegram_id_from_message(message))
 
     course = user_data.get('selected_course')
@@ -10284,6 +10736,7 @@ async def change_group(callback_query: types.CallbackQuery):
 async def support(message: types.Message, state: FSMContext):
     """Открывает раздел поддержки из главного меню."""
     await state.finish()
+    _log_message_action(message, 'support_open', 'Открыт раздел поддержки')
     await _render_support_view(message, state, _telegram_id_from_message(message), edit=False)
 
 
@@ -10338,6 +10791,7 @@ async def support_to_starosta(callback_query: types.CallbackQuery, state: FSMCon
         await callback_query.answer('⚠️ Для вашей группы пока нет доступной старосты в боте', show_alert=True)
         return
 
+    _log_callback_action(callback_query, 'support_to_starosta', 'Выбрано обращение к старосте', details={'group_code': group_code})
     await _start_support_compose(
         callback_query,
         state,
@@ -10358,6 +10812,7 @@ async def support_to_admin(callback_query: types.CallbackQuery, state: FSMContex
         await callback_query.answer('⚠️ Администрация пока недоступна в боте', show_alert=True)
         return
 
+    _log_callback_action(callback_query, 'support_to_admin', 'Выбрано обращение к администрации')
     await _start_support_compose(
         callback_query,
         state,
@@ -10407,6 +10862,7 @@ async def support_set_teacher(callback_query: types.CallbackQuery, state: FSMCon
         await callback_query.answer('⚠️ Этому преподавателю пока нельзя написать через бота', show_alert=True)
         return
 
+    _log_callback_action(callback_query, 'support_to_teacher', 'Выбрано обращение к преподавателю', details={'teacher_name': teacher_name})
     await _start_support_compose(
         callback_query,
         state,
@@ -10538,6 +10994,16 @@ async def support_receive_message_text(message: types.Message, state: FSMContext
         except Exception:
             failed_count += 1
 
+    _log_message_action(
+        message,
+        'support_message_sent',
+        'Отправлено обращение в поддержку',
+        details={
+            'target_label': user_data.get('support_target_label'),
+            'recipients_count': len(recipients),
+            'success_count': success_count,
+        },
+    )
     await _restore_support_origin(state, telegram_id)
     await _clear_support_context(state)
     await message.answer(
@@ -10814,6 +11280,9 @@ def register_handlers_client(dp: Dispatcher):
     dp.register_callback_query_handler(settings_toggle_student_lesson_reminder, Text(equals='settings_student_reminder_toggle'))
     dp.register_callback_query_handler(settings_time_noop, Text(equals="settings_time_noop"))
     dp.register_callback_query_handler(admin_open, Text(equals='admin_open'), state='*')
+    dp.register_callback_query_handler(admin_logs_open, Text(equals='admin_logs'), state='*')
+    dp.register_callback_query_handler(admin_logs_change_period, Text(startswith='admin_logs_period_'), state='*')
+    dp.register_callback_query_handler(admin_logs_export, Text(startswith='admin_logs_export_'), state='*')
     dp.register_callback_query_handler(admin_refresh, Text(equals='admin_refresh'), state='*')
     dp.register_callback_query_handler(admin_logout, Text(equals='admin_logout'), state='*')
     dp.register_callback_query_handler(teacher_open, Text(equals='teacher_open'), state='*')

@@ -1,6 +1,6 @@
 import json
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict
 
 from sqlalchemy import delete, func, or_, select
@@ -18,6 +18,7 @@ from db_api.tables import (
     LessonHomework,
     TeacherAssignment,
     Users,
+    UserActionLog,
     UserLessonReminderNotification,
     UserScheduleState,
     UserDailyNotification,
@@ -164,6 +165,47 @@ def _lesson_homework_row_to_dict(row: LessonHomework | None):
         'created_by_telegram_id': row.created_by_telegram_id,
         'created_at': row.created_at,
         'updated_at': row.updated_at,
+    }
+
+
+def _serialize_action_details(details: Any) -> str | None:
+    """Сериализует дополнительные данные действия в JSON."""
+    if details is None:
+        return None
+
+    try:
+        return json.dumps(details, ensure_ascii=False, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        return json.dumps({'value': str(details)}, ensure_ascii=False, sort_keys=True)
+
+
+def _deserialize_action_details(details_json: str | None):
+    """Преобразует JSON дополнительных данных действия обратно в Python-объект."""
+    normalized = str(details_json or '').strip()
+    if not normalized:
+        return None
+
+    try:
+        return json.loads(normalized)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {'value': normalized}
+
+
+def _user_action_log_row_to_dict(row: UserActionLog | None):
+    """Преобразует запись журнала действий в словарь."""
+    if row is None:
+        return None
+
+    return {
+        'id': row.id,
+        'telegram_id': row.telegram_id,
+        'username': str(row.username or '').strip() or None,
+        'role': str(row.role or '').strip() or None,
+        'action_key': str(row.action_key or '').strip() or None,
+        'action_label': str(row.action_label or '').strip() or None,
+        'source': str(row.source or '').strip() or None,
+        'details': _deserialize_action_details(row.details_json),
+        'created_at': row.created_at,
     }
 
 
@@ -752,6 +794,120 @@ async def get_admin_dashboard_stats():
             'lessons_count': int(lessons_count or 0),
             'events_count': int(events_count or 0),
         }
+
+
+async def get_user_action_report(days: int = 7, *, recent_limit: int = 10, top_limit: int = 5):
+    """Возвращает сводный отчет по действиям пользователей за период."""
+    try:
+        days = max(1, int(days))
+    except (TypeError, ValueError):
+        days = 7
+
+    try:
+        recent_limit = max(1, int(recent_limit))
+    except (TypeError, ValueError):
+        recent_limit = 10
+
+    try:
+        top_limit = max(1, int(top_limit))
+    except (TypeError, ValueError):
+        top_limit = 5
+
+    threshold = datetime.utcnow() - timedelta(days=days)
+
+    async with get_session() as session:
+        total_actions = await session.scalar(
+            select(func.count(UserActionLog.id)).where(UserActionLog.created_at >= threshold)
+        )
+        unique_users = await session.scalar(
+            select(func.count(func.distinct(UserActionLog.telegram_id))).where(
+                UserActionLog.created_at >= threshold
+            )
+        )
+
+        action_count = func.count(UserActionLog.id).label('actions_count')
+        top_actions_rows = (
+            await session.execute(
+                select(
+                    UserActionLog.action_key,
+                    UserActionLog.action_label,
+                    action_count,
+                )
+                .where(UserActionLog.created_at >= threshold)
+                .group_by(UserActionLog.action_key, UserActionLog.action_label)
+                .order_by(action_count.desc(), UserActionLog.action_label.asc())
+                .limit(top_limit)
+            )
+        ).all()
+
+        user_count = func.count(UserActionLog.id).label('actions_count')
+        top_users_rows = (
+            await session.execute(
+                select(
+                    UserActionLog.telegram_id,
+                    func.max(UserActionLog.username).label('username'),
+                    user_count,
+                )
+                .where(UserActionLog.created_at >= threshold)
+                .group_by(UserActionLog.telegram_id)
+                .order_by(user_count.desc(), UserActionLog.telegram_id.asc())
+                .limit(top_limit)
+            )
+        ).all()
+
+        recent_rows = (
+            await session.execute(
+                select(UserActionLog)
+                .where(UserActionLog.created_at >= threshold)
+                .order_by(UserActionLog.created_at.desc(), UserActionLog.id.desc())
+                .limit(recent_limit)
+            )
+        ).scalars().all()
+
+    return {
+        'days': days,
+        'period_started_at': threshold,
+        'total_actions': int(total_actions or 0),
+        'unique_users': int(unique_users or 0),
+        'top_actions': [
+            {
+                'action_key': str(row.action_key or '').strip() or None,
+                'action_label': str(row.action_label or '').strip() or None,
+                'actions_count': int(row.actions_count or 0),
+            }
+            for row in top_actions_rows
+        ],
+        'top_users': [
+            {
+                'telegram_id': row.telegram_id,
+                'username': str(row.username or '').strip() or None,
+                'actions_count': int(row.actions_count or 0),
+            }
+            for row in top_users_rows
+        ],
+        'recent_actions': [_user_action_log_row_to_dict(row) for row in recent_rows],
+    }
+
+
+async def get_user_action_export_rows(days: int = 7):
+    """Возвращает строки журнала действий для выгрузки отчета."""
+    try:
+        days = max(1, int(days))
+    except (TypeError, ValueError):
+        days = 7
+
+    threshold = datetime.utcnow() - timedelta(days=days)
+
+    async with get_session() as session:
+        rows = (
+            await session.execute(
+                select(UserActionLog)
+                .where(UserActionLog.created_at >= threshold)
+                .order_by(UserActionLog.created_at.desc(), UserActionLog.id.desc())
+            )
+        ).scalars().all()
+
+    return [_user_action_log_row_to_dict(row) for row in rows]
 
 
 async def get_admin_user_course_filters():
@@ -1788,7 +1944,42 @@ async def mark_daily_notification_sent(telegram_id: int, notification_type: str,
             return True
         except IntegrityError:
             await session.rollback()
-            return False
+
+
+async def log_user_action(
+    telegram_id: int,
+    action_key: str,
+    action_label: str | None = None,
+    *,
+    username: str | None = None,
+    role: str | None = 'user',
+    source: str | None = None,
+    details: Any = None,
+):
+    """Сохраняет действие пользователя или служебной роли в журнал."""
+    normalized_action_key = str(action_key or '').strip()
+    if telegram_id is None or not normalized_action_key:
+        return None
+
+    normalized_username = str(username or '').strip() or None
+    normalized_role = str(role or '').strip() or None
+    normalized_source = str(source or '').strip() or None
+    normalized_action_label = str(action_label or normalized_action_key).strip()
+
+    async with get_session() as session:
+        row = UserActionLog(
+            telegram_id=int(telegram_id),
+            username=normalized_username,
+            role=normalized_role,
+            action_key=normalized_action_key,
+            action_label=normalized_action_label,
+            source=normalized_source,
+            details_json=_serialize_action_details(details),
+            created_at=datetime.utcnow(),
+        )
+        session.add(row)
+        await session.commit()
+        return _user_action_log_row_to_dict(row)
 
 
 async def was_lesson_reminder_sent(telegram_id: int, reminder_key: str):

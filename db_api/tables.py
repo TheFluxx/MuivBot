@@ -27,6 +27,22 @@ class Users(Base):
     username = Column(String)
     referrer_id = Column(BigInteger)
 
+
+class UserActionLog(Base):
+    """Журнал действий пользователей и служебных ролей в боте."""
+
+    __tablename__ = 'user_action_logs'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    telegram_id = Column(BigInteger, nullable=False, index=True)
+    username = Column(String(255), nullable=True, index=True)
+    role = Column(String(32), nullable=True, index=True)
+    action_key = Column(String(64), nullable=False, index=True)
+    action_label = Column(String(255), nullable=False)
+    source = Column(String(32), nullable=True, index=True)
+    details_json = Column(Text, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+
 class BotAdminSession(Base):
     """Авторизованная админ-сессия в Telegram-боте."""
 
