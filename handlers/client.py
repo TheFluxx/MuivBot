@@ -37,6 +37,52 @@ def get_main_keyboard():
     return kb
 
 
+def _add_main_menu_button(
+    keyboard: types.InlineKeyboardMarkup,
+    text: str = '🏠 В главное меню',
+):
+    """Добавляет кнопку возврата в главное меню к inline-клавиатуре."""
+    keyboard.add(types.InlineKeyboardButton(text=text, callback_data='main_menu'))
+    return keyboard
+
+
+def _build_main_menu_inline_keyboard():
+    """Строит inline-меню с быстрыми переходами по разделам бота."""
+    keyboard = types.InlineKeyboardMarkup(row_width=2)
+    keyboard.row(
+        types.InlineKeyboardButton(text='📅 Мое расписание', callback_data='main_nav_schedule'),
+        types.InlineKeyboardButton(text='📊 Посещаемость', callback_data='main_nav_attendance'),
+    )
+    keyboard.row(
+        types.InlineKeyboardButton(text='🔎 Поиск', callback_data='main_nav_search'),
+        types.InlineKeyboardButton(text='🎉 События', callback_data='main_nav_events'),
+    )
+    keyboard.row(
+        types.InlineKeyboardButton(text='❓ FAQ', callback_data='main_nav_faq'),
+        types.InlineKeyboardButton(text='🆘 Поддержка', callback_data='main_nav_support'),
+    )
+    keyboard.add(types.InlineKeyboardButton(text='💼 Настройки', callback_data='main_nav_settings'))
+    return keyboard
+
+
+def _build_main_menu_inline_text():
+    """Возвращает текст экрана главного меню."""
+    return (
+        "<b>🏠 Главное меню</b>\n\n"
+        "Выберите нужный раздел через кнопки ниже "
+        "или используйте постоянную клавиатуру внизу экрана."
+    )
+
+
+async def _send_main_menu_overview(message: types.Message):
+    """Отправляет пользователю экран главного меню."""
+    await message.answer(
+        _build_main_menu_inline_text(),
+        reply_markup=_build_main_menu_inline_keyboard(),
+        parse_mode='HTML',
+    )
+
+
 class SearchDialog(StatesGroup):
     """Состояния диалога поиска."""
 
@@ -115,8 +161,10 @@ async def cmd_start(message: types.Message):
         except ValueError:
             await db_commands.register_user(telegram_id, username, 0)
         await message.reply(f"Привет, Вы успешно зарегистрированы.", reply_markup=get_main_keyboard())
+        await _send_main_menu_overview(message)
     else:
         await message.reply("Вы уже зарегистрированы.", reply_markup=get_main_keyboard())
+        await _send_main_menu_overview(message)
 
 
 def _commands_help_text():
@@ -6428,6 +6476,7 @@ def _build_settings_keyboard(user_data):
             callback_data='settings_schedule_changes_toggle',
         )
     )
+    _add_main_menu_button(keyboard)
     return keyboard
 
 
@@ -7476,6 +7525,7 @@ async def choose_course(message: types.Message):
         for name in course_names
     ]
     keyboard.add(*buttons)
+    _add_main_menu_button(keyboard)
 
     await message.answer("🎓 Выберите курс:", reply_markup=keyboard)
 
@@ -7505,6 +7555,7 @@ async def process_course_choice(callback_query: types.CallbackQuery):
         text="⬅️ Назад к выбору курса",
         callback_data="back_to_courses"
     ))
+    _add_main_menu_button(keyboard)
 
     await callback_query.message.edit_text(
         f"✅ Выбран курс: {course_name}\n👥 Выберите вашу группу:",
@@ -7839,6 +7890,7 @@ def _build_search_type_keyboard():
     keyboard.add(types.InlineKeyboardButton(text='👨‍🏫 По преподавателю', callback_data='search_kind_teacher'))
     keyboard.add(types.InlineKeyboardButton(text='🏫 По аудитории', callback_data='search_kind_room'))
     keyboard.add(types.InlineKeyboardButton(text='📚 По предмету', callback_data='search_kind_subject'))
+    _add_main_menu_button(keyboard)
     return keyboard
 
 
@@ -7846,6 +7898,7 @@ def _build_search_query_keyboard():
     """Строит клавиатуру экрана ввода поискового запроса."""
     keyboard = types.InlineKeyboardMarkup(row_width=1)
     keyboard.add(types.InlineKeyboardButton(text='↩️ К видам поиска', callback_data='search_start'))
+    _add_main_menu_button(keyboard)
     return keyboard
 
 
@@ -7855,6 +7908,7 @@ def _build_search_matches_keyboard(match_buttons):
     for button in match_buttons:
         keyboard.add(button)
     keyboard.add(types.InlineKeyboardButton(text='🔎 Новый поиск', callback_data='search_start'))
+    _add_main_menu_button(keyboard)
     return keyboard
 
 
@@ -7912,6 +7966,7 @@ def _build_search_entity_keyboard(search_kind, entity_value, token, date_groups,
         )
 
     keyboard.add(types.InlineKeyboardButton(text='🔎 Новый поиск', callback_data='search_start'))
+    _add_main_menu_button(keyboard)
     return keyboard
 
 
@@ -8808,6 +8863,7 @@ def _build_search_week_keyboard_v2(token, week_item, show_empty):
     keyboard.row(
         types.InlineKeyboardButton(text='🔎 Новый поиск', callback_data='search_start'),
     )
+    _add_main_menu_button(keyboard)
     return keyboard
 
 
@@ -8869,6 +8925,7 @@ def _build_search_day_keyboard_v2(token, weeks, week_index, selected_day_index, 
     )
 
     keyboard.row(types.InlineKeyboardButton(text='🔎 Новый поиск', callback_data='search_start'))
+    _add_main_menu_button(keyboard)
     return keyboard
 
 
@@ -8911,6 +8968,7 @@ def _build_search_week_picker_keyboard_v2(token, weeks, months, current_week_ind
         types.InlineKeyboardButton(text='🗓️ Все месяцы', callback_data=f"search_monthpick_{token}_{current_week_index}"),
     )
     keyboard.add(types.InlineKeyboardButton(text='🔎 Новый поиск', callback_data='search_start'))
+    _add_main_menu_button(keyboard)
     return keyboard
 
 
@@ -8929,6 +8987,7 @@ def _build_search_month_picker_keyboard_v2(token, months, current_month_index, c
 
     keyboard.add(types.InlineKeyboardButton(text='↩️ К неделе', callback_data=f"search_week_{token}_{current_week_index}"))
     keyboard.add(types.InlineKeyboardButton(text='🔎 Новый поиск', callback_data='search_start'))
+    _add_main_menu_button(keyboard)
     return keyboard
 
 
@@ -9895,6 +9954,7 @@ def _build_week_keyboard(week_label, week_days):
         types.InlineKeyboardButton(text='🗂️ Выбор недели', callback_data='cal_pick_week'),
         types.InlineKeyboardButton(text='🗓️ Выбор месяца', callback_data='cal_pick_month'),
     )
+    _add_main_menu_button(keyboard)
 
     return keyboard
 
@@ -9930,6 +9990,7 @@ def _build_day_keyboard(week_days, selected_day_index):
 
 
     keyboard.row(types.InlineKeyboardButton(text='↩️ Назад к неделе', callback_data='cal_back_week'))
+    _add_main_menu_button(keyboard)
 
     return keyboard
 
@@ -9979,6 +10040,7 @@ def _build_week_picker_keyboard(course, group_code, weeks, current_week_index):
     keyboard.row(
         types.InlineKeyboardButton(text='🎯 Перейти к нынешней неделе', callback_data='cal_current_week'),
     )
+    _add_main_menu_button(keyboard)
 
 
     return keyboard
@@ -10682,15 +10744,114 @@ async def back_to_courses(callback_query: types.CallbackQuery):
     await callback_query.answer()
 
 # Колбек для возврата в главное меню
-async def main_menu(callback_query: types.CallbackQuery):
+async def main_menu(callback_query: types.CallbackQuery, state: FSMContext):
     """Возвращает пользователя в главное меню."""
-    await callback_query.message.answer(
-        "🏠 Главное меню",
-        reply_markup=get_main_keyboard()
-    )
+    await state.finish()
+    _log_callback_action(callback_query, 'main_menu_open', 'Открыто главное меню')
+    await _send_main_menu_overview(callback_query.message)
     await callback_query.answer()
 
-# Хендлер для команды "Мое расписание"
+
+async def main_nav_schedule(callback_query: types.CallbackQuery, state: FSMContext):
+    """Открывает раздел расписания из инлайн-меню."""
+    _log_callback_action(callback_query, 'main_nav_schedule', 'Переход в раздел «Мое расписание»')
+    telegram_id = _telegram_id_from_callback(callback_query)
+    user_data = await _get_user_data_with_db_fallback(state, telegram_id)
+    course = user_data.get('selected_course')
+    group_code = user_data.get('selected_group')
+
+    if course and group_code:
+        keyboard = types.InlineKeyboardMarkup(row_width=1)
+        keyboard.add(
+            types.InlineKeyboardButton(
+                text='📅 Показать расписание',
+                callback_data=f'show_schedule_{course}_{group_code}',
+            )
+        )
+        _add_main_menu_button(keyboard)
+
+        group_info = get_group_info(course, group_code)
+        group_display = f'{group_code}'
+        if len(group_info) > 2 and group_info[2]:
+            group_display += f'\n📚 Направление: {group_info[2]}'
+
+        await _safe_edit_text(
+            callback_query.message,
+            (
+                '<b>📋 Ваше текущее расписание</b>\n'
+                f'<b>🎓 Курс:</b> {_course_display(course)}\n'
+                f'<b>👥 Группа:</b> {group_display}\n\n'
+                'Нажмите кнопку ниже, чтобы открыть расписание.'
+            ),
+            reply_markup=keyboard,
+            parse_mode='HTML',
+        )
+    else:
+        keyboard = types.InlineKeyboardMarkup(row_width=1)
+        keyboard.add(types.InlineKeyboardButton(text='🎓 Выбрать группу', callback_data='change_group'))
+        _add_main_menu_button(keyboard)
+        await _safe_edit_text(
+            callback_query.message,
+            'ℹ️ Вы еще не выбрали группу. Нажмите кнопку ниже, чтобы перейти к выбору.',
+            reply_markup=keyboard,
+        )
+
+    await callback_query.answer()
+
+
+async def main_nav_attendance(callback_query: types.CallbackQuery, state: FSMContext):
+    """Открывает раздел посещаемости из инлайн-меню."""
+    _log_callback_action(callback_query, 'main_nav_attendance', 'Переход в раздел «Посещаемость»')
+    await _render_self_attendance_view(
+        callback_query,
+        state,
+        _telegram_id_from_callback(callback_query),
+        page=None,
+        edit=True,
+    )
+
+
+async def main_nav_search(callback_query: types.CallbackQuery, state: FSMContext):
+    """Открывает раздел поиска из инлайн-меню."""
+    _log_callback_action(callback_query, 'main_nav_search', 'Переход в раздел «Поиск»')
+    await _render_search_start(callback_query, state, edit=True)
+
+
+async def main_nav_events(callback_query: types.CallbackQuery, state: FSMContext):
+    """Открывает раздел событий из инлайн-меню."""
+    _log_callback_action(callback_query, 'main_nav_events', 'Переход в раздел «События»')
+    await _render_events_list_view(callback_query, edit=True, mode='upcoming')
+
+
+async def main_nav_faq(callback_query: types.CallbackQuery, state: FSMContext):
+    """Открывает раздел FAQ из инлайн-меню."""
+    _log_callback_action(callback_query, 'main_nav_faq', 'Переход в раздел FAQ')
+    await _render_faq_list_view(callback_query, edit=True, page=0)
+
+
+async def main_nav_support(callback_query: types.CallbackQuery, state: FSMContext):
+    """Открывает раздел поддержки из инлайн-меню."""
+    await state.finish()
+    _log_callback_action(callback_query, 'main_nav_support', 'Переход в раздел «Поддержка»')
+    await _render_support_view(
+        callback_query,
+        state,
+        _telegram_id_from_callback(callback_query),
+        edit=True,
+    )
+
+
+async def main_nav_settings(callback_query: types.CallbackQuery, state: FSMContext):
+    """Открывает раздел настроек из инлайн-меню."""
+    _log_callback_action(callback_query, 'main_nav_settings', 'Переход в раздел «Настройки»')
+    await _render_settings_view(
+        callback_query.message,
+        state,
+        _telegram_id_from_callback(callback_query),
+        edit=True,
+    )
+
+
 async def my_schedule(message: types.Message, state: FSMContext):
     """Показывает текущее выбранное расписание пользователя."""
     _log_message_action(message, 'my_schedule_open', 'Открыто мое расписание')
@@ -10707,6 +10868,7 @@ async def my_schedule(message: types.Message, state: FSMContext):
                 callback_data=f"show_schedule_{course}_{group_code}"
             )
         )
+        _add_main_menu_button(keyboard)
 
         group_info = get_group_info(course, group_code)
         group_display = f"{group_code}"
@@ -11259,7 +11421,14 @@ def register_handlers_client(dp: Dispatcher):
 
     dp.register_callback_query_handler(refresh_schedule, Text(startswith="refresh_"))
     dp.register_callback_query_handler(back_to_courses, Text(startswith="back_to_courses"))
-    dp.register_callback_query_handler(main_menu, Text(startswith="main_menu"))
+    dp.register_callback_query_handler(main_nav_schedule, Text(equals='main_nav_schedule'), state='*')
+    dp.register_callback_query_handler(main_nav_attendance, Text(equals='main_nav_attendance'), state='*')
+    dp.register_callback_query_handler(main_nav_search, Text(equals='main_nav_search'), state='*')
+    dp.register_callback_query_handler(main_nav_events, Text(equals='main_nav_events'), state='*')
+    dp.register_callback_query_handler(main_nav_faq, Text(equals='main_nav_faq'), state='*')
+    dp.register_callback_query_handler(main_nav_support, Text(equals='main_nav_support'), state='*')
+    dp.register_callback_query_handler(main_nav_settings, Text(equals='main_nav_settings'), state='*')
+    dp.register_callback_query_handler(main_menu, Text(startswith="main_menu"), state='*')
     dp.register_callback_query_handler(support_open, Text(equals='support_open'), state='*')
     dp.register_callback_query_handler(support_to_starosta, Text(equals='support_to_starosta'), state='*')
     dp.register_callback_query_handler(support_to_admin, Text(equals='support_to_admin'), state='*')
