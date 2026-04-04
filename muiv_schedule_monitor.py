@@ -66,6 +66,32 @@ def _extract_links_from_rendered_dom(page):
     return pairs
 
 
+def _open_schedule_page(page, page_url: str):
+    """Открывает страницу расписания с резервными сценариями для медленного сайта."""
+    attempts = [
+        ('domcontentloaded', 45000),
+        ('load', 45000),
+    ]
+    errors = []
+
+    for wait_until, timeout_ms in attempts:
+        try:
+            page.goto(page_url, wait_until=wait_until, timeout=timeout_ms)
+            return
+        except Exception as open_error:
+            # Иногда переход завершается по таймауту, хотя DOM уже частично доступен.
+            try:
+                if page.query_selector('a.download__src'):
+                    return
+            except Exception:
+                pass
+            errors.append(f'{wait_until}: {open_error}')
+
+    raise RuntimeError(
+        'Не удалось открыть страницу расписания: ' + ' | '.join(errors)
+    )
+
+
 def check_for_schedule_updates(
     page_url: str = PAGE_URL,
     base_url: str = BASE_URL,
@@ -94,7 +120,7 @@ def check_for_schedule_updates(
             browser = playwright.chromium.launch(headless=True)
             page = browser.new_page()
 
-            page.goto(page_url, wait_until='networkidle', timeout=60000)
+            _open_schedule_page(page, page_url)
             pairs = _extract_links_from_rendered_dom(page)
 
             for text, href in pairs:

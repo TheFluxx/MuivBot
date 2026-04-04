@@ -10,6 +10,7 @@ from aiogram import types
 from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters import Text
 from aiogram.utils import executor
+from aiogram.utils.exceptions import InvalidQueryID
 
 from create_bot import bot, dp
 from db_api import db_commands
@@ -89,6 +90,13 @@ def setup_handlers(dispatcher):
     dispatcher.register_callback_query_handler(monitor_show_change_details, Text(startswith='mon_diff_'))
     dispatcher.register_callback_query_handler(monitor_back_to_change_summary, Text(startswith='mon_back_'))
     dispatcher.register_callback_query_handler(monitor_open_schedule, Text(startswith='mon_open_'))
+    dispatcher.register_errors_handler(ignore_expired_callback_query, exception=InvalidQueryID)
+
+
+async def ignore_expired_callback_query(update, exception):
+    """Игнорирует просроченные callback-запросы Telegram, чтобы они не роняли бота."""
+    logging.warning('Пропущен просроченный callback-запрос: %s', exception)
+    return True
 
 
 def _normalize_text(value) -> str:

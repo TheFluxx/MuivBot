@@ -7,13 +7,14 @@ import html
 import io
 from difflib import SequenceMatcher
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date, time
 from aiogram import types, Dispatcher
 from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters import Text
 from aiogram.dispatcher.filters.state import State, StatesGroup
 from aiogram.utils.exceptions import MessageNotModified
 import xlrd
+import openpyxl
 from db_api import db_commands
 from create_bot import bot
 from data.config import (
@@ -7025,8 +7026,68 @@ def _normalize_cell_text(value):
     return str(value).strip()
 
 
+def _open_schedule_workbook(excel_path: Path):
+    """Открывает файл расписания и возвращает унифицированное представление книги."""
+    suffix = excel_path.suffix.lower()
+
+    if suffix == ".xlsx":
+        workbook = openpyxl.load_workbook(
+            filename=str(excel_path),
+            data_only=True,
+            read_only=True,
+        )
+        sheets = {
+            sheet_name: [list(row) for row in workbook[sheet_name].iter_rows(values_only=True)]
+            for sheet_name in workbook.sheetnames
+        }
+        workbook.close()
+        return {
+            "engine": "openpyxl",
+            "datemode": 0,
+            "sheet_names": list(sheets.keys()),
+            "sheets": sheets,
+        }
+
+    workbook = xlrd.open_workbook(str(excel_path))
+    return {
+        "engine": "xlrd",
+        "datemode": workbook.datemode,
+        "sheet_names": workbook.sheet_names(),
+        "workbook": workbook,
+    }
+
+
+def _get_schedule_sheet(workbook_info, sheet_name_raw):
+    """Возвращает лист расписания в формате, удобном для общего парсера."""
+    if workbook_info["engine"] == "openpyxl":
+        return workbook_info["sheets"][sheet_name_raw]
+    return workbook_info["workbook"].sheet_by_name(sheet_name_raw)
+
+
+def _sheet_nrows(sheet, engine):
+    """Возвращает количество строк листа вне зависимости от движка Excel."""
+    if engine == "openpyxl":
+        return len(sheet)
+    return sheet.nrows
+
+
+def _sheet_row_values(sheet, row_idx, engine):
+    """Возвращает значения строки листа вне зависимости от движка Excel."""
+    if engine == "openpyxl":
+        if 0 <= row_idx < len(sheet):
+            return sheet[row_idx]
+        return []
+    return sheet.row_values(row_idx)
+
+
 def _format_excel_date(value, datemode):
     """Преобразует дату из Excel в строку."""
+    if isinstance(value, datetime):
+        return f"{value.year:04d}-{value.month:02d}-{value.day:02d}"
+
+    if isinstance(value, date):
+        return f"{value.year:04d}-{value.month:02d}-{value.day:02d}"
+
     if isinstance(value, float):
         try:
             y, m, d, _, _, _ = xlrd.xldate_as_tuple(value, datemode)
@@ -7040,6 +7101,12 @@ def _format_excel_date(value, datemode):
 
 def _format_excel_time(value, datemode):
     """Преобразует время из Excel в строку."""
+    if isinstance(value, datetime):
+        return f"{value.hour:02d}:{value.minute:02d}"
+
+    if isinstance(value, time):
+        return f"{value.hour:02d}:{value.minute:02d}"
+
     if isinstance(value, float):
         try:
             _, _, _, h, m, _ = xlrd.xldate_as_tuple(value, datemode)
@@ -7091,12 +7158,12 @@ def parse_excel_file():
         print(f"Reading workbook: {excel_path.name} ({source_label})")
 
         try:
-            workbook = xlrd.open_workbook(str(excel_path))
+            workbook_info = _open_schedule_workbook(excel_path)
         except Exception as open_error:
             print(f"ERROR: cannot open workbook {excel_path.name}: {open_error}")
             continue
 
-        sheets = workbook.sheet_names()
+        sheets = workbook_info["sheet_names"]
         print(f"Sheets found in {excel_path.name}: {len(sheets)}")
 
         for sheet_name_raw in sheets:
@@ -7109,7 +7176,7 @@ def parse_excel_file():
             print(f"Processing sheet: {course_display_names[course_key]}")
 
             try:
-                sheet = workbook.sheet_by_name(sheet_name_raw)
+                sheet = _get_schedule_sheet(workbook_info, sheet_name_raw)
             except Exception as sheet_error:
                 print(f"  ERROR: cannot read sheet {sheet_name_raw}: {sheet_error}")
                 continue
@@ -7120,8 +7187,8 @@ def parse_excel_file():
 
             group_codes = {}
 
-            for row_idx in range(sheet.nrows):
-                row = sheet.row_values(row_idx)
+            for row_idx in range(_sheet_nrows(sheet, workbook_info["engine"])):
+                row = _sheet_row_values(sheet, row_idx, workbook_info["engine"])
                 if not any(row):
                     continue
 
@@ -7142,8 +7209,8 @@ def parse_excel_file():
                     schedule_data[course_key][group_code] = {}
 
                     direction = DEFAULT_DIRECTION
-                    if row_idx + 1 < sheet.nrows:
-                        next_row = sheet.row_values(row_idx + 1)
+                    if row_idx + 1 < _sheet_nrows(sheet, workbook_info["engine"]):
+                        next_row = _sheet_row_values(sheet, row_idx + 1, workbook_info["engine"])
                         if col_idx < len(next_row):
                             direction_value = _normalize_cell_text(next_row[col_idx])
                             if direction_value:
@@ -7160,8 +7227,8 @@ def parse_excel_file():
             current_day = None
             current_date = DEFAULT_DATE
 
-            for row_idx in range(sheet.nrows):
-                row = sheet.row_values(row_idx)
+            for row_idx in range(_sheet_nrows(sheet, workbook_info["engine"])):
+                row = _sheet_row_values(sheet, row_idx, workbook_info["engine"])
                 if not any(row):
                     continue
 
@@ -7180,7 +7247,7 @@ def parse_excel_file():
                 if first_cell.lower() in DAY_NAMES:
                     current_day = first_cell
                     date_cell = row[1] if len(row) > 1 else None
-                    current_date = _format_excel_date(date_cell, workbook.datemode)
+                    current_date = _format_excel_date(date_cell, workbook_info["datemode"])
 
                     if current_week:
                         week_days_info[course_key].setdefault(current_week, {})
@@ -7190,7 +7257,7 @@ def parse_excel_file():
                     continue
 
                 time_cell = row[2] if len(row) > 2 else None
-                time_str = _format_excel_time(time_cell, workbook.datemode)
+                time_str = _format_excel_time(time_cell, workbook_info["datemode"])
                 if not time_str or time_str.lower() == TIME_HEADER:
                     continue
 
@@ -7207,11 +7274,11 @@ def parse_excel_file():
                         continue
 
                     lesson_details = ''
-                    if row_idx + 1 < sheet.nrows:
-                        next_row = sheet.row_values(row_idx + 1)
+                    if row_idx + 1 < _sheet_nrows(sheet, workbook_info["engine"]):
+                        next_row = _sheet_row_values(sheet, row_idx + 1, workbook_info["engine"])
                         next_first_cell = _normalize_cell_text(next_row[0]) if next_row else ''
                         next_time_cell = next_row[2] if len(next_row) > 2 else None
-                        next_time_str = _format_excel_time(next_time_cell, workbook.datemode)
+                        next_time_str = _format_excel_time(next_time_cell, workbook_info["datemode"])
                         next_week_label = _find_week_label(next_row) if next_row else None
 
                         is_details_row = (
@@ -7392,6 +7459,30 @@ def _parse_schedule_date(date_text):
             continue
 
     return None
+
+
+def _normalize_time_slot_text(time_text):
+    """Нормализует текст временного слота для сортировки."""
+    value = _normalize_cell_text(time_text).lower()
+    if not value:
+        return ''
+
+    value = value.replace('–', '-').replace('—', '-').replace('−', '-')
+    value = re.sub(r'\s+', '', value)
+    return value
+
+
+def _time_sort_key(time_text):
+    """Возвращает ключ сортировки времени занятия."""
+    normalized = _normalize_time_slot_text(time_text)
+    if not normalized:
+        return (1, 99, 99, normalized)
+
+    match = re.match(r'(\d{1,2})[:.](\d{2})', normalized)
+    if not match:
+        return (1, 99, 99, normalized)
+
+    return (0, int(match.group(1)), int(match.group(2)), normalized)
 
 
 def _collect_days_for_week(course, target_week, week_schedule):
@@ -7758,7 +7849,7 @@ def _search_occurrences_for_entity(search_kind, entity_value):
         key=lambda item: (
             item['date_obj'] is None,
             item['date_obj'] or datetime.max.date(),
-            _normalize_cell_text(item.get('time_text')),
+            _time_sort_key(item.get('time_text')),
             item.get('group_code'),
             item.get('course_name'),
         )
@@ -8407,7 +8498,7 @@ def _build_search_weeks_v2(occurrences):
     for entries in date_to_entries.values():
         entries.sort(
             key=lambda item: (
-                _normalize_cell_text(item.get('time_text')),
+                _time_sort_key(item.get('time_text')),
                 _normalize_cell_text(item.get('group_code')),
                 _normalize_cell_text(item.get('course_name')),
             )
@@ -8787,6 +8878,97 @@ def _search_lesson_lines_v2(search_kind, occurrence):
     return lines
 
 
+def _group_teacher_day_occurrences_v2(entries):
+    """Группирует занятия преподавателя по времени, аудитории, предмету и периоду."""
+    grouped = []
+    grouped_map = {}
+
+    for occurrence in entries:
+        room_text = _normalize_cell_text(occurrence.get('room'))
+        group_key = (
+            _normalize_cell_text(occurrence.get('time_text')),
+            room_text,
+            _normalize_cell_text(occurrence.get('subject')) or _normalize_cell_text(occurrence.get('lesson_text')),
+            _normalize_cell_text(occurrence.get('period_label')),
+            '' if room_text else _normalize_cell_text(occurrence.get('course_name')),
+            '' if room_text else _normalize_cell_text(occurrence.get('group_code')),
+        )
+
+        bucket = grouped_map.get(group_key)
+        if bucket is None:
+            bucket = {
+                'time_text': _normalize_cell_text(occurrence.get('time_text')) or 'Время не указано',
+                'room': room_text,
+                'subject': _normalize_cell_text(occurrence.get('subject')) or _normalize_cell_text(occurrence.get('lesson_text')) or 'Без названия',
+                'period_label': _normalize_cell_text(occurrence.get('period_label')),
+                'groups': [],
+            }
+            grouped_map[group_key] = bucket
+            grouped.append(bucket)
+
+        group_item = {
+            'course_name': _normalize_cell_text(occurrence.get('course_name')) or 'Курс не указан',
+            'group_code': _normalize_cell_text(occurrence.get('group_code')) or 'Группа не указана',
+        }
+        if group_item not in bucket['groups']:
+            bucket['groups'].append(group_item)
+
+    for bucket in grouped:
+        bucket['groups'].sort(
+            key=lambda item: (
+                _normalize_cell_text(item.get('course_name')),
+                _normalize_cell_text(item.get('group_code')),
+            )
+        )
+
+    grouped.sort(
+        key=lambda item: (
+            _time_sort_key(item.get('time_text')),
+            _normalize_cell_text(item.get('room')),
+            _normalize_cell_text(item.get('subject')),
+            _normalize_cell_text(item.get('period_label')),
+        )
+    )
+    return grouped
+
+
+def _search_teacher_grouped_lines_v2(entries):
+    """Формирует компактные строки дня для поиска по преподавателю."""
+    lines = []
+
+    for bucket in _group_teacher_day_occurrences_v2(entries):
+        time_text = html.escape(bucket.get('time_text') or 'Время не указано')
+        subject = html.escape(bucket.get('subject') or 'Без названия')
+        room = html.escape(bucket.get('room'))
+        period_label = html.escape(bucket.get('period_label'))
+        groups = bucket.get('groups', [])
+
+        lines.append(f"• ⏰ <b>{time_text}</b>")
+        lines.append(f"  📚 {subject}")
+        if room:
+            lines.append(f"  🏫 {room}")
+
+        if len(groups) == 1:
+            group_item = groups[0]
+            lines.append(
+                f"  🎓 {html.escape(group_item.get('course_name') or 'Курс не указан')} | "
+                f"👥 {html.escape(group_item.get('group_code') or 'Группа не указана')}"
+            )
+        elif groups:
+            lines.append(f"  👥 <b>Группы в одной аудитории:</b> {len(groups)}")
+            for group_item in groups:
+                lines.append(
+                    f"    • {html.escape(group_item.get('course_name') or 'Курс не указан')} | "
+                    f"{html.escape(group_item.get('group_code') or 'Группа не указана')}"
+                )
+
+        if period_label:
+            lines.append(f"  🗂️ {period_label}")
+        lines.append('')
+
+    return lines
+
+
 def _build_search_day_view_text_v2(search_kind, entity_value, week_item, day_index):
     """Формирует подробную страницу дня для найденной сущности."""
     week_days = week_item['week_days']
@@ -8815,6 +8997,8 @@ def _build_search_day_view_text_v2(search_kind, entity_value, week_item, day_ind
     entries = day_item.get('entries', [])
     if not entries:
         lines.append(_search_empty_day_text_v2(search_kind))
+    elif search_kind == 'teacher':
+        lines.extend(_search_teacher_grouped_lines_v2(entries))
     else:
         for occurrence in entries:
             lines.extend(_search_lesson_lines_v2(search_kind, occurrence))
@@ -9896,7 +10080,7 @@ def get_teacher_lessons_by_date(teacher_name: str, target_date):
 
     items.sort(
         key=lambda item: (
-            _normalize_cell_text(item.get('time_text')),
+            _time_sort_key(item.get('time_text')),
             _normalize_cell_text(item.get('group_code')),
             _normalize_cell_text(item.get('course_name')),
         )
